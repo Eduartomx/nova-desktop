@@ -1,0 +1,9 @@
+{
+  "product": "Nova",
+  "version": "0.5.7",
+  "name": "GitHub Update Infrastructure",
+  "min_version": "0.5.6",
+  "channel": "stable",
+  "requires_restart": true,
+  "description": "Migra Nova al sistema de actualizaciones mediante GitHub Releases."
+}
