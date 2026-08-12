@@ -3,9 +3,10 @@ from __future__ import annotations
 """Bootstrap consolidado de Nova.
 
 Desde v0.6.7 Memory/Workspace/Semantic Memory/Continuity y Nova Doctor son
-módulos nativos administrados por GitHub. En v0.7.0 Perception Engine se suma
-como dominio nativo. Agent/Tools/UI/TaskEngine todavía usan la base histórica
-local v0.5, por lo que aquí se instalan únicamente adaptadores por dominio.
+módulos nativos administrados por GitHub. En v0.7 Perception Engine y Context
+Intelligence se suman como dominios nativos. Agent/Tools/UI/TaskEngine todavía
+usan la base histórica local v0.5, por lo que aquí se instalan únicamente
+adaptadores por dominio.
 """
 
 _INSTALLED = False
@@ -23,14 +24,16 @@ def install_core_runtime():
     from .tools_continuity import install_tools_v065
     from .tools_diagnostics import install_tools_v066
     from .tools_perception import install_tools_perception
+    from .tools_context_intelligence import install_tools_context_intelligence
     install_tools_v060()
     install_tools_v061()
     install_tools_v063()
     install_tools_v065()
     install_tools_v066()
     install_tools_perception()
+    install_tools_context_intelligence()
 
-    # Agent: workspace -> semantic -> continuity -> diagnostics -> perception.
+    # Agent: workspace -> semantic -> continuity -> diagnostics -> perception/context.
     from .agent_workspace import install_agent_v060
     from .agent_semantic import install_agent_v063
     from .agent_continuity import install_agent_v065
@@ -76,6 +79,7 @@ def architecture_status() -> dict:
         "github_managed_native": [
             "memory", "workspace", "workspace_index", "semantic_memory",
             "continuity", "doctor", "profiler", "self_repair", "perception",
+            "context_intelligence",
         ],
         "compatibility_adapters": ["agent", "tools", "ui", "task_engine"],
         "versioned_runtime_chain": False,
