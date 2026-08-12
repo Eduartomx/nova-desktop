@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from .anomaly_detection import get_anomaly_detector
+from .anomaly import get_anomaly_detector
 
 
 def install_ui_anomaly():
