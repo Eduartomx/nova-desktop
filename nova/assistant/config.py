@@ -125,6 +125,32 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "cpu_warn_percent": 92.0,
         "memory_warn_percent": 90.0,
     },
+    "context_intelligence": {
+        "enabled": True,
+        "recent_event_limit": 32,
+        "prompt_event_limit": 4,
+        "minimum_prompt_relevance": 0.30,
+        "workspace_confidence_bonus": 0.22,
+        "system_pressure_bonus": 0.38,
+        "app_change_bonus": 0.16,
+        "workspace_change_bonus": 0.24,
+        "include_window_title_in_prompt": False,
+    },
+    "workspace_autodetect": {
+        "enabled": True,
+        "learn_enabled": True,
+        "observe_interval_seconds": 4.0,
+        "learn_cooldown_seconds": 20.0,
+        "suggestion_threshold": 0.84,
+        "ambiguity_margin": 0.18,
+        "minimum_confirmations": 3,
+        "auto_activate": False,
+        "auto_activate_threshold": 0.97,
+        "auto_activate_min_confirmations": 6,
+        "auto_activate_dwell_seconds": 15.0,
+        "auto_activate_cooldown_seconds": 90.0,
+        "learn_app_kinds": ["code_editor", "terminal", "game", "office"],
+    },
     "hotkey": "<ctrl>+<alt>+<space>",
     "desktop": {
         "auto_context": True,
@@ -197,8 +223,6 @@ def load_config() -> dict[str, Any]:
         else:
             merged[key] = value
 
-    # v0.6.6: el atajo histórico Ctrl+Espacio molestaba en juegos. Se migra
-    # únicamente ese valor antiguo; cualquier otro hotkey personalizado se respeta.
     migrated = False
     if str(data.get("hotkey") or "").strip().casefold() == "<ctrl>+<space>":
         merged["hotkey"] = "<ctrl>+<alt>+<space>"
