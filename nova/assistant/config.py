@@ -77,6 +77,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "recent_memory_limit": 8,
         "refresh_metadata_on_select": True,
         "registered_paths_allowed": True,
+        "index_max_files": 12000,
+        "index_max_depth": 8,
+        "index_hash_max_bytes": 2097152,
+        "index_ignore_dirs": [],
+        "index_ignore_globs": ["*.pyc", "*.tmp", "*.part", "*.log.gz"],
     },
     "hotkey": "<ctrl>+<space>",
     "desktop": {

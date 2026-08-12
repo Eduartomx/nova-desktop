@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.6.1 — Workspace Intelligence
+
+- Índice incremental local por workspace guardado en SQLite.
+- Detección de archivos añadidos, modificados y eliminados entre análisis.
+- Búsqueda rápida por nombre/ruta sin volver a recorrer todo el proyecto.
+- Hash SHA-256 selectivo para archivos de configuración y código pequeños/importantes.
+- Límites de profundidad y número de archivos para evitar escaneos costosos.
+- Exclusión por defecto de `.git`, `.venv`, `node_modules`, caches y carpetas de build.
+- Nuevas herramientas: `workspace_index`, `workspace_changes`, `workspace_search`, `workspace_index_status`.
+- El selector de herramientas prioriza Workspace Intelligence ante preguntas sobre archivos y cambios.
+- Nuevas pruebas automáticas de indexado incremental, búsqueda y liberación de SQLite.
+
 ## v0.6.0 — Memory & Workspace
 
 - Nuevo sistema de **Workspaces** persistentes con proyecto activo.
