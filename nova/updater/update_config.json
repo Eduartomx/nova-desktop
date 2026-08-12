@@ -1,0 +1,6 @@
+{
+  "repository": "Eduartomx/nova-desktop",
+  "channel": "stable",
+  "source_dir": "nova",
+  "github_api": "https://api.github.com"
+}
