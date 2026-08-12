@@ -21,7 +21,9 @@ def performance_direct_intent(text: str) -> str | None:
     if any(cue in t for cue in (
         "perfil de rendimiento", "performance profiler", "profiler de nova",
         "como va tu rendimiento", "como esta tu rendimiento", "muestra tu rendimiento",
-        "por que estas lento", "por que vas lento", "cuello de botella", "cuellos de botella",
+        "por que estas lento", "por que vas lento",
+        "cuello de botella de nova", "cuellos de botella de nova",
+        "que te esta haciendo lento", "que hace lenta a nova",
     )):
         return "performance"
     if any(cue in t for cue in (
