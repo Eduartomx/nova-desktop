@@ -104,7 +104,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "history_limit": 12,
         "max_items_per_checkpoint": 60,
     },
-    "hotkey": "<ctrl>+<space>",
+    "performance_profiler": {
+        "enabled": True,
+        "max_events": 5000,
+        "slow_ms": 1200,
+        "summary_hours": 24,
+    },
+    "hotkey": "<ctrl>+<alt>+<space>",
     "desktop": {
         "auto_context": True,
         "auto_visual_context": True,
@@ -176,9 +182,22 @@ def load_config() -> dict[str, Any]:
         else:
             merged[key] = value
 
+    # v0.6.6: el atajo histórico Ctrl+Espacio molestaba en juegos. Se migra
+    # únicamente ese valor antiguo; cualquier otro hotkey personalizado se respeta.
+    migrated = False
+    if str(data.get("hotkey") or "").strip().casefold() == "<ctrl>+<space>":
+        merged["hotkey"] = "<ctrl>+<alt>+<space>"
+        migrated = True
+
     original_security = data.get("security", {}) if isinstance(data.get("security", {}), dict) else {}
     profile = str(original_security.get("profile", "trusted")).lower().strip()
     if profile not in SECURITY_PROFILES:
         profile = "trusted"
     apply_security_profile(merged, profile)
+
+    if migrated:
+        try:
+            save_config(merged)
+        except Exception:
+            pass
     return merged
