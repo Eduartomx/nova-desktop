@@ -40,6 +40,20 @@
     "index_ignore_dirs": [],
     "index_ignore_globs": ["*.pyc", "*.tmp", "*.part", "*.log.gz"]
   },
+  "semantic_memory": {
+    "enabled": true,
+    "model": "qwen3-embedding:0.6b",
+    "auto_pull_model": false,
+    "request_timeout_seconds": 8,
+    "batch_size": 16,
+    "lazy_index": true,
+    "lazy_index_limit": 24,
+    "semantic_weight": 0.58,
+    "lexical_weight": 0.27,
+    "importance_weight": 0.10,
+    "recency_weight": 0.05,
+    "minimum_semantic_score": 0.12
+  },
   "hotkey": "<ctrl>+<space>",
   "desktop": {
     "auto_context": true,
