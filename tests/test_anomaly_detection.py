@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 
 from assistant.agent_anomaly import anomaly_direct_intent
-from assistant.anomaly_detection import AnomalyDetector
+from assistant.anomaly import AnomalyDetector
 from assistant.config import DEFAULT_CONFIG
 
 
