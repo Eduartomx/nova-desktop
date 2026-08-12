@@ -118,7 +118,16 @@ class SelfRepairManager:
             updater = self.root / "updater" / "nova_updater.py"
             if not updater.exists():
                 return {"ok": False, "error": f"No existe {updater}"}
-            return self._run([py, str(updater), "--repair", "--yes"])
+            # Reutiliza las funciones del updater sin depender de que exista una
+            # versión nueva: sync_release compara archivo por archivo y restaura
+            # los gestionados que falten o estén corruptos en la Release estable.
+            code = (
+                "import runpy; "
+                f"ns=runpy.run_path({str(updater)!r}); "
+                "cfg=ns['load_config'](); rel=ns['get_release'](cfg); "
+                "ns['sync_release'](cfg, rel)"
+            )
+            return self._run([py, "-c", code], timeout=1200)
 
         if action_id == "install_requirements":
             req = self.root / "requirements.txt"
