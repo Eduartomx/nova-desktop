@@ -3,20 +3,12 @@ import traceback
 from pathlib import Path
 import tkinter as tk
 
-# v0.6 añade Memory, Workspace Intelligence, Semantic Memory, Continuity,
-# Self Repair y Performance Profiler sobre los módulos históricos v0.5
-# mientras completamos la migración del núcleo.
-from assistant.v060_runtime import install_v060
-from assistant.v061_runtime import install_v061
-from assistant.v063_runtime import install_v063
-from assistant.v065_runtime import install_v065
-from assistant.v066_runtime import install_v066
+# v0.6.7 concentra todas las extensiones administradas por GitHub en un
+# único bootstrap estable. Los módulos históricos agent/tools/ui/task_engine
+# siguen siendo la base local mientras completamos su migración a GitHub.
+from assistant.core_runtime import install_core_runtime
 
-install_v060()
-install_v061()
-install_v063()
-install_v065()
-install_v066()
+install_core_runtime()
 
 from assistant.config import load_config
 from assistant.ui import AssistantUI
