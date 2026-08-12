@@ -131,6 +131,24 @@
     "expected_heavy_processes": ["ollama.exe", "llama.exe"],
     "crash_signal_processes": ["werfault.exe", "wermgr.exe"]
   },
+  "event_driven_vision": {
+    "enabled": true,
+    "user_visual_queries": true,
+    "auto_event_capture": true,
+    "auto_capture_event_types": ["crash_signal"],
+    "auto_capture_min_severity": "high",
+    "auto_capture_high_anomalies": false,
+    "cooldown_seconds": 75.0,
+    "max_auto_captures_per_hour": 4,
+    "analysis_timeout_seconds": 25.0,
+    "model": "",
+    "require_vision_capability": true,
+    "max_image_dimension": 1440,
+    "jpeg_quality": 78,
+    "retain_images": false,
+    "persist_analysis": false,
+    "max_events": 300
+  },
   "hotkey": "<ctrl>+<alt>+<space>",
   "desktop": {
     "auto_context": true,
