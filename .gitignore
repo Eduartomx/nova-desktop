@@ -1,0 +1,27 @@
+# Nova - datos locales / privados
+.venv/
+__pycache__/
+*.pyc
+data/
+logs/
+screenshots/
+browser_profile/
+assistant.db
+*.db
+config.json
+.env
+.env.*
+OPENAI_API_KEY*
+*.key
+*.pem
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Builds
+dist/
+build/
+*.zip
