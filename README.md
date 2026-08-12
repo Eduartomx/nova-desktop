@@ -4,7 +4,7 @@ Nova es un asistente virtual local para Windows que combina un modelo local medi
 
 ## Estado actual
 
-**Nova v0.6.1 — Workspace Intelligence**
+**Nova v0.6.2 — Update Reliability**
 
 GitHub es la fuente oficial del proyecto:
 
@@ -14,6 +14,14 @@ GitHub es la fuente oficial del proyecto:
 - el updater sincroniza directamente los archivos del tag publicado, sin ZIPs;
 - cada archivo se verifica contra su Git blob SHA;
 - se crea un backup antes de reemplazar archivos y existe rollback ante fallos de validación.
+
+## v0.6.2 — Update Reliability
+
+Las actualizaciones iniciadas desde `⬆ Actualizar` ahora pasan por un supervisor independiente (`updater/update_runner.py`). El supervisor espera el cierre de la instancia actual, ejecuta el updater, guarda un log local y vuelve a iniciar Nova tanto si la actualización termina correctamente como si falla.
+
+El resultado se guarda en `data/update_last.json` y Nova lo muestra al siguiente arranque. Los logs quedan en `data/updater_logs/` para que un fallo ya no deje la aplicación cerrada sin explicación.
+
+`ACTUALIZAR_NOVA.cmd` usa el mismo supervisor, de modo que el flujo desde la interfaz y el flujo manual comparten la misma lógica de actualización y reinicio.
 
 ## v0.6.1 — Workspace Intelligence
 
@@ -60,6 +68,8 @@ nova-desktop/
 │  │  ├─ v060_*.py
 │  │  └─ v061_*.py
 │  ├─ updater/
+│  │  ├─ nova_updater.py
+│  │  └─ update_runner.py
 │  ├─ app.py
 │  └─ ...
 ├─ tests/

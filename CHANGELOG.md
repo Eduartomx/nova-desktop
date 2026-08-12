@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.6.2 — Update Reliability
+
+- Nuevo `update_runner.py` que supervisa las actualizaciones lanzadas desde la interfaz.
+- El botón `⬆ Actualizar` deja de depender de una cadena `cmd.exe && start` frágil.
+- Nova espera a que la instancia actual termine antes de reemplazar archivos administrados.
+- Cada actualización guarda un log local en `data/updater_logs/`.
+- El resultado se registra en `data/update_last.json` y se muestra al volver a abrir Nova.
+- Nova se vuelve a abrir incluso si el updater falla, evitando quedar cerrada sin explicación.
+- El relanzado usa `INICIAR.bat` cuando existe y tiene fallback directo a `pythonw.exe app.py`.
+- `ACTUALIZAR_NOVA.cmd` usa el mismo supervisor para que el flujo manual y el botón tengan el mismo comportamiento.
+- Pruebas automáticas para estado, versión y selección del intérprete del supervisor.
+
 ## v0.6.1 — Workspace Intelligence
 
 - Índice incremental local por workspace guardado en SQLite.

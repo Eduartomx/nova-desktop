@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import os
 import subprocess
 import sys
 import threading
@@ -31,11 +33,35 @@ def install_ui_v060():
         tk.Button(bar, text='📁 Proyectos', command=self.show_workspace_manager, width=12).pack(side='right')
         tk.Button(bar, text='🩺 Doctor', command=self.quick_doctor, width=10).pack(side='right', padx=(0, 6))
         tk.Button(bar, text='⬆ Actualizar', command=self.quick_update, width=11).pack(side='right', padx=(0, 6))
-        self._append('system', 'v0.6.0: Memory & Workspace. Nova mantiene proyectos activos, recupera memoria relevante y asocia tareas al proyecto actual.')
+        self._append('system', 'v0.6.x: Memory, Workspace Intelligence y actualización nativa desde GitHub.')
 
     def init(self, *a, **kw):
         self.workspace_window = None; self.workspace_listbox = None; self.workspace_rows = []
-        original_init(self, *a, **kw); self.root.title(f'{self.name} · Asistente local v0.6.0'); self.root.after(280, self._refresh_workspace_label)
+        original_init(self, *a, **kw)
+        self.root.title(f'{self.name} · Asistente local v0.6.2')
+        self.root.after(280, self._refresh_workspace_label)
+        self.root.after(900, self._consume_update_status)
+
+    def consume_update_status(self):
+        path = Path(__file__).resolve().parent.parent / 'data' / 'update_last.json'
+        if not path.exists():
+            return
+        try:
+            data = json.loads(path.read_text(encoding='utf-8'))
+            path.unlink(missing_ok=True)
+            before = str(data.get('before') or '?')
+            after = str(data.get('after') or '?')
+            log = str(data.get('log') or '')
+            if data.get('ok'):
+                self._append('system', f'Actualización completada: Nova {before} → {after}.')
+                self.status_var.set(f'Nova {after} · actualización correcta')
+            else:
+                error = str(data.get('error') or 'Error desconocido')
+                self._append('system', f'La actualización no se pudo completar. Nova se reinició sin quedar cerrada.\n{error}\nLog: {log}')
+                self.status_var.set('La actualización falló; Nova fue restaurada/reiniciada')
+                messagebox.showwarning('Nova · Actualización', f'La actualización no se completó.\n\n{error}\n\nLog:\n{log}', parent=self.root)
+        except Exception:
+            pass
 
     def refresh_label(self):
         try:
@@ -101,16 +127,26 @@ def install_ui_v060():
 
     def quick_update(self):
         root = Path(__file__).resolve().parent.parent
-        updater = root / 'updater' / 'nova_updater.py'
-        starter = root / 'INICIAR.bat'
+        runner = root / 'updater' / 'update_runner.py'
+        py = root / '.venv' / 'Scripts' / 'python.exe'
+        if not py.exists():
+            current = Path(sys.executable)
+            py = current.with_name('python.exe') if current.name.casefold() == 'pythonw.exe' and current.with_name('python.exe').exists() else current
+        if not runner.exists():
+            messagebox.showerror('Nova · Actualizador', f'Falta el supervisor de actualización:\n{runner}', parent=self.root)
+            return
         try:
-            command = f'"{sys.executable}" "{updater}" --yes && start "" "{starter}"'
-            subprocess.Popen(['cmd.exe', '/d', '/c', command], cwd=str(root), creationflags=getattr(subprocess, 'CREATE_NEW_CONSOLE', 0))
-            self.status_var.set('Actualizando desde GitHub… Nova se reiniciará si la actualización termina bien.')
-            self.root.after(450, self._close)
-        except Exception as exc: messagebox.showerror('Nova · Actualizador', str(exc), parent=self.root)
+            subprocess.Popen(
+                [str(py), str(runner), '--parent-pid', str(os.getpid())],
+                cwd=str(root),
+                creationflags=getattr(subprocess, 'CREATE_NEW_CONSOLE', 0),
+            )
+            self.status_var.set('Actualizando desde GitHub… Nova se cerrará y volverá a abrirse automáticamente.')
+            self.root.after(250, self._close)
+        except Exception as exc:
+            messagebox.showerror('Nova · Actualizador', str(exc), parent=self.root)
 
     UI._build = build; UI.__init__ = init; UI._refresh_workspace_label = refresh_label; UI._refresh_workspace_manager = refresh_manager
     UI.show_workspace_manager = show_manager; UI._selected_workspace = selected; UI._workspace_add_folder = add_folder; UI._workspace_activate_selected = activate; UI._workspace_open_selected = open_selected
-    UI.quick_doctor = quick_doctor; UI.quick_update = quick_update; UI._nova_v060_patched = True
+    UI.quick_doctor = quick_doctor; UI.quick_update = quick_update; UI._consume_update_status = consume_update_status; UI._nova_v060_patched = True
     return mod
