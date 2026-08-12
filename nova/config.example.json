@@ -82,6 +82,32 @@
     "cpu_warn_percent": 92.0,
     "memory_warn_percent": 90.0
   },
+  "context_intelligence": {
+    "enabled": true,
+    "recent_event_limit": 32,
+    "prompt_event_limit": 4,
+    "minimum_prompt_relevance": 0.30,
+    "workspace_confidence_bonus": 0.22,
+    "system_pressure_bonus": 0.38,
+    "app_change_bonus": 0.16,
+    "workspace_change_bonus": 0.24,
+    "include_window_title_in_prompt": false
+  },
+  "workspace_autodetect": {
+    "enabled": true,
+    "learn_enabled": true,
+    "observe_interval_seconds": 4.0,
+    "learn_cooldown_seconds": 20.0,
+    "suggestion_threshold": 0.84,
+    "ambiguity_margin": 0.18,
+    "minimum_confirmations": 3,
+    "auto_activate": false,
+    "auto_activate_threshold": 0.97,
+    "auto_activate_min_confirmations": 6,
+    "auto_activate_dwell_seconds": 15.0,
+    "auto_activate_cooldown_seconds": 90.0,
+    "learn_app_kinds": ["code_editor", "terminal", "game", "office"]
+  },
   "hotkey": "<ctrl>+<alt>+<space>",
   "desktop": {
     "auto_context": true,
