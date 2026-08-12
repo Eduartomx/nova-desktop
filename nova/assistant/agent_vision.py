@@ -66,8 +66,11 @@ def install_agent_vision():
     original_prompt = getattr(Agent, "_system_prompt", None)
 
     def ask(self, user_text):
-        vision = get_event_vision(self.config, getattr(self, "memory", None))
         action = vision_direct_intent(user_text)
+        if action is None:
+            return original_ask(self, user_text)
+
+        vision = get_event_vision(self.config, getattr(self, "memory", None))
 
         if action == "status":
             try:
@@ -109,16 +112,13 @@ def install_agent_vision():
 
     def system_prompt(self):
         base = original_prompt(self) if callable(original_prompt) else ""
-        vision = get_event_vision(self.config, getattr(self, "memory", None))
-        try:
-            status = vision.status(refresh_capability=False)
-            state = (
-                f"Event-driven Vision: {'activa' if status.get('enabled') else 'desactivada'} · "
-                f"captura periódica=no · modelo={status.get('model') or 'sin configurar'} · "
-                f"modelo listo={'sí' if status.get('model_ready') else 'no/por comprobar'}"
-            )
-        except Exception:
-            state = "Event-driven Vision: estado temporalmente no disponible"
+        cfg = self.config.get("event_driven_vision", {}) if isinstance(self.config, dict) else {}
+        enabled = bool(cfg.get("enabled", True))
+        model = str(cfg.get("model") or self.config.get("model") or "sin configurar")
+        state = (
+            f"Event-driven Vision: {'activa' if enabled else 'desactivada'} · "
+            f"captura periódica=no · modelo={model} · capacidad visual se comprueba solo al usar visión"
+        )
         return base + f"""
 
 EVENT-DRIVEN VISION
