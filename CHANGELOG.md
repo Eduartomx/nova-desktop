@@ -1,5 +1,21 @@
 # Changelog
 
+## v0.6.0 — Memory & Workspace
+
+- Nuevo sistema de **Workspaces** persistentes con proyecto activo.
+- Detección rápida de proyectos: Nova, Minecraft server, Python, Node, Arduino, Godot, Unity, Visual Studio y Git.
+- Metadatos específicos para servidores Minecraft: mods y propiedades básicas.
+- Memoria enriquecida con categoría, alcance global/workspace, importancia y fuente.
+- Búsqueda local de memoria relevante sin invocar al LLM.
+- El prompt usa solo recuerdos relevantes para reducir contexto y latencia.
+- Las tareas del Task Engine se asocian automáticamente al workspace activo.
+- Nuevas herramientas: `memory_search`, `workspace_list`, `workspace_create`, `workspace_set_active`, `workspace_info`, `workspace_open`.
+- Gestor visual de proyectos desde la interfaz.
+- Nova Doctor rápido y determinista, sin usar el modelo local.
+- Botón `Actualizar` integrado en Nova para instalar desde GitHub y reiniciar tras una actualización correcta.
+- Capa de compatibilidad v0.6 administrada desde GitHub para extender de forma segura instalaciones v0.5 mientras continúa la migración completa del núcleo.
+- Pruebas automáticas de Memory/Workspace y liberación del archivo SQLite.
+
 ## v0.5.8 — GitHub Native Updates
 
 - GitHub pasa a ser la fuente de verdad del código de Nova.
