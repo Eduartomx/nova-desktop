@@ -1,0 +1,57 @@
+name: Publish Nova Native Release
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "VERSION"
+      - "nova/**"
+      - ".github/workflows/publish-native.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Validate source syntax
+        run: python -m compileall -q nova
+
+      - name: Read version
+        id: version
+        shell: bash
+        run: |
+          VERSION="$(tr -d '\r\n ' < VERSION)"
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9._-]+)?$ ]]; then
+            echo "Invalid VERSION: $VERSION"
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Create release if missing
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+          VERSION: ${{ steps.version.outputs.version }}
+        shell: bash
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "$TAG already exists; nothing to publish."
+            exit 0
+          fi
+          gh release create "$TAG" \
+            --target "$GITHUB_SHA" \
+            --title "Nova v$VERSION" \
+            --generate-notes \
+            --latest

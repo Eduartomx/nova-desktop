@@ -1,0 +1,14 @@
+ollama
+psutil
+Pillow
+pynput
+requests
+beautifulsoup4
+openai
+numpy
+sounddevice
+faster-whisper
+pyttsx3
+openwakeword
+pywinauto
+playwright

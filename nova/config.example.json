@@ -1,0 +1,91 @@
+{
+  "assistant_name": "Nova",
+  "model": "qwen3.5:4b",
+  "ollama_host": "http://127.0.0.1:11434",
+  "context_tokens": 8192,
+  "max_agent_steps": 10,
+  "task_engine": {
+    "enabled": true,
+    "performance_mode": "fast",
+    "fast_system_diagnostics": true,
+    "direct_read_tools": true,
+    "fast_verification": true,
+    "read_tool_cache_seconds": 8,
+    "task_context_tokens": 4096,
+    "json_max_tokens": 320,
+    "executor_max_tokens": 520,
+    "summary_max_tokens": 480,
+    "diagnostic_max_tokens": 420,
+    "max_plan_steps": 8,
+    "max_agent_turns_per_step": 6,
+    "max_step_retries": 1,
+    "stop_on_failed_step": true,
+    "auto_replan": true,
+    "max_replans": 2,
+    "max_tool_calls": 40,
+    "max_task_minutes": 20,
+    "pause_poll_ms": 150
+  },
+  "recent_messages": 16,
+  "hotkey": "<ctrl>+<space>",
+  "desktop": {
+    "auto_context": true,
+    "auto_visual_context": true,
+    "context_hotkey": "<ctrl>+<shift>+<space>",
+    "refresh_context_ms": 900
+  },
+  "voice": {
+    "enabled": true,
+    "language": "es",
+    "push_to_talk_hotkey": "<f9>",
+    "stt_model": "small",
+    "stt_device": "cpu",
+    "stt_compute_type": "int8",
+    "tts_enabled": true,
+    "wakeword_enabled": true,
+    "wakeword": "hey_jarvis",
+    "wakeword_threshold": 0.55,
+    "max_command_seconds": 15,
+    "speech_start_timeout": 4.0,
+    "silence_seconds": 1.0,
+    "energy_threshold": 0.015
+  },
+  "internet": {
+    "enabled": true,
+    "timeout_seconds": 12,
+    "max_page_chars": 18000
+  },
+  "browser": {
+    "enabled": true,
+    "channel": "msedge",
+    "headless": false,
+    "search_engine": "google",
+    "action_timeout_ms": 9000,
+    "navigation_timeout_ms": 25000,
+    "command_timeout_seconds": 35,
+    "snapshot_depth": 6
+  },
+  "openai": {
+    "enabled": true,
+    "model": "gpt-5.6-luna",
+    "confirm_paid_requests": true
+  },
+  "security": {
+    "profile": "trusted",
+    "restrict_files_to_allowed_roots": true,
+    "allowed_roots": ["~"],
+    "confirm_file_writes": false,
+    "confirm_powershell": false,
+    "confirm_input_actions": false,
+    "confirm_window_close": false,
+    "confirm_window_layout": false,
+    "confirm_clipboard_write": false,
+    "confirm_read_selection": false,
+    "confirm_uia_actions": false,
+    "confirm_browser_typing": false,
+    "confirm_browser_submit": false,
+    "confirm_browser_sensitive_clicks": true,
+    "confirm_browser_close_tab": false,
+    "backup_overwritten_files": true
+  }
+}
