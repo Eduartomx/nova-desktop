@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import tempfile
 import time
 import unittest
@@ -113,7 +112,8 @@ class EventVisionTests(unittest.TestCase):
             vision.stop()
             self.assertIsNone(detector._nova_event_vision_owner)
             self.assertTrue(callable(detector._emit))
-            self.assertNotEqual(detector._emit, original)  # bound-method identity is not stable; callable restoration is what matters
+            self.assertIs(detector._emit.__self__, detector)
+            self.assertIs(detector._emit.__func__, original.__func__)
 
     def test_auto_event_analysis_is_structured_and_rate_limited(self):
         with tempfile.TemporaryDirectory() as td:
