@@ -67,6 +67,21 @@
     "slow_ms": 1200,
     "summary_hours": 24
   },
+  "perception": {
+    "enabled": true,
+    "poll_interval_ms": 1100,
+    "inject_context": true,
+    "keep_last_external": true,
+    "persist_events": true,
+    "persist_window_titles": false,
+    "max_events": 1200,
+    "title_max_chars": 180,
+    "system_sample_seconds": 5.0,
+    "workspace_suggestion_threshold": 0.78,
+    "auto_activate_workspace": false,
+    "cpu_warn_percent": 92.0,
+    "memory_warn_percent": 90.0
+  },
   "hotkey": "<ctrl>+<alt>+<space>",
   "desktop": {
     "auto_context": true,

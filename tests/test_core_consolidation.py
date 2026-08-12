@@ -42,6 +42,7 @@ class CoreConsolidationTests(unittest.TestCase):
         self.assertEqual(status["bootstrap"], "assistant.core_runtime")
         self.assertFalse(status["versioned_runtime_chain"])
         self.assertIn("memory", status["github_managed_native"])
+        self.assertIn("perception", status["github_managed_native"])
         self.assertIn("agent", status["compatibility_adapters"])
 
 

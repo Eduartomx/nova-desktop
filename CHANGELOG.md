@@ -1,5 +1,21 @@
 # Changelog
 
+## v0.7.0 — Perception Engine
+
+- Nuevo `PerceptionEngine` nativo y local que observa metadatos de la ventana/proceso activo y carga básica del sistema sin usar LLM.
+- Sondeo ligero por defecto cada 1100 ms; no realiza screenshots periódicos, no captura teclado y no lee portapapeles.
+- Cuando Nova pasa al primer plano conserva la última ventana externa observada, permitiendo responder qué aplicación/ventana se estaba usando antes de abrir el asistente.
+- Clasificación barata de contexto: editor de código, navegador, terminal, explorador, juego, comunicación, multimedia, Office y otros.
+- Inferencia de workspace probable usando cwd del proceso y nombre/carpeta del proyecto en el título de ventana; nunca cambia automáticamente el workspace por defecto.
+- Contexto de percepción inyectado al agente con una barrera explícita contra prompt injection: los títulos de ventana se consideran datos no confiables.
+- Historial local limitado en `data/perception.db` para cambios de aplicación, workspace probable y presión/recuperación de CPU/RAM.
+- Los títulos de ventana no se persisten por defecto (`persist_window_titles=false`).
+- Nuevas herramientas de solo lectura: `perception_context`, `perception_status` y `perception_recent`.
+- Routing directo para preguntas como `¿qué aplicación tengo abierta?`, `¿qué estaba usando antes de abrir Nova?`, `¿está funcionando tu percepción?` y consultas de cambios recientes.
+- Nova Doctor incorpora una comprobación específica de Perception Engine y sus garantías de privacidad.
+- La UI inicia y detiene el motor junto con Nova; el hilo de percepción es daemon y no bloquea el cierre/actualizador.
+- Nuevas pruebas para detección de workspace, preservación de la última ventana externa, privacidad de eventos, clasificación y routing.
+
 ## v0.6.7 — Core Consolidation
 
 - `app.py` pasa a usar un único bootstrap estable: `assistant.core_runtime.install_core_runtime()`.

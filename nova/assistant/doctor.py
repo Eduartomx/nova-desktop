@@ -14,6 +14,7 @@ from typing import Any, Callable
 
 import psutil
 
+from .perception import get_perception
 from .profiler import get_profiler
 from .self_repair import SelfRepairManager
 
@@ -38,7 +39,8 @@ class NovaDoctor:
         required = [
             "app.py", "assistant/agent.py", "assistant/tools.py", "assistant/ui.py",
             "assistant/memory.py", "assistant/task_engine.py", "assistant/workspace.py",
-            "assistant/core_runtime.py", "updater/nova_updater.py", "NOVA_VERSION.txt",
+            "assistant/core_runtime.py", "assistant/perception.py",
+            "updater/nova_updater.py", "NOVA_VERSION.txt",
         ]
         missing = [x for x in required if not (self.root / x).exists()]
         if missing:
@@ -63,7 +65,7 @@ class NovaDoctor:
             return self._result(
                 "Arquitectura",
                 "ok",
-                f"core_runtime único · {native} dominios nativos · {adapters} adaptadores legacy · sin cadena v06x_runtime",
+                f"core_runtime único · {native} dominios nativos · {adapters} adaptadores legacy · sin cadena versionada",
                 architecture=status,
             )
         except Exception as exc:
@@ -118,11 +120,29 @@ class NovaDoctor:
         except Exception as exc:
             return self._result("Semantic Memory", "warn", str(exc))
 
+    def _perception(self):
+        try:
+            engine = get_perception(self.config, self.memory)
+            status = engine.status(refresh=True)
+            if not status.get("enabled"):
+                return self._result("Perception Engine", "warn", "Desactivado en config", perception=status)
+            process = status.get("process") or "sin ventana externa todavía"
+            candidate = status.get("probable_workspace") or None
+            detail = (
+                f"{'activo' if status.get('running') else 'preparado'} · {status.get('poll_interval_ms')} ms · "
+                f"{process} · sin screenshot/teclado/portapapeles"
+            )
+            if candidate:
+                detail += f" · proyecto probable: {candidate.get('name')} ({float(candidate.get('confidence',0))*100:.0f}%)"
+            return self._result("Perception Engine", "ok", detail, perception=status)
+        except Exception as exc:
+            return self._result("Perception Engine", "warn", str(exc))
+
     def _ollama(self):
         host = str(self.config.get("ollama_host", "http://127.0.0.1:11434")).rstrip("/")
         model = str(self.config.get("model", "qwen3.5:4b"))
         try:
-            req = urllib.request.Request(host + "/api/tags", headers={"User-Agent": "Nova-Doctor/0.6.7"})
+            req = urllib.request.Request(host + "/api/tags", headers={"User-Agent": "Nova-Doctor/0.7.0"})
             with urllib.request.urlopen(req, timeout=2.5) as r:
                 data = json.load(r)
             names = {str(x.get("name") or x.get("model") or "") for x in data.get("models", [])}
@@ -206,6 +226,7 @@ class NovaDoctor:
             self._dependencies,
             self._memory,
             self._semantic_memory,
+            self._perception,
             self._ollama,
             self._gpu,
             self._system,
@@ -222,7 +243,7 @@ class NovaDoctor:
                     results.append(self._result(future_map[future], "error", str(exc)))
         wanted = [
             "Python", "Core Nova", "Arquitectura", "Dependencias", "Memoria",
-            "Semantic Memory", "Ollama", "GPU", "Sistema", "GitHub", "Browser Agent",
+            "Semantic Memory", "Perception Engine", "Ollama", "GPU", "Sistema", "GitHub", "Browser Agent",
         ]
         results.sort(key=lambda x: wanted.index(x["name"]) if x["name"] in wanted else 999)
         duration = round(time.perf_counter() - started, 2)
