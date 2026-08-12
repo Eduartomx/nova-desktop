@@ -54,6 +54,13 @@
     "recency_weight": 0.05,
     "minimum_semantic_score": 0.12
   },
+  "continuity": {
+    "enabled": true,
+    "auto_checkpoint_tasks": true,
+    "inject_context": true,
+    "history_limit": 12,
+    "max_items_per_checkpoint": 60
+  },
   "hotkey": "<ctrl>+<space>",
   "desktop": {
     "auto_context": true,

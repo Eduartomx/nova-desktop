@@ -97,6 +97,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "recency_weight": 0.05,
         "minimum_semantic_score": 0.12,
     },
+    "continuity": {
+        "enabled": True,
+        "auto_checkpoint_tasks": True,
+        "inject_context": True,
+        "history_limit": 12,
+        "max_items_per_checkpoint": 60,
+    },
     "hotkey": "<ctrl>+<space>",
     "desktop": {
         "auto_context": True,

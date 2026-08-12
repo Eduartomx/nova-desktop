@@ -3,15 +3,17 @@ import traceback
 from pathlib import Path
 import tkinter as tk
 
-# v0.6 añade Memory, Workspace Intelligence y Semantic Memory sobre los
-# módulos históricos v0.5 mientras completamos la migración del núcleo.
+# v0.6 añade Memory, Workspace Intelligence, Semantic Memory y Continuity
+# sobre los módulos históricos v0.5 mientras completamos la migración del núcleo.
 from assistant.v060_runtime import install_v060
 from assistant.v061_runtime import install_v061
 from assistant.v063_runtime import install_v063
+from assistant.v065_runtime import install_v065
 
 install_v060()
 install_v061()
 install_v063()
+install_v065()
 
 from assistant.config import load_config
 from assistant.ui import AssistantUI
