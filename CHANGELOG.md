@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.6.6 — Self Repair + Performance Profiler
+
+- Nova Doctor pasa de diagnóstico a diagnóstico + reparación determinista con confirmación explícita antes de instalaciones, descargas o cambios importantes.
+- Reparaciones disponibles para archivos gestionados de Nova, dependencias Python, Ollama, modelos principal/semántico, GitHub CLI/autenticación y fallback de Playwright.
+- Nueva ventana de Nova Doctor con botones de reparación, re-diagnóstico automático y resumen de rendimiento.
+- Nuevo Performance Profiler 100% local en `data/performance.db`; no registra prompts, mensajes, secretos ni contenido de archivos.
+- Métricas de duración para Agent, memoria, embeddings, herramientas, Task Engine (cuando está disponible) y Nova Doctor.
+- Nuevas herramientas `performance_summary`, `performance_recent` y `doctor_repairs`.
+- Routing directo para preguntas como `¿cómo va tu rendimiento?`, `¿por qué estás lento?` y `¿qué puedes reparar?`.
+- El profiler identifica cuellos de botella por promedio y conserva un historial acotado para evitar crecimiento indefinido.
+- El atajo global predeterminado cambia de `Ctrl + Espacio` a `Ctrl + Alt + Espacio` para reducir conflictos con juegos.
+- Las instalaciones existentes que todavía usan exactamente el antiguo `Ctrl + Espacio` se migran automáticamente; cualquier hotkey personalizado distinto se conserva.
+- Nuevas pruebas para profiler, privacidad de metadatos, detección de reparaciones, routing y migración del hotkey.
+
 ## v0.6.5 — Continuity Engine
 
 - Nuevas sesiones persistentes de trabajo por workspace mediante `continuity_sessions`.
