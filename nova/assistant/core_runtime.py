@@ -4,9 +4,9 @@ from __future__ import annotations
 
 Desde v0.6.7 Memory/Workspace/Semantic Memory/Continuity y Nova Doctor son
 módulos nativos administrados por GitHub. En v0.7 Perception Engine, Context
-Intelligence y Workspace Auto-Detection se suman como dominios nativos.
-Agent/Tools/UI/TaskEngine todavía usan la base histórica local v0.5, por lo que
-aquí se instalan únicamente adaptadores por dominio.
+Intelligence, Workspace Auto-Detection y Anomaly Detection se suman como
+dominios nativos. Agent/Tools/UI/TaskEngine todavía usan la base histórica
+local v0.5, por lo que aquí se instalan únicamente adaptadores por dominio.
 """
 
 _INSTALLED = False
@@ -26,6 +26,7 @@ def install_core_runtime():
     from .tools_perception import install_tools_perception
     from .tools_context_intelligence import install_tools_context_intelligence
     from .tools_workspace_autodetect import install_tools_workspace_autodetect
+    from .tools_anomaly import install_tools_anomaly
     install_tools_v060()
     install_tools_v061()
     install_tools_v063()
@@ -34,18 +35,21 @@ def install_core_runtime():
     install_tools_perception()
     install_tools_context_intelligence()
     install_tools_workspace_autodetect()
+    install_tools_anomaly()
 
-    # Agent: workspace -> semantic -> continuity -> diagnostics -> perception/context/autodetect.
+    # Agent: workspace -> semantic -> continuity -> diagnostics -> perception/context/autodetect -> anomaly.
     from .agent_workspace import install_agent_v060
     from .agent_semantic import install_agent_v063
     from .agent_continuity import install_agent_v065
     from .agent_diagnostics import install_agent_v066
     from .agent_perception import install_agent_perception
+    from .agent_anomaly import install_agent_anomaly
     install_agent_v060()
     install_agent_v063()
     install_agent_v065()
     install_agent_v066()
     install_agent_perception()
+    install_agent_anomaly()
 
     # UI y hooks del profiler al final.
     from .ui_workspace import install_ui_v060
@@ -54,6 +58,7 @@ def install_core_runtime():
     from .ui_diagnostics import install_ui_v066
     from .ui_perception import install_ui_perception
     from .ui_workspace_autodetect import install_ui_workspace_autodetect
+    from .ui_anomaly import install_ui_anomaly
     from .profiler_hooks import install_profiler_v066
     install_ui_v060()
     install_ui_v063()
@@ -61,6 +66,7 @@ def install_core_runtime():
     install_ui_v066()
     install_ui_perception()
     install_ui_workspace_autodetect()
+    install_ui_anomaly()
     install_profiler_v066()
 
     _INSTALLED = True
@@ -83,7 +89,7 @@ def architecture_status() -> dict:
         "github_managed_native": [
             "memory", "workspace", "workspace_index", "semantic_memory",
             "continuity", "doctor", "profiler", "self_repair", "perception",
-            "context_intelligence", "workspace_autodetect",
+            "context_intelligence", "workspace_autodetect", "anomaly_detection",
         ],
         "compatibility_adapters": ["agent", "tools", "ui", "task_engine"],
         "versioned_runtime_chain": False,

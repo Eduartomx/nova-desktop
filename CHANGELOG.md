@@ -1,5 +1,39 @@
 # Changelog
 
+## v0.7.3 — Anomaly Detection
+
+- Nuevo `AnomalyDetector` local y determinista sobre Perception Engine + Context Intelligence.
+- Aprende una línea base de CPU/RAM por actividad (`gaming`, `programming`, `browsing`, etc.) y una línea base de consumo por proceso.
+- Las alertas requieren desviaciones sostenidas para reducir falsos positivos por picos breves.
+- Contexto sensible: jugar o usar procesos pesados esperados como Ollama eleva los umbrales antes de considerar el consumo anómalo.
+- Detecta procesos nuevos con consumo alto o procesos conocidos que se desvían de su comportamiento normal.
+- Señales best-effort de crash mediante apariciones de Windows Error Reporting (`WerFault.exe`/`wermgr.exe`), con escalado si se repiten en una ventana corta.
+- Nueva base local `data/anomaly_detection.db`; no guarda cmdline, rutas, títulos de ventana, contenido de pantalla, teclado ni portapapeles.
+- Nunca mata, bloquea, desinstala o repara procesos automáticamente.
+- Herramientas: `anomaly_status`, `anomaly_recent`, `anomaly_mark_process_expected`, `anomaly_acknowledge`.
+- Routing directo para consultas como `¿hay algo raro en mi PC?`, estado del baseline y marcado explícito de procesos esperados.
+- El Agent recibe solo un resumen compacto de anomalías pendientes y trata los nombres de proceso como datos no confiables.
+- Pruebas para baseline, carga alta esperada en juegos, proceso nuevo pesado, preferencias del usuario, señales repetidas de crash, privacidad y routing.
+
+## v0.7.2 — Workspace Auto-Detection
+
+- Aprendizaje local persistente de asociaciones aplicación ↔ workspace en `data/workspace_autodetect.db`.
+- Solo entrena con evidencia confiable acumulada (`cwd` dentro del workspace o coincidencia corroborada por el workspace activo); un título de ventana aislado nunca entrena.
+- Las asociaciones contradictorias pierden confianza y las fijadas explícitamente por el usuario tienen prioridad.
+- Detección de ambigüedad para evitar elegir un proyecto cuando dos asociaciones tienen confianza parecida.
+- Activación automática del workspace permanece deshabilitada por defecto y exige umbrales estrictos si el usuario decide habilitarla.
+- Herramientas para estado, asociaciones, aprendizaje explícito y olvido de asociaciones.
+- Routing directo para preguntar qué proyecto cree Nova que está activo.
+
+## v0.7.1 — Context Intelligence
+
+- Nueva capa determinista sobre Perception Engine para inferir actividad probable y puntuar relevancia contextual.
+- Reduce rebotes repetitivos entre aplicaciones y evita llenar el prompt con cambios irrelevantes.
+- Infiere actividades como programación, investigación, navegación, juegos, ofimática y administración de archivos.
+- El prompt recibe un bloque compacto de aplicación, actividad, workspace probable, relevancia y solo señales importantes.
+- Los títulos de ventana quedan fuera del prompt por defecto y siguen tratándose como datos no confiables.
+- Herramientas: `context_activity`, `context_relevant_recent`, `context_intelligence_status`.
+
 ## v0.7.0 — Perception Engine
 
 - Nuevo `PerceptionEngine` nativo y local que observa metadatos de la ventana/proceso activo y carga básica del sistema sin usar LLM.
