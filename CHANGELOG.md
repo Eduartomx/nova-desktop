@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.6.5 — Continuity Engine
+
+- Nuevas sesiones persistentes de trabajo por workspace mediante `continuity_sessions`.
+- Checkpoints estructurados en `continuity_checkpoints`: resumen, completado, pendientes, archivos, decisiones, errores y metadatos.
+- Las tareas del Task Engine abren una sesión automáticamente y generan checkpoints al completar/fallar/pausar/bloquear pasos o tareas.
+- Routing determinista para `Nova, continúa`, `¿dónde nos quedamos?`, `¿qué quedó pendiente?` y `¿qué hicimos ayer?`.
+- `Nova, continúa` reconstruye primero el estado local y solo después entra al agente normal, evitando repetir trabajo ya completado.
+- Nuevas herramientas: `continuity_resume`, `continuity_pending`, `continuity_history`, `continuity_checkpoint` y `continuity_close`.
+- El system prompt recibe un contexto compacto de continuidad del workspace activo, separado de Semantic Memory.
+- La interfaz avisa al iniciar si el workspace activo tiene trabajo pendiente y permite retomarlo con lenguaje natural.
+- Continuity es tolerante a fallos: un problema al guardar un checkpoint nunca debe romper el Task Engine.
+- Nuevas pruebas de persistencia tras reabrir SQLite, checkpoints automáticos, cierre de sesiones y routing.
+
 ## v0.6.4 — Semantic Routing Hotfix
 
 - Corrige el comando explícito `reindexa la memoria semántica`, que podía caer en el Task Engine y confundirse con Windows Search/SearchIndexer.
