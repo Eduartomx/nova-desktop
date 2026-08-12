@@ -1,0 +1,8 @@
+{
+  "repository": "Eduartomx/nova-desktop",
+  "channel": "stable",
+  "check_on_start": false,
+  "asset_prefix": "Nova_Parche_",
+  "github_api": "https://api.github.com",
+  "github_web": "https://github.com"
+}
