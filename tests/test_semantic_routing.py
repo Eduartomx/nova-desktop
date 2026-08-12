@@ -1,6 +1,6 @@
 import unittest
 
-from nova.assistant.v063_agent import (
+from nova.assistant.agent_semantic import (
     _format_reindex_result,
     _format_status_result,
     semantic_direct_intent,
