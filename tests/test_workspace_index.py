@@ -5,9 +5,6 @@ import time
 import unittest
 from pathlib import Path
 
-from assistant.v060_memory import install_memory_v060
-
-install_memory_v060()
 from assistant.memory import MemoryStore
 from assistant.workspace import WorkspaceManager
 from assistant.workspace_index import WorkspaceIndexer
