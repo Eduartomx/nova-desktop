@@ -149,6 +149,20 @@
     "persist_analysis": false,
     "max_events": 300
   },
+  "skills": {
+    "enabled": true,
+    "inject_context": true,
+    "suggest_on_match": true,
+    "suggest_threshold": 0.72,
+    "explicit_run_threshold": 0.58,
+    "max_prompt_skills": 3,
+    "max_steps": 24,
+    "max_skills": 500,
+    "max_trigger_phrases": 20,
+    "workspace_scoped_by_default": false,
+    "generated_skills_start_as_draft": true,
+    "auto_execute_matches": false
+  },
   "hotkey": "<ctrl>+<alt>+<space>",
   "desktop": {
     "auto_context": true,
