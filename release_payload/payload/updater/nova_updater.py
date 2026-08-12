@@ -17,7 +17,7 @@ from pathlib import Path
 
 
 APP_NAME = "Nova"
-UPDATER_VERSION = "1.1-github"
+UPDATER_VERSION = "1.2-github-auth"
 USER_AGENT = f"Nova-Updater/{UPDATER_VERSION}"
 
 
@@ -83,15 +83,51 @@ def request_json(url: str):
         return json.load(r)
 
 
+def find_gh() -> str | None:
+    candidates = [
+        shutil.which("gh"),
+        str(Path(os.environ.get("ProgramFiles", r"C:\\Program Files")) / "GitHub CLI" / "gh.exe"),
+    ]
+    for candidate in candidates:
+        if candidate and Path(candidate).exists():
+            return str(Path(candidate))
+    return None
+
+
+def github_json(endpoint: str, fallback_url: str):
+    """Use authenticated GitHub CLI first, then anonymous HTTP as fallback."""
+    gh = find_gh()
+    if gh:
+        try:
+            p = subprocess.run(
+                [gh, "api", endpoint],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=25,
+            )
+            if p.returncode == 0 and p.stdout.strip():
+                return json.loads(p.stdout)
+        except Exception:
+            pass
+    return request_json(fallback_url)
+
+
 def get_release(cfg: dict) -> dict:
     repo = cfg["repository"]
     api = cfg.get("github_api", "https://api.github.com").rstrip("/")
     channel = cfg.get("channel", "stable").lower()
 
     if channel == "stable":
-        return request_json(f"{api}/repos/{repo}/releases/latest")
+        return github_json(
+            f"repos/{repo}/releases/latest",
+            f"{api}/repos/{repo}/releases/latest",
+        )
 
-    releases = request_json(f"{api}/repos/{repo}/releases?per_page=30")
+    releases = github_json(
+        f"repos/{repo}/releases?per_page=30",
+        f"{api}/repos/{repo}/releases?per_page=30",
+    )
     usable = [r for r in releases if not r.get("draft")]
     if not usable:
         raise RuntimeError("No hay releases publicadas.")
