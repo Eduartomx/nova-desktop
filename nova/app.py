@@ -6,8 +6,10 @@ import tkinter as tk
 # v0.6 añade Memory & Workspace sobre los módulos históricos v0.5 que
 # siguen instalados localmente mientras completamos la migración a GitHub.
 from assistant.v060_runtime import install_v060
+from assistant.v061_runtime import install_v061
 
 install_v060()
+install_v061()
 
 from assistant.config import load_config
 from assistant.ui import AssistantUI
