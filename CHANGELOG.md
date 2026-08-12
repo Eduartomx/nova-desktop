@@ -1,5 +1,22 @@
 # Changelog
 
+## v0.7.4 — Event-driven Vision
+
+- Nueva capa `EventDrivenVision` local que usa capturas únicamente bajo una consulta visual explícita o un evento configurado; no existe hilo de screenshots periódicos.
+- Captura preferentemente la última aplicación externa observada por Perception Engine para evitar fotografiar la propia ventana de Nova cuando el usuario abre el asistente.
+- Análisis local mediante Ollama `/api/chat` con imágenes y comprobación previa de capability `vision`; no descarga modelos automáticamente ni usa OpenAI como fallback automático.
+- Por defecto solo `crash_signal` puede disparar una captura automática. Las anomalías de CPU/RAM no abren visión salvo configuración explícita, porque normalmente se explican mejor con métricas.
+- Rate limit de capturas automáticas: cooldown y máximo por hora para impedir loops de screenshots ante eventos repetidos.
+- Las imágenes se procesan en memoria y no se conservan por defecto (`retain_images=false`). El texto del análisis tampoco se persiste por defecto (`persist_analysis=false`).
+- La base `data/vision_events.db` guarda únicamente metadatos seguros de ejecución, categoría y confianza; no guarda imágenes, prompts ni títulos de ventana por defecto.
+- Todo contenido de pantalla se trata como dato externo no confiable: instrucciones visibles en webs, terminales, chats, juegos o documentos nunca autorizan acciones.
+- El prompt visual prohíbe transcribir contraseñas, tokens, cookies, claves API u otros secretos visibles.
+- Nuevas herramientas: `vision_status`, `vision_describe_screen`, `vision_last`, `vision_recent_events`.
+- Routing directo para `¿qué ves en mi pantalla?`, `mira mi pantalla`, estado de visión y último análisis visual.
+- Event-driven Vision se enlaza a Anomaly Detection mediante callback en memoria; no necesita polling visual.
+- Se añade `anomaly_detection.py` como módulo de compatibilidad estable para corregir la diferencia de nombre publicada en v0.7.3 (`anomaly.py` vs. adaptadores `anomaly_detection`).
+- Nuevas pruebas de privacidad, routing, ausencia de polling, política de triggers, rate limiting, capability del modelo y compatibilidad de Anomaly Detection.
+
 ## v0.7.3 — Anomaly Detection
 
 - Nuevo `AnomalyDetector` local y determinista sobre Perception Engine + Context Intelligence.

@@ -4,7 +4,7 @@ Nova es un asistente virtual local para Windows que combina un modelo local medi
 
 ## Estado actual
 
-**Nova v0.7.0 — Perception Engine**
+**Nova v0.7.4 — Event-driven Vision**
 
 GitHub es la fuente oficial del proyecto:
 
@@ -15,43 +15,65 @@ GitHub es la fuente oficial del proyecto:
 - cada archivo se verifica contra su Git blob SHA;
 - se crea un backup antes de reemplazar archivos y existe rollback ante fallos de validación.
 
-## v0.7.0 — Perception Engine
+## Percepción 0.7
 
-Perception Engine mantiene un contexto barato del escritorio sin mantener visión encendida. Por defecto observa cada ~1,1 s únicamente metadatos de la ventana/proceso activo y carga básica del sistema.
+La rama 0.7 añade percepción incremental sin convertir Nova en un sistema que observa la pantalla continuamente.
 
-Puede conservar la última aplicación externa cuando Nova pasa al frente, clasificar el tipo de aplicación y relacionar el contexto con un workspace registrado. El workspace probable es solo una inferencia y **no se activa automáticamente** por defecto.
+### v0.7.0 — Perception Engine
 
-Ejemplos:
+Mantiene un contexto barato del escritorio observando cada ~1,1 s únicamente metadatos de ventana/proceso activo y carga básica del sistema. Puede conservar la última aplicación externa cuando Nova pasa al frente y relacionarla con un workspace probable.
 
-- `Nova, ¿qué aplicación tengo abierta?`
-- `¿Qué estaba usando antes de abrir Nova?`
-- `¿Está funcionando tu percepción?`
-- `¿Qué cambios de contexto viste recientemente?`
+### v0.7.1 — Context Intelligence
 
-Herramientas nuevas:
+Reduce rebotes entre aplicaciones, infiere actividad probable (`programming`, `gaming`, `browsing`, etc.) y puntúa la relevancia de los cambios antes de añadirlos al contexto del agente.
 
-- `perception_context`: contexto estructurado actual;
-- `perception_status`: estado y garantías de privacidad;
-- `perception_recent`: cambios recientes de aplicación/workspace/carga del sistema.
+### v0.7.2 — Workspace Auto-Detection
 
-### Privacidad de percepción
+Aprende asociaciones locales aplicación ↔ workspace mediante evidencia acumulada. Un título de ventana aislado nunca entrena la asociación y la activación automática del workspace permanece deshabilitada por defecto.
 
-Perception Engine v0.7.0:
+### v0.7.3 — Anomaly Detection
 
-- **no hace screenshots periódicos**;
-- **no captura teclado**;
-- **no lee portapapeles**;
-- no necesita LLM para observar el contexto;
-- guarda un historial local limitado en `data/perception.db`;
-- no persiste títulos de ventana por defecto (`persist_window_titles=false`).
+Aprende líneas base de CPU/RAM por actividad y proceso. Busca desviaciones sostenidas, procesos inesperadamente pesados y señales de Windows Error Reporting sin matar, bloquear o modificar procesos automáticamente.
 
-Los títulos visibles en el contexto del agente se tratan explícitamente como **datos externos/no confiables**, nunca como instrucciones.
+### v0.7.4 — Event-driven Vision
 
-## Núcleo 0.6 consolidado
+Añade visión local como **fallback por evento**, no como observación continua.
 
-Desde v0.6.7 Nova usa un único bootstrap `assistant.core_runtime.install_core_runtime()`. MemoryStore integra de forma nativa Workspaces, Semantic Memory y Continuity; Nova Doctor integra Self Repair y Performance Profiler.
+Nova puede usar una captura cuando:
 
-Los módulos históricos locales `agent.py`, `tools.py`, `ui.py` y `task_engine.py` todavía se mantienen como contrato legacy y reciben adaptadores estables por dominio. Esto permite continuar la migración sin reemplazar de golpe módulos que existían antes de que GitHub se convirtiera en la fuente oficial.
+- el usuario lo pide explícitamente (`Nova, ¿qué ves en mi pantalla?`);
+- aparece un evento visual permitido por la política local; por defecto solo una `crash_signal` de Anomaly Detection.
+
+No existe un hilo de screenshots periódicos. Las anomalías normales de CPU/RAM no disparan visión por defecto porque se explican mejor con métricas.
+
+La captura intenta usar la última aplicación externa observada por Perception Engine para evitar analizar la propia ventana de Nova. El análisis se hace mediante Ollama y solo si el modelo configurado informa capability `vision`. Nova **no descarga un modelo automáticamente** y **no usa OpenAI como fallback automático**.
+
+Herramientas:
+
+- `vision_status`;
+- `vision_describe_screen`;
+- `vision_last`;
+- `vision_recent_events`.
+
+Consultas directas:
+
+- `Nova, ¿qué ves en mi pantalla?`;
+- `Nova, mira mi pantalla`;
+- `¿qué error aparece en pantalla?`;
+- `¿estado de tu visión por eventos?`;
+- `¿cuál fue tu último análisis visual?`.
+
+### Privacidad de Event-driven Vision
+
+Por defecto:
+
+- **no hay screenshots periódicos**;
+- las imágenes se procesan en memoria y no se conservan (`retain_images=false`);
+- el texto completo del análisis visual no se persiste (`persist_analysis=false`);
+- `data/vision_events.db` guarda solo metadatos de ejecución, categoría y confianza;
+- no captura teclado ni lee portapapeles;
+- el contenido de la imagen se trata como dato externo/no confiable, nunca como instrucciones;
+- el prompt visual prohíbe repetir contraseñas, tokens, cookies, claves API y otros secretos visibles.
 
 ## Memory, Workspace y Continuity
 
@@ -76,6 +98,14 @@ Performance Profiler almacena métricas exclusivamente locales en `data/performa
 
 Puedes preguntar `Nova, ¿cómo va tu rendimiento?` para ver promedios y cuellos de botella recientes.
 
+## Núcleo consolidado
+
+Desde v0.6.7 Nova usa un único bootstrap `assistant.core_runtime.install_core_runtime()`. MemoryStore integra de forma nativa Workspaces, Semantic Memory y Continuity; Nova Doctor integra Self Repair y Performance Profiler.
+
+Los módulos históricos locales `agent.py`, `tools.py`, `ui.py` y `task_engine.py` todavía se mantienen como contrato legacy y reciben adaptadores estables por dominio.
+
+v0.7.4 también añade `assistant/anomaly_detection.py` como alias de compatibilidad del núcleo `assistant/anomaly.py`, corrigiendo la diferencia de nombre que podía afectar instalaciones 0.7.3.
+
 ## Atajos
 
 El atajo global por defecto es **Ctrl + Alt + Espacio**. El push-to-talk predeterminado sigue siendo **F9**.
@@ -91,6 +121,10 @@ nova-desktop/
 │  │  ├─ semantic_memory.py
 │  │  ├─ continuity.py
 │  │  ├─ perception.py
+│  │  ├─ context_intelligence.py
+│  │  ├─ workspace_autodetect.py
+│  │  ├─ anomaly.py
+│  │  ├─ event_vision.py
 │  │  ├─ profiler.py
 │  │  ├─ self_repair.py
 │  │  ├─ workspace.py
@@ -113,9 +147,9 @@ nova-desktop/
 
 ## Privacidad general
 
-Nunca deben subirse al repositorio `config.json` real, `assistant.db`, `performance.db`, `perception.db`, `data/`, perfiles del navegador, capturas, logs personales, `.venv/`, claves API, tokens o credenciales.
+Nunca deben subirse al repositorio `config.json` real, `assistant.db`, `performance.db`, `perception.db`, `anomaly_detection.db`, `vision_events.db`, `data/`, perfiles del navegador, capturas, logs personales, `.venv/`, claves API, tokens o credenciales.
 
-`nova/config.example.json` contiene únicamente valores de ejemplo/por defecto. Memoria, embeddings, métricas y percepción permanecen locales salvo que una herramienta externa sea invocada explícitamente para una tarea.
+`nova/config.example.json` contiene únicamente valores de ejemplo/por defecto. Memoria, embeddings, métricas, percepción y visión permanecen locales salvo que una herramienta externa sea invocada explícitamente para una tarea.
 
 ## Publicación
 
