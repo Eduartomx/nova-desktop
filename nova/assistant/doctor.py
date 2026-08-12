@@ -1,0 +1,173 @@
+from __future__ import annotations
+
+import importlib.util
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+from typing import Any, Callable
+
+import psutil
+
+
+class NovaDoctor:
+    """Diagnóstico determinista y rápido. No usa el LLM."""
+
+    def __init__(self, config: dict[str, Any], memory=None):
+        self.config = config
+        self.memory = memory
+        self.root = Path(__file__).resolve().parent.parent
+
+    @staticmethod
+    def _result(name: str, status: str, detail: str, **extra) -> dict[str, Any]:
+        return {"name": name, "status": status, "detail": detail, **extra}
+
+    def _python(self):
+        ok = sys.version_info[:2] >= (3, 11)
+        return self._result("Python", "ok" if ok else "warn", f"{sys.version.split()[0]} · {sys.executable}")
+
+    def _core_files(self):
+        required = [
+            "app.py", "assistant/agent.py", "assistant/tools.py", "assistant/ui.py",
+            "assistant/memory.py", "assistant/task_engine.py", "assistant/workspace.py",
+            "updater/nova_updater.py", "NOVA_VERSION.txt",
+        ]
+        missing = [x for x in required if not (self.root / x).exists()]
+        if missing:
+            return self._result("Core Nova", "error", "Faltan: " + ", ".join(missing))
+        version = (self.root / "NOVA_VERSION.txt").read_text(encoding="utf-8", errors="ignore").strip()
+        return self._result("Core Nova", "ok", f"v{version} · archivos esenciales presentes")
+
+    def _dependencies(self):
+        modules = ["ollama", "psutil", "PIL", "pynput", "requests", "bs4", "numpy", "playwright", "pywinauto"]
+        missing = [name for name in modules if importlib.util.find_spec(name) is None]
+        if missing:
+            return self._result("Dependencias", "warn", "Faltan módulos: " + ", ".join(missing), missing=missing)
+        return self._result("Dependencias", "ok", f"{len(modules)}/{len(modules)} módulos base disponibles")
+
+    def _memory(self):
+        if self.memory is None:
+            return self._result("Memoria", "warn", "MemoryStore no proporcionado")
+        try:
+            stats = self.memory.stats()
+            ws = self.memory.active_workspace()
+            detail = (
+                f"DB {stats['db_size_mb']} MB · {stats['memory_items']} memorias · "
+                f"{stats['workspaces']} workspaces · {stats['tasks']} tareas"
+            )
+            if ws:
+                detail += f" · activo: {ws.get('name')}"
+            return self._result("Memoria", "ok", detail, stats=stats)
+        except Exception as exc:
+            return self._result("Memoria", "error", str(exc))
+
+    def _ollama(self):
+        host = str(self.config.get("ollama_host", "http://127.0.0.1:11434")).rstrip("/")
+        model = str(self.config.get("model", "qwen3.5:4b"))
+        try:
+            req = urllib.request.Request(host + "/api/tags", headers={"User-Agent": "Nova-Doctor/0.6"})
+            with urllib.request.urlopen(req, timeout=2.5) as r:
+                data = json.load(r)
+            names = {str(x.get("name") or x.get("model") or "") for x in data.get("models", [])}
+            if model not in names:
+                return self._result("Ollama", "warn", f"Conectado, pero no aparece {model}")
+            return self._result("Ollama", "ok", f"Conectado · {model} disponible")
+        except Exception as exc:
+            return self._result("Ollama", "error", f"No responde: {exc}")
+
+    def _gpu(self):
+        smi = shutil.which("nvidia-smi")
+        if not smi:
+            return self._result("GPU", "warn", "nvidia-smi no disponible; puede ser normal si no usas NVIDIA")
+        try:
+            cp = subprocess.run(
+                [smi, "--query-gpu=name,utilization.gpu,memory.used,memory.total,temperature.gpu", "--format=csv,noheader,nounits"],
+                capture_output=True, text=True, timeout=3,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            if cp.returncode != 0 or not cp.stdout.strip():
+                return self._result("GPU", "warn", (cp.stderr or "nvidia-smi sin datos").strip())
+            first = cp.stdout.strip().splitlines()[0]
+            parts = [x.strip() for x in first.split(",")]
+            if len(parts) >= 5:
+                name, util, used, total, temp = parts[:5]
+                return self._result("GPU", "ok", f"{name} · {util}% · VRAM {used}/{total} MB · {temp} °C")
+            return self._result("GPU", "ok", first)
+        except Exception as exc:
+            return self._result("GPU", "warn", str(exc))
+
+    def _system(self):
+        try:
+            vm = psutil.virtual_memory()
+            cpu = psutil.cpu_percent(interval=0.15)
+            proc = psutil.Process(os.getpid())
+            nova_mb = proc.memory_info().rss / 1024**2
+            return self._result("Sistema", "ok", f"CPU {cpu:.0f}% · RAM {vm.percent:.0f}% · Nova {nova_mb:.0f} MB")
+        except Exception as exc:
+            return self._result("Sistema", "warn", str(exc))
+
+    def _github(self):
+        gh = shutil.which("gh")
+        if not gh:
+            candidate = Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "GitHub CLI" / "gh.exe"
+            if candidate.exists():
+                gh = str(candidate)
+        if not gh:
+            return self._result("GitHub", "warn", "GitHub CLI no encontrado")
+        try:
+            auth = subprocess.run([gh, "auth", "status"], capture_output=True, text=True, timeout=4)
+            if auth.returncode != 0:
+                return self._result("GitHub", "warn", "gh instalado, pero la sesión no está autenticada")
+            repo = self.config.get("updater", {}).get("repository") or "Eduartomx/nova-desktop"
+            cp = subprocess.run([gh, "api", f"repos/{repo}/releases/latest", "--jq", ".tag_name"], capture_output=True, text=True, timeout=5)
+            latest = cp.stdout.strip() if cp.returncode == 0 else "release no consultada"
+            return self._result("GitHub", "ok", f"Sesión autenticada · latest {latest}")
+        except Exception as exc:
+            return self._result("GitHub", "warn", str(exc))
+
+    def _browser(self):
+        enabled = bool(self.config.get("browser", {}).get("enabled", True))
+        if not enabled:
+            return self._result("Browser Agent", "warn", "Desactivado en config")
+        if importlib.util.find_spec("playwright") is None:
+            return self._result("Browser Agent", "error", "Playwright no está instalado")
+        channel = self.config.get("browser", {}).get("channel", "msedge")
+        return self._result("Browser Agent", "ok", f"Playwright disponible · canal {channel}")
+
+    def run(self) -> dict[str, Any]:
+        started = time.perf_counter()
+        checks: list[Callable[[], dict[str, Any]]] = [
+            self._python, self._core_files, self._dependencies, self._memory,
+            self._ollama, self._gpu, self._system, self._github, self._browser,
+        ]
+        results: list[dict[str, Any]] = []
+        with ThreadPoolExecutor(max_workers=6, thread_name_prefix="nova-doctor") as pool:
+            future_map = {pool.submit(fn): fn.__name__ for fn in checks}
+            for future in as_completed(future_map):
+                try:
+                    results.append(future.result())
+                except Exception as exc:
+                    results.append(self._result(future_map[future], "error", str(exc)))
+        wanted = ["Python", "Core Nova", "Dependencias", "Memoria", "Ollama", "GPU", "Sistema", "GitHub", "Browser Agent"]
+        results.sort(key=lambda x: wanted.index(x["name"]) if x["name"] in wanted else 999)
+        duration = round(time.perf_counter() - started, 2)
+        severity = "error" if any(x["status"] == "error" for x in results) else ("warn" if any(x["status"] == "warn" for x in results) else "ok")
+        return {"ok": severity != "error", "severity": severity, "duration_seconds": duration, "checks": results}
+
+    @staticmethod
+    def format_text(report: dict[str, Any]) -> str:
+        icons = {"ok": "✅", "warn": "⚠️", "error": "❌"}
+        lines = [f"Nova Doctor · {report.get('duration_seconds', '?')} s", ""]
+        for item in report.get("checks", []):
+            lines.append(f"{icons.get(item.get('status'), '•')} {item.get('name')}: {item.get('detail')}")
+        errors = sum(1 for x in report.get("checks", []) if x.get("status") == "error")
+        warns = sum(1 for x in report.get("checks", []) if x.get("status") == "warn")
+        lines += ["", f"Resultado: {errors} errores · {warns} avisos."]
+        if errors == 0:
+            lines.append("No detecté un problema crítico en los componentes base de Nova.")
+        return "\n".join(lines)
