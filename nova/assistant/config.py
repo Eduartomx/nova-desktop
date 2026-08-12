@@ -25,8 +25,6 @@ SECURITY_PROFILES: dict[str, dict[str, Any]] = {
         "backup_overwritten_files": True,
     },
     "trusted": {
-        # Modo personal: Nova puede manejar el PC sin interrumpir por acciones rutinarias.
-        # Las operaciones críticas siguen pasando por comprobaciones específicas en tools.py.
         "confirm_file_writes": False,
         "confirm_powershell": False,
         "confirm_input_actions": False,
@@ -72,6 +70,14 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "pause_poll_ms": 150,
     },
     "recent_messages": 16,
+    "workspace": {
+        "enabled": True,
+        "auto_memory_context": True,
+        "relevant_memory_limit": 8,
+        "recent_memory_limit": 8,
+        "refresh_metadata_on_select": True,
+        "registered_paths_allowed": True,
+    },
     "hotkey": "<ctrl>+<space>",
     "desktop": {
         "auto_context": True,
@@ -144,8 +150,6 @@ def load_config() -> dict[str, Any]:
         else:
             merged[key] = value
 
-    # El perfil es la fuente de verdad para las confirmaciones rutinarias. Las
-    # instalaciones anteriores no tenían profile, por lo que migran a trusted.
     original_security = data.get("security", {}) if isinstance(data.get("security", {}), dict) else {}
     profile = str(original_security.get("profile", "trusted")).lower().strip()
     if profile not in SECURITY_PROFILES:

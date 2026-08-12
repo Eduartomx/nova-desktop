@@ -4,29 +4,60 @@ Nova es un asistente virtual local para Windows que combina un modelo local medi
 
 ## Estado actual
 
-**Nova v0.5.8 — GitHub Native Updates**
+**Nova v0.6.0 — Memory & Workspace**
 
-Desde v0.5.8, GitHub es la fuente oficial del proyecto:
+GitHub es la fuente oficial del proyecto:
 
-- el código instalable vive en `nova/`;
-- `main` contiene el desarrollo integrado actual;
-- las versiones estables se marcan con GitHub Releases (`v0.x.y`);
-- el updater obtiene directamente los archivos del tag publicado, sin ZIPs;
-- cada archivo se verifica contra su Git blob SHA antes de reemplazar la copia local;
-- Nova hace backup y rollback si la validación posterior falla.
+- el código administrado por el updater vive en `nova/`;
+- `main` contiene el desarrollo estable integrado;
+- las versiones estables se publican como GitHub Releases (`v0.x.y`);
+- el updater sincroniza directamente los archivos del tag publicado, sin ZIPs;
+- cada archivo se verifica contra su Git blob SHA;
+- se crea un backup antes de reemplazar archivos y existe rollback ante fallos de validación.
+
+## v0.6.0 — Memory & Workspace
+
+Nova puede mantener un **workspace activo** que representa el proyecto con el que estás trabajando. Guarda ruta, tipo de proyecto, metadatos básicos, memorias asociadas y continuidad de tareas.
+
+Ejemplos:
+
+- `mi servidor` puede referirse al workspace activo del servidor Minecraft;
+- una tarea creada mientras un workspace está activo queda asociada a ese proyecto;
+- Nova recupera solo las memorias relevantes para la petición actual, reduciendo contexto y latencia;
+- las rutas de workspaces registrados pasan a ser raíces de trabajo reconocidas por Nova.
+
+Tipos detectados inicialmente: Nova, servidor Minecraft, Python, Node, Arduino, Godot, Unity, Visual Studio, Git y genérico.
+
+La interfaz incorpora:
+
+- `📁 Proyectos` para registrar y cambiar de workspace;
+- `🩺 Doctor` para revisar componentes sin gastar una inferencia del LLM;
+- `⬆ Actualizar` para instalar la siguiente Release desde GitHub y reiniciar Nova si termina correctamente.
+
+## Migración del núcleo
+
+v0.6.0 usa una **capa de compatibilidad administrada desde GitHub** (`v060_*`) sobre los módulos históricos v0.5 que ya están instalados localmente. Esto permite añadir Memory & Workspace sin reemplazar de golpe archivos grandes todavía no migrados al repositorio. La migración completa del núcleo continuará en versiones posteriores.
 
 ## Estructura
 
 ```text
 nova-desktop/
-├─ nova/                    # código que se sincroniza con la instalación local
+├─ nova/
 │  ├─ assistant/
+│  │  ├─ memory.py           # base histórica estable
+│  │  ├─ workspace.py        # workspaces v0.6
+│  │  ├─ doctor.py           # diagnóstico rápido
+│  │  ├─ v060_memory.py      # extensión de memoria/SQLite
+│  │  ├─ v060_tools.py
+│  │  ├─ v060_agent.py
+│  │  ├─ v060_ui.py
+│  │  └─ v060_runtime.py
 │  ├─ updater/
 │  ├─ app.py
-│  ├─ requirements.txt
 │  └─ ...
-├─ .github/workflows/       # CI y publicación de releases
-├─ VERSION                  # versión que se publicará
+├─ tests/
+├─ .github/workflows/
+├─ VERSION
 ├─ CHANGELOG.md
 └─ README.md
 ```
@@ -47,4 +78,4 @@ Nunca deben subirse al repositorio:
 
 ## Publicación
 
-Al cambiar `VERSION` y hacer push a `main`, GitHub Actions valida la sintaxis Python y crea la Release correspondiente si aún no existe. La release apunta al commit exacto y no necesita un paquete ZIP.
+Los pull requests ejecutan compilación y pruebas de Memory/Workspace. Al fusionar una versión con un nuevo `VERSION`, GitHub Actions vuelve a validar el código y crea la Release correspondiente si todavía no existe.

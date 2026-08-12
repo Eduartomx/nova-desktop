@@ -6,6 +6,7 @@ on:
     paths:
       - "VERSION"
       - "nova/**"
+      - "tests/**"
       - ".github/workflows/publish-native.yml"
   workflow_dispatch:
 
@@ -26,6 +27,11 @@ jobs:
 
       - name: Validate source syntax
         run: python -m compileall -q nova
+
+      - name: Run Memory and Workspace tests
+        env:
+          PYTHONPATH: ${{ github.workspace }}/nova
+        run: python -m unittest discover -s tests -v
 
       - name: Read version
         id: version

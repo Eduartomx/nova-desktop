@@ -27,6 +27,14 @@
     "pause_poll_ms": 150
   },
   "recent_messages": 16,
+  "workspace": {
+    "enabled": true,
+    "auto_memory_context": true,
+    "relevant_memory_limit": 8,
+    "recent_memory_limit": 8,
+    "refresh_metadata_on_select": true,
+    "registered_paths_allowed": true
+  },
   "hotkey": "<ctrl>+<space>",
   "desktop": {
     "auto_context": true,
