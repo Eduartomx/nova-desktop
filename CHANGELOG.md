@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.6.7 — Core Consolidation
+
+- `app.py` pasa a usar un único bootstrap estable: `assistant.core_runtime.install_core_runtime()`.
+- Se elimina la cadena de runtimes versionados `v060_runtime` → `v066_runtime`.
+- Los adaptadores de Agent/Tools/UI se renombran por dominio (`*_workspace`, `*_semantic`, `*_continuity`, `*_diagnostics`) en lugar de por número de versión.
+- `MemoryStore` integra nativamente Workspaces, búsqueda léxica/híbrida, Semantic Memory, asociación de tareas y Continuity Engine; ya no necesita monkey patches de memoria.
+- `NovaDoctor` integra nativamente Semantic Memory, Self Repair, Performance Profiler y una comprobación del contrato de arquitectura.
+- Se eliminan los adaptadores versionados de memoria y Doctor ya absorbidos por el núcleo.
+- El updater de GitHub eliminará automáticamente los archivos `v06x_*` administrados que ya no formen parte de la Release, después de crear su backup habitual.
+- Los módulos históricos locales `agent.py`, `tools.py`, `ui.py` y `task_engine.py` se conservan como contrato legacy hasta su migración completa; 0.6.7 los extiende mediante adaptadores estables.
+- Nuevas pruebas impiden reintroducir archivos `v0*.py`, verifican el bootstrap único y confirman que las capacidades de memoria existen sin instaladores.
+
 ## v0.6.6 — Self Repair + Performance Profiler
 
 - Nova Doctor pasa de diagnóstico a diagnóstico + reparación determinista con confirmación explícita antes de instalaciones, descargas o cambios importantes.

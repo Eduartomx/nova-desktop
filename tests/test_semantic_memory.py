@@ -4,12 +4,6 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from assistant.v060_memory import install_memory_v060
-from assistant.v063_memory import install_memory_v063
-
-install_memory_v060()
-install_memory_v063()
-
 from assistant.memory import MemoryStore
 
 

@@ -4,13 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from assistant.v060_memory import install_memory_v060
-from assistant.v065_memory import install_memory_v065
-from assistant.v065_agent import continuity_direct_intent
-
-install_memory_v060()
-install_memory_v065()
-
+from assistant.agent_continuity import continuity_direct_intent
 from assistant.memory import MemoryStore
 from assistant.workspace import WorkspaceManager
 

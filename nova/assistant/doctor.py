@@ -14,9 +14,12 @@ from typing import Any, Callable
 
 import psutil
 
+from .profiler import get_profiler
+from .self_repair import SelfRepairManager
+
 
 class NovaDoctor:
-    """Diagnóstico determinista y rápido. No usa el LLM."""
+    """Diagnóstico determinista, reparable y sin LLM."""
 
     def __init__(self, config: dict[str, Any], memory=None):
         self.config = config
@@ -35,13 +38,36 @@ class NovaDoctor:
         required = [
             "app.py", "assistant/agent.py", "assistant/tools.py", "assistant/ui.py",
             "assistant/memory.py", "assistant/task_engine.py", "assistant/workspace.py",
-            "updater/nova_updater.py", "NOVA_VERSION.txt",
+            "assistant/core_runtime.py", "updater/nova_updater.py", "NOVA_VERSION.txt",
         ]
         missing = [x for x in required if not (self.root / x).exists()]
         if missing:
-            return self._result("Core Nova", "error", "Faltan: " + ", ".join(missing))
+            return self._result("Core Nova", "error", "Faltan: " + ", ".join(missing), missing=missing)
         version = (self.root / "NOVA_VERSION.txt").read_text(encoding="utf-8", errors="ignore").strip()
-        return self._result("Core Nova", "ok", f"v{version} · archivos esenciales presentes")
+        return self._result("Core Nova", "ok", f"v{version} · bootstrap consolidado presente")
+
+    def _architecture(self):
+        try:
+            from .core_runtime import architecture_status
+            status = architecture_status()
+            if not status.get("ok"):
+                missing = [k for k, v in status.get("legacy_local_contract", {}).items() if not v]
+                return self._result(
+                    "Arquitectura",
+                    "error",
+                    "Contrato local incompleto: " + ", ".join(missing),
+                    architecture=status,
+                )
+            native = len(status.get("github_managed_native") or [])
+            adapters = len(status.get("compatibility_adapters") or [])
+            return self._result(
+                "Arquitectura",
+                "ok",
+                f"core_runtime único · {native} dominios nativos · {adapters} adaptadores legacy · sin cadena v06x_runtime",
+                architecture=status,
+            )
+        except Exception as exc:
+            return self._result("Arquitectura", "warn", str(exc))
 
     def _dependencies(self):
         modules = ["ollama", "psutil", "PIL", "pynput", "requests", "bs4", "numpy", "playwright", "pywinauto"]
@@ -62,15 +88,41 @@ class NovaDoctor:
             )
             if ws:
                 detail += f" · activo: {ws.get('name')}"
+            detail += f" · continuity {stats.get('continuity_active', 0)} activa"
             return self._result("Memoria", "ok", detail, stats=stats)
         except Exception as exc:
             return self._result("Memoria", "error", str(exc))
+
+    def _semantic_memory(self):
+        if self.memory is None or not hasattr(self.memory, "semantic_status"):
+            return self._result("Semantic Memory", "warn", "Semantic Memory no disponible")
+        try:
+            active = self.memory.active_workspace()
+            wid = int(active["id"]) if active else None
+            status = self.memory.semantic_status(workspace_id=wid, refresh=True)
+            if not status.get("enabled"):
+                return self._result("Semantic Memory", "warn", "Desactivada en config", semantic=status)
+            if not status.get("model_available"):
+                return self._result(
+                    "Semantic Memory",
+                    "warn",
+                    f"{status.get('detail')} · instala con: {status.get('install_command')}",
+                    semantic=status,
+                )
+            return self._result(
+                "Semantic Memory",
+                "ok",
+                f"{status.get('model')} · {status.get('indexed', 0)}/{status.get('total_candidates', 0)} recuerdos indexados",
+                semantic=status,
+            )
+        except Exception as exc:
+            return self._result("Semantic Memory", "warn", str(exc))
 
     def _ollama(self):
         host = str(self.config.get("ollama_host", "http://127.0.0.1:11434")).rstrip("/")
         model = str(self.config.get("model", "qwen3.5:4b"))
         try:
-            req = urllib.request.Request(host + "/api/tags", headers={"User-Agent": "Nova-Doctor/0.6"})
+            req = urllib.request.Request(host + "/api/tags", headers={"User-Agent": "Nova-Doctor/0.6.7"})
             with urllib.request.urlopen(req, timeout=2.5) as r:
                 data = json.load(r)
             names = {str(x.get("name") or x.get("model") or "") for x in data.get("models", [])}
@@ -87,17 +139,18 @@ class NovaDoctor:
         try:
             cp = subprocess.run(
                 [smi, "--query-gpu=name,utilization.gpu,memory.used,memory.total,temperature.gpu", "--format=csv,noheader,nounits"],
-                capture_output=True, text=True, timeout=3,
+                capture_output=True,
+                text=True,
+                timeout=3,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
             if cp.returncode != 0 or not cp.stdout.strip():
                 return self._result("GPU", "warn", (cp.stderr or "nvidia-smi sin datos").strip())
-            first = cp.stdout.strip().splitlines()[0]
-            parts = [x.strip() for x in first.split(",")]
+            parts = [x.strip() for x in cp.stdout.strip().splitlines()[0].split(",")]
             if len(parts) >= 5:
                 name, util, used, total, temp = parts[:5]
                 return self._result("GPU", "ok", f"{name} · {util}% · VRAM {used}/{total} MB · {temp} °C")
-            return self._result("GPU", "ok", first)
+            return self._result("GPU", "ok", cp.stdout.strip().splitlines()[0])
         except Exception as exc:
             return self._result("GPU", "warn", str(exc))
 
@@ -124,7 +177,12 @@ class NovaDoctor:
             if auth.returncode != 0:
                 return self._result("GitHub", "warn", "gh instalado, pero la sesión no está autenticada")
             repo = self.config.get("updater", {}).get("repository") or "Eduartomx/nova-desktop"
-            cp = subprocess.run([gh, "api", f"repos/{repo}/releases/latest", "--jq", ".tag_name"], capture_output=True, text=True, timeout=5)
+            cp = subprocess.run(
+                [gh, "api", f"repos/{repo}/releases/latest", "--jq", ".tag_name"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
             latest = cp.stdout.strip() if cp.returncode == 0 else "release no consultada"
             return self._result("GitHub", "ok", f"Sesión autenticada · latest {latest}")
         except Exception as exc:
@@ -142,8 +200,17 @@ class NovaDoctor:
     def run(self) -> dict[str, Any]:
         started = time.perf_counter()
         checks: list[Callable[[], dict[str, Any]]] = [
-            self._python, self._core_files, self._dependencies, self._memory,
-            self._ollama, self._gpu, self._system, self._github, self._browser,
+            self._python,
+            self._core_files,
+            self._architecture,
+            self._dependencies,
+            self._memory,
+            self._semantic_memory,
+            self._ollama,
+            self._gpu,
+            self._system,
+            self._github,
+            self._browser,
         ]
         results: list[dict[str, Any]] = []
         with ThreadPoolExecutor(max_workers=6, thread_name_prefix="nova-doctor") as pool:
@@ -153,11 +220,25 @@ class NovaDoctor:
                     results.append(future.result())
                 except Exception as exc:
                     results.append(self._result(future_map[future], "error", str(exc)))
-        wanted = ["Python", "Core Nova", "Dependencias", "Memoria", "Ollama", "GPU", "Sistema", "GitHub", "Browser Agent"]
+        wanted = [
+            "Python", "Core Nova", "Arquitectura", "Dependencias", "Memoria",
+            "Semantic Memory", "Ollama", "GPU", "Sistema", "GitHub", "Browser Agent",
+        ]
         results.sort(key=lambda x: wanted.index(x["name"]) if x["name"] in wanted else 999)
         duration = round(time.perf_counter() - started, 2)
-        severity = "error" if any(x["status"] == "error" for x in results) else ("warn" if any(x["status"] == "warn" for x in results) else "ok")
-        return {"ok": severity != "error", "severity": severity, "duration_seconds": duration, "checks": results}
+        severity = "error" if any(x["status"] == "error" for x in results) else (
+            "warn" if any(x["status"] == "warn" for x in results) else "ok"
+        )
+        report = {"ok": severity != "error", "severity": severity, "duration_seconds": duration, "checks": results}
+        try:
+            report["repairs"] = SelfRepairManager(self.config, self.memory).available_actions(report)
+        except Exception:
+            report["repairs"] = []
+        try:
+            report["performance"] = get_profiler(self.config).summary(hours=24)
+        except Exception:
+            report["performance"] = {"ok": False, "operations": []}
+        return report
 
     @staticmethod
     def format_text(report: dict[str, Any]) -> str:
@@ -170,4 +251,15 @@ class NovaDoctor:
         lines += ["", f"Resultado: {errors} errores · {warns} avisos."]
         if errors == 0:
             lines.append("No detecté un problema crítico en los componentes base de Nova.")
+
+        repairs = list(report.get("repairs") or [])
+        if repairs:
+            lines += ["", "Reparaciones disponibles:"]
+            lines += [f"- {item.get('title')}: {item.get('detail')}" for item in repairs[:8]]
+            lines.append("Abre Nova Doctor para ejecutar una reparación con confirmación.")
+
+        perf = report.get("performance") if isinstance(report.get("performance"), dict) else {}
+        slow = list(perf.get("slow_operations") or [])
+        if slow:
+            lines += ["", "Rendimiento: " + ", ".join(f"{x.get('operation')} {x.get('avg_ms')} ms" for x in slow[:4])]
         return "\n".join(lines)

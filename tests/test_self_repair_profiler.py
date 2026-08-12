@@ -7,7 +7,7 @@ from pathlib import Path
 
 from assistant.profiler import PerformanceProfiler
 from assistant.self_repair import SelfRepairManager
-from assistant.v066_agent import performance_direct_intent
+from assistant.agent_diagnostics import performance_direct_intent
 import assistant.config as config_mod
 
 
