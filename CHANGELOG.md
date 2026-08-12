@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.6.4 — Semantic Routing Hotfix
+
+- Corrige el comando explícito `reindexa la memoria semántica`, que podía caer en el Task Engine y confundirse con Windows Search/SearchIndexer.
+- Añade routing determinista previo al LLM para `memory_semantic_reindex` y `memory_semantic_status`.
+- Las órdenes de Semantic Memory ya no usan PowerShell ni servicios de indexación de Windows.
+- Si falta el modelo de embeddings, Nova devuelve directamente el comando `ollama pull` correcto en vez de intentar una vía alternativa del sistema operativo.
+- Soporta variantes con/sin acentos y comandos limitados al workspace/proyecto actual.
+- Añade una regla explícita al system prompt como segunda barrera contra confusiones futuras.
+- Nuevas pruebas de regresión para routing semántico y para evitar interceptar órdenes reales de Windows Search.
+
 ## v0.6.3 — Semantic Memory
 
 - Búsqueda híbrida de recuerdos: coincidencia léxica + similitud semántica + importancia + recencia + prioridad del workspace activo.
@@ -40,7 +50,7 @@
 ## v0.6.0 — Memory & Workspace
 
 - Nuevo sistema de **Workspaces** persistentes con proyecto activo.
-- Detección rápida de proyectos: Nova, Minecraft server, Python, Node, Arduino, Godot, Unity, Visual Studio y Git.
+- Detección rápida de proyectos: Nova, Minecraft server, Python, Node, Arduino, Godot, Unity, Visual Studio, Git y genérico.
 - Metadatos específicos para servidores Minecraft: mods y propiedades básicas.
 - Memoria enriquecida con categoría, alcance global/workspace, importancia y fuente.
 - Búsqueda local de memoria relevante sin invocar al LLM.
