@@ -77,9 +77,14 @@ def install_ui_v066():
         def worker():
             try:
                 report = NovaDoctor(self.config, self.agent.memory).run()
-                self.root.after(0, lambda: self._doctor_render(report))
+                self.root.after(0, lambda r=report: self._doctor_render(r))
             except Exception as exc:
-                self.root.after(0, lambda: self.doctor_status_var.set(f"Error de Nova Doctor: {exc}") if self.doctor_status_var is not None else None)
+                error_text = str(exc)
+                self.root.after(
+                    0,
+                    lambda err=error_text: self.doctor_status_var.set(f"Error de Nova Doctor: {err}")
+                    if self.doctor_status_var is not None else None,
+                )
 
         threading.Thread(target=worker, daemon=True, name="nova-doctor-ui").start()
 
