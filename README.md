@@ -4,7 +4,7 @@ Nova es un asistente virtual local para Windows que combina un modelo local medi
 
 ## Estado actual
 
-**Nova v0.6.3 — Semantic Memory**
+**Nova v0.6.6 — Self Repair + Performance Profiler**
 
 GitHub es la fuente oficial del proyecto:
 
@@ -14,6 +14,22 @@ GitHub es la fuente oficial del proyecto:
 - el updater sincroniza directamente los archivos del tag publicado, sin ZIPs;
 - cada archivo se verifica contra su Git blob SHA;
 - se crea un backup antes de reemplazar archivos y existe rollback ante fallos de validación.
+
+## v0.6.6 — Self Repair + Performance Profiler
+
+Nova Doctor puede proponer reparaciones deterministas para fallos conocidos y ejecutarlas desde su ventana únicamente después de una confirmación explícita. Entre otras cosas puede reparar dependencias, re-sincronizar archivos gestionados, iniciar Ollama, descargar modelos y ayudar con GitHub/Playwright.
+
+El Performance Profiler guarda métricas exclusivamente locales en `data/performance.db`: nombre de operación, duración, éxito y metadatos técnicos pequeños. No almacena prompts, mensajes, secretos ni contenido de archivos.
+
+Puedes preguntar `Nova, ¿cómo va tu rendimiento?` para ver promedios y cuellos de botella recientes.
+
+El atajo global por defecto es ahora **Ctrl + Alt + Espacio**. Las instalaciones que todavía tengan exactamente el antiguo `Ctrl + Espacio` se migran automáticamente; otros atajos personalizados se respetan.
+
+## v0.6.5 — Continuity Engine
+
+Nova mantiene sesiones de trabajo persistentes por workspace y checkpoints estructurados con objetivo, pasos completados, pendientes, archivos, decisiones y errores. Esto permite órdenes como `Nova, continúa`, `¿dónde nos quedamos?`, `¿qué quedó pendiente?` y `¿qué hicimos ayer?`.
+
+Continuity guarda estado temporal/accionable; Semantic Memory sigue reservada para hechos y decisiones duraderas.
 
 ## v0.6.3 — Semantic Memory
 
@@ -79,12 +95,17 @@ nova-desktop/
 │  ├─ assistant/
 │  │  ├─ memory.py
 │  │  ├─ semantic_memory.py
+│  │  ├─ continuity.py
+│  │  ├─ profiler.py
+│  │  ├─ self_repair.py
 │  │  ├─ workspace.py
 │  │  ├─ workspace_index.py
 │  │  ├─ doctor.py
 │  │  ├─ v060_*.py
 │  │  ├─ v061_*.py
-│  │  └─ v063_*.py
+│  │  ├─ v063_*.py
+│  │  ├─ v065_*.py
+│  │  └─ v066_*.py
 │  ├─ updater/
 │  │  ├─ nova_updater.py
 │  │  └─ update_runner.py
@@ -99,9 +120,9 @@ nova-desktop/
 
 ## Privacidad
 
-Nunca deben subirse al repositorio `config.json` real, `assistant.db`, `data/`, perfiles del navegador, capturas, logs personales, `.venv/`, claves API, tokens o credenciales.
+Nunca deben subirse al repositorio `config.json` real, `assistant.db`, `performance.db`, `data/`, perfiles del navegador, capturas, logs personales, `.venv/`, claves API, tokens o credenciales.
 
-`nova/config.example.json` contiene únicamente valores de ejemplo/por defecto. Los embeddings de recuerdos se guardan exclusivamente en la base SQLite local de Nova.
+`nova/config.example.json` contiene únicamente valores de ejemplo/por defecto. Los embeddings y las métricas de rendimiento se guardan exclusivamente de forma local.
 
 ## Publicación
 
