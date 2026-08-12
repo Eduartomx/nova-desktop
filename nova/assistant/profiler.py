@@ -43,8 +43,22 @@ class PerformanceProfiler:
         conn.execute("PRAGMA busy_timeout=5000")
         return conn
 
+    @contextmanager
+    def _connection(self):
+        # Igual que assistant.db: sqlite3.Connection.__exit__ no cierra el
+        # handle. En Windows eso puede dejar el archivo bloqueado hasta GC.
+        conn = self._connect()
+        try:
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
     def _init_db(self):
-        with self._connect() as conn:
+        with self._connection() as conn:
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS performance_events (
@@ -70,7 +84,7 @@ class PerformanceProfiler:
             if isinstance(value, (str, int, float, bool)) or value is None:
                 safe_meta[str(key)[:64]] = value if not isinstance(value, str) else value[:180]
         try:
-            with self._lock, self._connect() as conn:
+            with self._lock, self._connection() as conn:
                 conn.execute(
                     "INSERT INTO performance_events(operation,duration_ms,success,metadata_json) VALUES (?,?,?,?)",
                     (str(operation)[:120], round(float(duration_ms), 3), 1 if success else 0,
@@ -81,7 +95,6 @@ class PerformanceProfiler:
                     "DELETE FROM performance_events WHERE id <= (SELECT MAX(id)-? FROM performance_events)",
                     (max_events,),
                 )
-                conn.commit()
         except Exception:
             # El profiler jamás debe romper la operación que está observando.
             pass
@@ -100,7 +113,7 @@ class PerformanceProfiler:
         hours = float(hours if hours is not None else self.config.get("summary_hours", 24))
         hours = max(0.1, min(hours, 24 * 30))
         modifier = f"-{hours} hours"
-        with self._lock, self._connect() as conn:
+        with self._lock, self._connection() as conn:
             rows = conn.execute(
                 """
                 SELECT operation,
@@ -129,7 +142,7 @@ class PerformanceProfiler:
 
     def recent(self, limit: int = 30) -> list[dict[str, Any]]:
         limit = max(1, min(int(limit), 200))
-        with self._lock, self._connect() as conn:
+        with self._lock, self._connection() as conn:
             rows = conn.execute(
                 "SELECT id,operation,duration_ms,success,metadata_json,created_at FROM performance_events ORDER BY id DESC LIMIT ?",
                 (limit,),
