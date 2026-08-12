@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.6.3 — Semantic Memory
+
+- Búsqueda híbrida de recuerdos: coincidencia léxica + similitud semántica + importancia + recencia + prioridad del workspace activo.
+- Nuevo índice `memory_embeddings` dentro de la misma base SQLite local de Nova.
+- Embeddings generados localmente mediante Ollama `/api/embed`; no se envían recuerdos a servicios externos.
+- Modelo por defecto: `qwen3-embedding:0.6b`, configurable desde `semantic_memory`.
+- Nova **no descarga automáticamente** el modelo de embeddings; si falta, mantiene el buscador léxico de v0.6 como fallback inmediato.
+- Indexado por lotes, invalidación automática cuando cambia un recuerdo y lazy indexing limitado para evitar reindexar toda la memoria en cada consulta.
+- Nuevas herramientas: `memory_semantic_status` y `memory_semantic_reindex`; `memory_search` usa automáticamente el ranking híbrido cuando está disponible.
+- Nova Doctor informa modelo, disponibilidad e índice semántico.
+- La UI usa la versión real desde `NOVA_VERSION.txt` y muestra si Semantic Memory está activa o en fallback.
+- Pruebas automáticas para fallback léxico, recuperación semántica sin palabras compartidas e invalidación de embeddings obsoletos.
+
 ## v0.6.2 — Update Reliability
 
 - Nuevo `update_runner.py` que supervisa las actualizaciones lanzadas desde la interfaz.
