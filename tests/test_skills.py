@@ -125,30 +125,44 @@ class SkillsEngineTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 registry.save(**data)
 
-    def test_sensitive_run_arguments_are_redacted_at_rest(self):
+    def test_sensitive_run_arguments_never_enter_playbook_or_storage(self):
         with tempfile.TemporaryDirectory() as td:
             registry = self.make_registry(td)
             data = self.definition()
             data["parameters"]["password"] = {"type": "string", "required": False}
+            data["steps"][1]["instruction"] += " Credencial: {password}."
             skill = registry.save(**data)
             compiled = registry.compile(skill, {"server": "Alpha", "password": "super-secret-value"})
+            self.assertIn("password", compiled.sensitive_parameters)
+            self.assertIn("[SENSITIVE_PARAMETER:password]", compiled.steps[1]["instruction"])
+            self.assertNotIn("super-secret-value", registry.format_playbook(compiled))
             run_id = registry.start_run(compiled)
             info = registry.run_info(run_id)
             self.assertEqual(info["arguments"]["password"], "[REDACTED]")
             self.assertNotIn("super-secret-value", str(info))
+            self.assertNotIn("[SENSITIVE_PARAMETER:password]", str(info["steps"]))
+            self.assertFalse(registry.status()["persist_run_summaries"])
 
-    def test_two_verified_successes_promote_draft(self):
+    def test_finish_run_is_idempotent_and_promotes_after_two_distinct_successes(self):
         with tempfile.TemporaryDirectory() as td:
             registry = self.make_registry(td)
             skill = registry.save(**self.definition(), source="nova")
             self.assertEqual(skill["trust_level"], "draft")
-            for _ in range(2):
-                compiled = registry.compile(skill, {"server": "Alpha"})
-                run_id = registry.start_run(compiled)
-                registry.finish_run(run_id, True, "verificado")
-                skill = registry.get(skill["id"])
-            self.assertEqual(skill["trust_level"], "verified")
+
+            compiled = registry.compile(skill, {"server": "Alpha"})
+            first_id = registry.start_run(compiled)
+            registry.finish_run(first_id, True, "verificado")
+            registry.finish_run(first_id, True, "no debe contar dos veces")
+            skill = registry.get(skill["id"])
+            self.assertEqual(skill["successful_runs"], 1)
+            self.assertEqual(skill["trust_level"], "draft")
+
+            compiled = registry.compile(skill, {"server": "Alpha"})
+            second_id = registry.start_run(compiled)
+            registry.finish_run(second_id, True, "verificado")
+            skill = registry.get(skill["id"])
             self.assertEqual(skill["successful_runs"], 2)
+            self.assertEqual(skill["trust_level"], "verified")
 
     def test_direct_routing(self):
         self.assertEqual(skills_direct_intent("Nova, ¿qué habilidades tienes?"), "list")
