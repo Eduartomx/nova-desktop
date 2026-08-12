@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from .anomaly_detection import get_anomaly_detector
+from .anomaly import get_anomaly_detector
 
 
 def anomaly_schemas() -> list[dict[str, Any]]:
