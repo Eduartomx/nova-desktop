@@ -34,12 +34,12 @@ def workspace_autodetect_schemas() -> list[dict[str, Any]]:
         fn(
             "workspace_autodetect_learn_current",
             "Fija explícitamente la aplicación externa actual al workspace activo o indicado. Úsalo solo cuando el usuario pida que Nova aprenda esa asociación.",
-            {"workspace": {"type": ["string", "integer"]}},
+            {"workspace": {"type": "string"}},
         ),
         fn(
             "workspace_autodetect_forget_current",
             "Olvida asociaciones aprendidas para la aplicación externa actual, opcionalmente solo para un workspace.",
-            {"workspace": {"type": ["string", "integer"]}},
+            {"workspace": {"type": "string"}},
         ),
     ]
 
