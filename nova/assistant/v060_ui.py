@@ -100,9 +100,14 @@ def install_ui_v060():
         threading.Thread(target=worker, daemon=True).start()
 
     def quick_update(self):
-        updater = Path(__file__).resolve().parent.parent / 'updater' / 'nova_updater.py'
+        root = Path(__file__).resolve().parent.parent
+        updater = root / 'updater' / 'nova_updater.py'
+        starter = root / 'INICIAR.bat'
         try:
-            subprocess.Popen([sys.executable, str(updater), '--yes', '--restart'], cwd=str(updater.parent.parent), creationflags=getattr(subprocess, 'CREATE_NEW_CONSOLE', 0)); self.status_var.set('Actualizando desde GitHub… Nova se reiniciará.'); self.root.after(450, self._close)
+            command = f'"{sys.executable}" "{updater}" --yes && start "" "{starter}"'
+            subprocess.Popen(['cmd.exe', '/d', '/c', command], cwd=str(root), creationflags=getattr(subprocess, 'CREATE_NEW_CONSOLE', 0))
+            self.status_var.set('Actualizando desde GitHub… Nova se reiniciará si la actualización termina bien.')
+            self.root.after(450, self._close)
         except Exception as exc: messagebox.showerror('Nova · Actualizador', str(exc), parent=self.root)
 
     UI._build = build; UI.__init__ = init; UI._refresh_workspace_label = refresh_label; UI._refresh_workspace_manager = refresh_manager
