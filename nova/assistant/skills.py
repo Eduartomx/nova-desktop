@@ -8,11 +8,12 @@ La ejecución real vuelve a pasar por Agent/LocalTools y su política de segurid
 """
 
 import json
+import math
 import re
 import sqlite3
 import threading
 import unicodedata
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -30,6 +31,7 @@ DEFAULT_SKILLS_CONFIG: dict[str, Any] = {
     "workspace_scoped_by_default": False,
     "generated_skills_start_as_draft": True,
     "auto_execute_matches": False,
+    "persist_run_summaries": False,
 }
 
 _SECRET_PATTERNS = (
@@ -42,6 +44,7 @@ _SECRET_PATTERNS = (
 _SENSITIVE_PARAM = re.compile(r"(?:pass|password|passwd|token|secret|api.?key|cookie|credential|auth)", re.I)
 _ALLOWED_PARAM_TYPES = {"string", "integer", "number", "boolean"}
 _ALLOWED_TRUST = {"draft", "user", "verified"}
+_FINAL_RUN_STATES = {"completed", "failed"}
 
 
 def _norm(value: Any) -> str:
@@ -55,17 +58,6 @@ def _slug(value: Any) -> str:
     text = _norm(value).replace(" ", "-").replace("_", "-")
     text = re.sub(r"-+", "-", text).strip("-")
     return text[:80] or "skill"
-
-
-def _json(value: Any, default: Any) -> Any:
-    if value is None:
-        return default
-    if isinstance(value, str):
-        try:
-            return json.loads(value)
-        except Exception:
-            return default
-    return value
 
 
 def _has_secret_material(value: Any) -> bool:
@@ -93,6 +85,16 @@ def _tokens(value: str) -> set[str]:
     return {x for x in _norm(value).split() if len(x) >= 2}
 
 
+def _safe_scalar(value: Any, limit: int = 500) -> Any:
+    if isinstance(value, bool) or value is None:
+        return value
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else 0.0
+    return str(value)[:limit]
+
+
 @dataclass
 class CompiledSkill:
     skill: dict[str, Any]
@@ -100,6 +102,7 @@ class CompiledSkill:
     steps: list[dict[str, Any]]
     verification: list[str]
     missing: list[str]
+    sensitive_parameters: list[str] = field(default_factory=list)
 
 
 class SkillRegistry:
@@ -214,16 +217,20 @@ class SkillRegistry:
     @staticmethod
     def _decode(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
         data = dict(row)
-        for field, default in (
-            ("trigger_phrases_json", []), ("parameters_json", {}), ("steps_json", []),
-            ("verification_json", []), ("permissions_json", []), ("provenance_json", {}),
+        for field_name, default in (
+            ("trigger_phrases_json", []),
+            ("parameters_json", {}),
+            ("steps_json", []),
+            ("verification_json", []),
+            ("permissions_json", []),
+            ("provenance_json", {}),
         ):
-            key = field.removesuffix("_json")
+            key = field_name.removesuffix("_json")
             try:
-                data[key] = json.loads(data.get(field) or json.dumps(default))
+                data[key] = json.loads(data.get(field_name) or json.dumps(default))
             except Exception:
                 data[key] = default
-            data.pop(field, None)
+            data.pop(field_name, None)
         data["enabled"] = bool(data.get("enabled"))
         return data
 
@@ -269,7 +276,7 @@ class SkillRegistry:
             if "default" in spec and not _SENSITIVE_PARAM.search(key):
                 default = spec.get("default")
                 if isinstance(default, (str, int, float, bool)) or default is None:
-                    clean_params[key]["default"] = default if not isinstance(default, str) else default[:500]
+                    clean_params[key]["default"] = _safe_scalar(default)
 
         max_steps = max(1, min(int(self.config.get("max_steps", 24)), 60))
         clean_steps: list[dict[str, Any]] = []
@@ -292,7 +299,7 @@ class SkillRegistry:
             raise ValueError("La habilidad necesita al menos un paso declarativo.")
 
         clean_verification = [str(x).strip()[:700] for x in list(verification or []) if str(x).strip()][:16]
-        clean_permissions = []
+        clean_permissions: list[str] = []
         for item in list(permissions or []):
             text = _norm(item).replace(" ", "_")[:80]
             if text and text not in clean_permissions:
@@ -328,7 +335,13 @@ class SkillRegistry:
         if not self.enabled:
             raise RuntimeError("Skills Engine está desactivado.")
         triggers2, params2, steps2, verify2, perms2 = self._validate_definition(
-            name, description, triggers or [], parameters or {}, steps or [], verification or [], permissions or []
+            name,
+            description,
+            triggers or [],
+            parameters or {},
+            steps or [],
+            verification or [],
+            permissions or [],
         )
         if workspace_id is None and bool(self.config.get("workspace_scoped_by_default", False)):
             workspace_id = self._active_workspace_id()
@@ -336,7 +349,11 @@ class SkillRegistry:
         slug = _slug(name)
         source = _norm(source or "nova").replace(" ", "_")[:80] or "nova"
         if trust_level is None:
-            trust_level = "draft" if self.config.get("generated_skills_start_as_draft", True) and source not in {"user", "manual"} else "user"
+            trust_level = (
+                "draft"
+                if self.config.get("generated_skills_start_as_draft", True) and source not in {"user", "manual"}
+                else "user"
+            )
         trust_level = str(trust_level).casefold()
         if trust_level not in _ALLOWED_TRUST:
             trust_level = "draft"
@@ -345,13 +362,18 @@ class SkillRegistry:
             prov = {"note": "provenance_redacted"}
 
         with self._lock, self._connect() as conn:
-            existing = conn.execute("SELECT * FROM skills WHERE scope_key=? AND slug=?", (scope_key, slug)).fetchone()
+            existing = conn.execute(
+                "SELECT * FROM skills WHERE scope_key=? AND slug=?", (scope_key, slug)
+            ).fetchone()
             if existing:
                 old = self._decode(existing)
-                snapshot = json.dumps(old, ensure_ascii=False, separators=(",", ":"))
                 conn.execute(
                     "INSERT INTO skill_revisions(skill_id,version,snapshot_json) VALUES (?,?,?)",
-                    (int(existing["id"]), int(existing["version"]), snapshot),
+                    (
+                        int(existing["id"]),
+                        int(existing["version"]),
+                        json.dumps(old, ensure_ascii=False, separators=(",", ":")),
+                    ),
                 )
                 version = int(existing["version"]) + 1
                 conn.execute(
@@ -359,10 +381,18 @@ class SkillRegistry:
                        trigger_phrases_json=?,parameters_json=?,steps_json=?,verification_json=?,permissions_json=?,
                        provenance_json=?,updated_at=CURRENT_TIMESTAMP WHERE id=?""",
                     (
-                        str(name).strip()[:120], str(description or "")[:1200], version, trust_level, source,
-                        json.dumps(triggers2, ensure_ascii=False), json.dumps(params2, ensure_ascii=False),
-                        json.dumps(steps2, ensure_ascii=False), json.dumps(verify2, ensure_ascii=False),
-                        json.dumps(perms2, ensure_ascii=False), json.dumps(prov, ensure_ascii=False), int(existing["id"]),
+                        str(name).strip()[:120],
+                        str(description or "")[:1200],
+                        version,
+                        trust_level,
+                        source,
+                        json.dumps(triggers2, ensure_ascii=False),
+                        json.dumps(params2, ensure_ascii=False),
+                        json.dumps(steps2, ensure_ascii=False),
+                        json.dumps(verify2, ensure_ascii=False),
+                        json.dumps(perms2, ensure_ascii=False),
+                        json.dumps(prov, ensure_ascii=False),
+                        int(existing["id"]),
                     ),
                 )
                 skill_id = int(existing["id"])
@@ -375,16 +405,27 @@ class SkillRegistry:
                        trigger_phrases_json,parameters_json,steps_json,verification_json,permissions_json,provenance_json)
                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (
-                        scope_key, int(workspace_id) if workspace_id is not None else None, slug,
-                        str(name).strip()[:120], str(description or "")[:1200], trust_level, source,
-                        json.dumps(triggers2, ensure_ascii=False), json.dumps(params2, ensure_ascii=False),
-                        json.dumps(steps2, ensure_ascii=False), json.dumps(verify2, ensure_ascii=False),
-                        json.dumps(perms2, ensure_ascii=False), json.dumps(prov, ensure_ascii=False),
+                        scope_key,
+                        int(workspace_id) if workspace_id is not None else None,
+                        slug,
+                        str(name).strip()[:120],
+                        str(description or "")[:1200],
+                        trust_level,
+                        source,
+                        json.dumps(triggers2, ensure_ascii=False),
+                        json.dumps(params2, ensure_ascii=False),
+                        json.dumps(steps2, ensure_ascii=False),
+                        json.dumps(verify2, ensure_ascii=False),
+                        json.dumps(perms2, ensure_ascii=False),
+                        json.dumps(prov, ensure_ascii=False),
                     ),
                 )
                 skill_id = int(cur.lastrowid)
             conn.commit()
-        return self.get(skill_id)
+        result = self.get(skill_id)
+        if result is None:
+            raise RuntimeError("La habilidad se guardó, pero no pudo volver a leerse.")
+        return result
 
     def get(self, skill: int | str, workspace_id: int | None = None) -> dict[str, Any] | None:
         with self._connect() as conn:
@@ -396,14 +437,22 @@ class SkillRegistry:
                 wid = self._active_workspace_id() if workspace_id is None else workspace_id
                 if wid is not None:
                     row = conn.execute(
-                        "SELECT * FROM skills WHERE slug=? AND scope_key IN (?, 'global') ORDER BY CASE WHEN workspace_id=? THEN 0 ELSE 1 END LIMIT 1",
+                        "SELECT * FROM skills WHERE slug=? AND scope_key IN (?, 'global') "
+                        "ORDER BY CASE WHEN workspace_id=? THEN 0 ELSE 1 END LIMIT 1",
                         (slug, self._scope_key(wid), int(wid)),
                     ).fetchone()
                 else:
-                    row = conn.execute("SELECT * FROM skills WHERE slug=? AND scope_key='global' LIMIT 1", (slug,)).fetchone()
+                    row = conn.execute(
+                        "SELECT * FROM skills WHERE slug=? AND scope_key='global' LIMIT 1", (slug,)
+                    ).fetchone()
             return self._decode(row) if row else None
 
-    def list(self, workspace_id: int | None = None, include_disabled: bool = False, limit: int = 100) -> list[dict[str, Any]]:
+    def list(
+        self,
+        workspace_id: int | None = None,
+        include_disabled: bool = False,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
         wid = self._active_workspace_id() if workspace_id is None else workspace_id
         clauses = ["scope_key='global'"]
         args: list[Any] = []
@@ -411,21 +460,37 @@ class SkillRegistry:
             clauses.append("workspace_id=?")
             args.append(int(wid))
         enabled = "" if include_disabled else "AND enabled=1"
-        query = f"SELECT * FROM skills WHERE ({' OR '.join(clauses)}) {enabled} ORDER BY updated_at DESC, id DESC LIMIT ?"
+        query = (
+            f"SELECT * FROM skills WHERE ({' OR '.join(clauses)}) {enabled} "
+            "ORDER BY updated_at DESC, id DESC LIMIT ?"
+        )
         args.append(max(1, min(int(limit), 500)))
         with self._connect() as conn:
             return [self._decode(row) for row in conn.execute(query, args).fetchall()]
 
-    def set_enabled(self, skill: int | str, enabled: bool, workspace_id: int | None = None) -> dict[str, Any] | None:
+    def set_enabled(
+        self,
+        skill: int | str,
+        enabled: bool,
+        workspace_id: int | None = None,
+    ) -> dict[str, Any] | None:
         row = self.get(skill, workspace_id=workspace_id)
         if not row:
             return None
         with self._lock, self._connect() as conn:
-            conn.execute("UPDATE skills SET enabled=?,updated_at=CURRENT_TIMESTAMP WHERE id=?", (1 if enabled else 0, int(row["id"])))
+            conn.execute(
+                "UPDATE skills SET enabled=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                (1 if enabled else 0, int(row["id"])),
+            )
             conn.commit()
         return self.get(int(row["id"]))
 
-    def match(self, text: str, workspace_id: int | None = None, limit: int = 5) -> list[dict[str, Any]]:
+    def match(
+        self,
+        text: str,
+        workspace_id: int | None = None,
+        limit: int = 5,
+    ) -> list[dict[str, Any]]:
         query = _norm(text)
         if not query:
             return []
@@ -469,7 +534,10 @@ class SkillRegistry:
                 item["match_score"] = round(score, 3)
                 item["match_reason"] = reason
                 scored.append(item)
-        scored.sort(key=lambda x: (float(x.get("match_score", 0)), int(x.get("successful_runs", 0))), reverse=True)
+        scored.sort(
+            key=lambda x: (float(x.get("match_score", 0)), int(x.get("successful_runs", 0))),
+            reverse=True,
+        )
         return scored[: max(1, min(int(limit), 20))]
 
     @staticmethod
@@ -481,14 +549,21 @@ class SkillRegistry:
         if typ == "integer":
             return int(value)
         if typ == "number":
-            return float(value)
+            number = float(value)
+            if not math.isfinite(number):
+                raise ValueError("number_not_finite")
+            return number
         if typ == "boolean":
             if isinstance(value, bool):
                 return value
             return _norm(value) in {"1", "true", "si", "sí", "yes", "on"}
         return value
 
-    def compile(self, skill: int | str | dict[str, Any], arguments: dict[str, Any] | None = None) -> CompiledSkill:
+    def compile(
+        self,
+        skill: int | str | dict[str, Any],
+        arguments: dict[str, Any] | None = None,
+    ) -> CompiledSkill:
         row = skill if isinstance(skill, dict) else self.get(skill)
         if not row:
             raise KeyError(f"No encontré la habilidad: {skill}")
@@ -498,6 +573,7 @@ class SkillRegistry:
         supplied = dict(arguments or {})
         bound: dict[str, Any] = {}
         missing: list[str] = []
+        sensitive: list[str] = []
         for name, spec in specs.items():
             if name in supplied:
                 try:
@@ -508,23 +584,33 @@ class SkillRegistry:
                 bound[name] = spec.get("default")
             elif spec.get("required"):
                 missing.append(name)
+            if _SENSITIVE_PARAM.search(name):
+                sensitive.append(name)
         for name, value in supplied.items():
             if name not in bound and name not in specs:
-                bound[str(name)] = value
+                bound[str(name)] = _safe_scalar(value)
+                if _SENSITIVE_PARAM.search(str(name)):
+                    sensitive.append(str(name))
 
         class SafeMap(dict):
             def __missing__(self, key):
                 return "{" + str(key) + "}"
 
-        mapping = SafeMap({k: str(v) for k, v in bound.items()})
+        mapping = SafeMap()
+        for key, value in bound.items():
+            if _SENSITIVE_PARAM.search(str(key)):
+                mapping[key] = f"[SENSITIVE_PARAMETER:{key}]"
+            else:
+                mapping[key] = str(value)
+
         steps: list[dict[str, Any]] = []
         for step in row.get("steps") or []:
             item = dict(step)
-            for field in ("title", "instruction", "tool_hint", "verify"):
-                item[field] = str(item.get(field) or "").format_map(mapping)
+            for field_name in ("title", "instruction", "tool_hint", "verify"):
+                item[field_name] = str(item.get(field_name) or "").format_map(mapping)
             steps.append(item)
         verification = [str(x).format_map(mapping) for x in (row.get("verification") or [])]
-        return CompiledSkill(row, bound, steps, verification, missing)
+        return CompiledSkill(row, bound, steps, verification, missing, sorted(set(sensitive)))
 
     def format_playbook(self, compiled: CompiledSkill, run_id: int | None = None) -> str:
         skill = compiled.skill
@@ -536,8 +622,13 @@ class SkillRegistry:
         if run_id:
             lines.append(f"Run ID: {run_id}")
         if compiled.arguments:
-            visible = _safe_run_args(compiled.arguments)
-            lines.append("Parámetros: " + json.dumps(visible, ensure_ascii=False))
+            lines.append("Parámetros: " + json.dumps(_safe_run_args(compiled.arguments), ensure_ascii=False))
+        if compiled.sensitive_parameters:
+            lines.append(
+                "Parámetros sensibles NO inyectados al playbook: "
+                + ", ".join(compiled.sensitive_parameters)
+                + ". Deben solicitarse/obtenerse mediante un flujo seguro cuando sean imprescindibles."
+            )
         if compiled.missing:
             lines.append("FALTAN PARÁMETROS REQUERIDOS: " + ", ".join(compiled.missing))
         lines.append("PASOS:")
@@ -548,14 +639,14 @@ class SkillRegistry:
                 lines.append(f"   Herramienta sugerida: {step.get('tool_hint')}")
             if step.get("verify"):
                 lines.append(f"   Verifica: {step.get('verify')}")
-        checks = list(compiled.verification or [])
-        if checks:
+        if compiled.verification:
             lines.append("VERIFICACIÓN FINAL:")
-            for check in checks:
-                lines.append(f"- {check}")
+            lines += [f"- {check}" for check in compiled.verification]
         permissions = list(skill.get("permissions") or [])
         if permissions:
-            lines.append("CAPACIDADES REQUERIDAS (declarativas, no concedidas): " + ", ".join(permissions))
+            lines.append(
+                "CAPACIDADES REQUERIDAS (declarativas, no concedidas): " + ", ".join(permissions)
+            )
         return "\n".join(lines)
 
     def start_run(self, compiled: CompiledSkill, workspace_id: int | None = None) -> int:
@@ -563,41 +654,68 @@ class SkillRegistry:
             raise ValueError("Faltan parámetros: " + ", ".join(compiled.missing))
         if workspace_id is None:
             workspace_id = self._active_workspace_id()
+        # Persistimos los templates originales, nunca los pasos ya interpolados.
+        # Así un valor sensible no puede acabar en skills.db por sustitución.
+        persisted_steps = list(compiled.skill.get("steps") or [])
         with self._lock, self._connect() as conn:
             cur = conn.execute(
                 "INSERT INTO skill_runs(skill_id,workspace_id,status,arguments_json,steps_json) VALUES (?,?,?,?,?)",
                 (
-                    int(compiled.skill["id"]), int(workspace_id) if workspace_id is not None else None, "prepared",
+                    int(compiled.skill["id"]),
+                    int(workspace_id) if workspace_id is not None else None,
+                    "prepared",
                     json.dumps(_safe_run_args(compiled.arguments), ensure_ascii=False),
-                    json.dumps(compiled.steps, ensure_ascii=False),
+                    json.dumps(persisted_steps, ensure_ascii=False),
                 ),
             )
-            conn.execute("UPDATE skills SET last_used_at=CURRENT_TIMESTAMP WHERE id=?", (int(compiled.skill["id"]),))
+            conn.execute(
+                "UPDATE skills SET last_used_at=CURRENT_TIMESTAMP WHERE id=?",
+                (int(compiled.skill["id"]),),
+            )
             conn.commit()
             return int(cur.lastrowid)
 
-    def finish_run(self, run_id: int, success: bool | None, summary: str = "") -> dict[str, Any] | None:
+    def finish_run(
+        self,
+        run_id: int,
+        success: bool | None,
+        summary: str = "",
+    ) -> dict[str, Any] | None:
         with self._lock, self._connect() as conn:
             row = conn.execute("SELECT * FROM skill_runs WHERE id=?", (int(run_id),)).fetchone()
             if not row:
                 return None
-            if success is True:
-                status = "completed"
-            elif success is False:
-                status = "failed"
-            else:
-                status = "agent_returned"
+            current_status = str(row["status"] or "prepared")
+            desired = "completed" if success is True else "failed" if success is False else "agent_returned"
+            if current_status in _FINAL_RUN_STATES:
+                return self.run_info(int(run_id))
+            output = ""
+            if self.config.get("persist_run_summaries", False):
+                candidate = str(summary or "")[:1000]
+                output = "[REDACTED_SENSITIVE_OUTPUT]" if _has_secret_material(candidate) else candidate
             conn.execute(
                 "UPDATE skill_runs SET status=?,output_summary=?,finished_at=CURRENT_TIMESTAMP WHERE id=?",
-                (status, str(summary or "")[:1000], int(run_id)),
+                (desired, output, int(run_id)),
             )
-            if success is True:
-                conn.execute("UPDATE skills SET successful_runs=successful_runs+1 WHERE id=?", (int(row["skill_id"]),))
-            elif success is False:
-                conn.execute("UPDATE skills SET failed_runs=failed_runs+1 WHERE id=?", (int(row["skill_id"]),))
-            counts = conn.execute("SELECT successful_runs,failed_runs,trust_level FROM skills WHERE id=?", (int(row["skill_id"]),)).fetchone()
+            if desired == "completed":
+                conn.execute(
+                    "UPDATE skills SET successful_runs=successful_runs+1 WHERE id=?",
+                    (int(row["skill_id"]),),
+                )
+            elif desired == "failed":
+                conn.execute(
+                    "UPDATE skills SET failed_runs=failed_runs+1 WHERE id=?",
+                    (int(row["skill_id"]),),
+                )
+            counts = conn.execute(
+                "SELECT successful_runs,failed_runs,trust_level FROM skills WHERE id=?",
+                (int(row["skill_id"]),),
+            ).fetchone()
             if counts and counts["trust_level"] == "draft" and int(counts["successful_runs"]) >= 2:
-                conn.execute("UPDATE skills SET trust_level='verified',updated_at=CURRENT_TIMESTAMP WHERE id=?", (int(row["skill_id"]),))
+                conn.execute(
+                    "UPDATE skills SET trust_level='verified',updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                    (int(row["skill_id"]),),
+                )
             conn.commit()
         return self.run_info(int(run_id))
 
@@ -607,13 +725,13 @@ class SkillRegistry:
             if not row:
                 return None
             data = dict(row)
-            for field, default in (("arguments_json", {}), ("steps_json", [])):
-                key = field.removesuffix("_json")
+            for field_name, default in (("arguments_json", {}), ("steps_json", [])):
+                key = field_name.removesuffix("_json")
                 try:
-                    data[key] = json.loads(data.get(field) or json.dumps(default))
+                    data[key] = json.loads(data.get(field_name) or json.dumps(default))
                 except Exception:
                     data[key] = default
-                data.pop(field, None)
+                data.pop(field_name, None)
             return data
 
     def recent_runs(self, limit: int = 20) -> list[dict[str, Any]]:
@@ -634,13 +752,19 @@ class SkillRegistry:
                 "SELECT version,snapshot_json,created_at FROM skill_revisions WHERE skill_id=? ORDER BY version DESC LIMIT ?",
                 (int(row["id"]), max(1, min(int(limit), 100))),
             ).fetchall()
-            out = []
+            out: list[dict[str, Any]] = []
             for item in rows:
                 try:
                     snapshot = json.loads(item["snapshot_json"])
                 except Exception:
                     snapshot = {}
-                out.append({"version": item["version"], "created_at": item["created_at"], "snapshot": snapshot})
+                out.append(
+                    {
+                        "version": item["version"],
+                        "created_at": item["created_at"],
+                        "snapshot": snapshot,
+                    }
+                )
             return out
 
     def status(self) -> dict[str, Any]:
@@ -660,16 +784,26 @@ class SkillRegistry:
             "db_path": str(self.db_path),
             "db_size_mb": round(self.db_path.stat().st_size / 1024**2, 3) if self.db_path.exists() else 0.0,
             "auto_execute_matches": bool(self.config.get("auto_execute_matches", False)),
+            "persist_run_summaries": bool(self.config.get("persist_run_summaries", False)),
             "declarative_only": True,
             "inherits_security_policy": True,
+            "sensitive_parameters_injected": False,
         }
 
     def compact_candidates(self, text: str, workspace_id: int | None = None) -> str:
-        if not self.enabled or not self.config.get("inject_context", True) or not self.config.get("suggest_on_match", True):
+        if (
+            not self.enabled
+            or not self.config.get("inject_context", True)
+            or not self.config.get("suggest_on_match", True)
+        ):
             return ""
         threshold = float(self.config.get("suggest_threshold", 0.72))
         limit = max(1, min(int(self.config.get("max_prompt_skills", 3)), 6))
-        rows = [x for x in self.match(text, workspace_id=workspace_id, limit=limit) if float(x.get("match_score", 0)) >= threshold]
+        rows = [
+            item
+            for item in self.match(text, workspace_id=workspace_id, limit=limit)
+            if float(item.get("match_score", 0)) >= threshold
+        ]
         if not rows:
             return ""
         lines = ["Skills posiblemente relevantes (solo sugerencias; no ejecutar automáticamente):"]
