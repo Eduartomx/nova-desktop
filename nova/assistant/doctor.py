@@ -40,7 +40,8 @@ class NovaDoctor:
         required = [
             "app.py", "assistant/agent.py", "assistant/tools.py", "assistant/ui.py",
             "assistant/memory.py", "assistant/task_engine.py", "assistant/workspace.py",
-            "assistant/core_runtime.py", "assistant/perception.py",
+            "assistant/core_runtime.py", "assistant/perception.py", "assistant/runtime_lifecycle.py",
+            "assistant/tray_controller.py", "assistant/instance_lock.py", "assistant/autostart.py",
             "updater/nova_updater.py", "NOVA_VERSION.txt",
         ]
         missing = [x for x in required if not (self.root / x).exists()]
@@ -55,25 +56,15 @@ class NovaDoctor:
             status = architecture_status()
             if not status.get("ok"):
                 missing = [k for k, v in status.get("legacy_local_contract", {}).items() if not v]
-                return self._result(
-                    "Arquitectura",
-                    "error",
-                    "Contrato local incompleto: " + ", ".join(missing),
-                    architecture=status,
-                )
+                return self._result("Arquitectura", "error", "Contrato local incompleto: " + ", ".join(missing), architecture=status)
             native = len(status.get("github_managed_native") or [])
             adapters = len(status.get("compatibility_adapters") or [])
-            return self._result(
-                "Arquitectura",
-                "ok",
-                f"core_runtime único · {native} dominios nativos · {adapters} adaptadores legacy · sin cadena versionada",
-                architecture=status,
-            )
+            return self._result("Arquitectura", "ok", f"core_runtime único · {native} dominios nativos · {adapters} adaptadores legacy · sin cadena versionada", architecture=status)
         except Exception as exc:
             return self._result("Arquitectura", "warn", str(exc))
 
     def _dependencies(self):
-        modules = ["ollama", "psutil", "PIL", "pynput", "requests", "bs4", "numpy", "playwright", "pywinauto"]
+        modules = ["ollama", "psutil", "PIL", "pystray", "pynput", "requests", "bs4", "numpy", "playwright", "pywinauto"]
         missing = [name for name in modules if importlib.util.find_spec(name) is None]
         if missing:
             return self._result("Dependencias", "warn", "Faltan módulos: " + ", ".join(missing), missing=missing)
@@ -85,10 +76,7 @@ class NovaDoctor:
         try:
             stats = self.memory.stats()
             ws = self.memory.active_workspace()
-            detail = (
-                f"DB {stats['db_size_mb']} MB · {stats['memory_items']} memorias · "
-                f"{stats['workspaces']} workspaces · {stats['tasks']} tareas"
-            )
+            detail = f"DB {stats['db_size_mb']} MB · {stats['memory_items']} memorias · {stats['workspaces']} workspaces · {stats['tasks']} tareas"
             if ws:
                 detail += f" · activo: {ws.get('name')}"
             detail += f" · continuity {stats.get('continuity_active', 0)} activa"
@@ -106,18 +94,8 @@ class NovaDoctor:
             if not status.get("enabled"):
                 return self._result("Semantic Memory", "warn", "Desactivada en config", semantic=status)
             if not status.get("model_available"):
-                return self._result(
-                    "Semantic Memory",
-                    "warn",
-                    f"{status.get('detail')} · instala con: {status.get('install_command')}",
-                    semantic=status,
-                )
-            return self._result(
-                "Semantic Memory",
-                "ok",
-                f"{status.get('model')} · {status.get('indexed', 0)}/{status.get('total_candidates', 0)} recuerdos indexados",
-                semantic=status,
-            )
+                return self._result("Semantic Memory", "warn", f"{status.get('detail')} · instala con: {status.get('install_command')}", semantic=status)
+            return self._result("Semantic Memory", "ok", f"{status.get('model')} · {status.get('indexed', 0)}/{status.get('total_candidates', 0)} recuerdos indexados", semantic=status)
         except Exception as exc:
             return self._result("Semantic Memory", "warn", str(exc))
 
@@ -129,10 +107,7 @@ class NovaDoctor:
                 return self._result("Perception Engine", "warn", "Desactivado en config", perception=status)
             process = status.get("process") or "sin ventana externa todavía"
             candidate = status.get("probable_workspace") or None
-            detail = (
-                f"{'activo' if status.get('running') else 'preparado'} · {status.get('poll_interval_ms')} ms · "
-                f"{process} · sin screenshot/teclado/portapapeles"
-            )
+            detail = f"{'activo' if status.get('running') else 'preparado'} · {status.get('poll_interval_ms')} ms · {process} · sin screenshot/teclado/portapapeles"
             if candidate:
                 detail += f" · proyecto probable: {candidate.get('name')} ({float(candidate.get('confidence',0))*100:.0f}%)"
             return self._result("Perception Engine", "ok", detail, perception=status)
@@ -143,7 +118,7 @@ class NovaDoctor:
         host = str(self.config.get("ollama_host", "http://127.0.0.1:11434")).rstrip("/")
         model = str(self.config.get("model", "qwen3.5:4b"))
         try:
-            req = urllib.request.Request(host + "/api/tags", headers={"User-Agent": "Nova-Doctor/0.9.3"})
+            req = urllib.request.Request(host + "/api/tags", headers={"User-Agent": "Nova-Doctor/0.9.9"})
             with urllib.request.urlopen(req, timeout=2.5) as r:
                 data = json.load(r)
             names = {str(x.get("name") or x.get("model") or "") for x in data.get("models", [])}
@@ -158,13 +133,7 @@ class NovaDoctor:
         if not smi:
             return self._result("GPU", "warn", "nvidia-smi no disponible; puede ser normal si no usas NVIDIA")
         try:
-            cp = subprocess.run(
-                [smi, "--query-gpu=name,utilization.gpu,memory.used,memory.total,temperature.gpu", "--format=csv,noheader,nounits"],
-                capture_output=True,
-                text=True,
-                timeout=3,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            )
+            cp = subprocess.run([smi, "--query-gpu=name,utilization.gpu,memory.used,memory.total,temperature.gpu", "--format=csv,noheader,nounits"], capture_output=True, text=True, timeout=3, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
             if cp.returncode != 0 or not cp.stdout.strip():
                 return self._result("GPU", "warn", (cp.stderr or "nvidia-smi sin datos").strip())
             parts = [x.strip() for x in cp.stdout.strip().splitlines()[0].split(",")]
@@ -198,12 +167,7 @@ class NovaDoctor:
             if auth.returncode != 0:
                 return self._result("GitHub", "warn", "gh instalado, pero la sesión no está autenticada")
             repo = self.config.get("updater", {}).get("repository") or "Eduartomx/nova-desktop"
-            cp = subprocess.run(
-                [gh, "api", f"repos/{repo}/releases/latest", "--jq", ".tag_name"],
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
+            cp = subprocess.run([gh, "api", f"repos/{repo}/releases/latest", "--jq", ".tag_name"], capture_output=True, text=True, timeout=5)
             latest = cp.stdout.strip() if cp.returncode == 0 else "release no consultada"
             return self._result("GitHub", "ok", f"Sesión autenticada · latest {latest}")
         except Exception as exc:
@@ -218,21 +182,41 @@ class NovaDoctor:
         channel = self.config.get("browser", {}).get("channel", "msedge")
         return self._result("Browser Agent", "ok", f"Playwright disponible · canal {channel}")
 
+    def _resident_runtime(self):
+        try:
+            from .runtime_lifecycle import get_current_lifecycle
+            lifecycle = get_current_lifecycle()
+            cfg = self.config.get("resident_mode", {}) if isinstance(self.config, dict) else {}
+            if lifecycle is None:
+                enabled = bool(cfg.get("enabled", True))
+                return self._result("Resident Mode", "warn" if enabled else "ok", "runtime todavía no inicializado" if enabled else "desactivado en config")
+            status = lifecycle.status()
+            tray = status.get("tray") or {}
+            instance = status.get("single_instance") or {}
+            autostart = status.get("start_with_windows") or {}
+            state = str(status.get("state") or "?")
+            visible = "oculta" if status.get("window_hidden") else "visible"
+            tray_text = "activa" if tray.get("available") else ("degradada" if tray.get("degraded") else "no disponible")
+            instance_ok = bool(instance.get("acquired") or getattr(lifecycle.instance, "acquired", False))
+            auto_text = "activo" if autostart.get("enabled") else "inactivo"
+            detail = f"{state} · ventana {visible} · bandeja {tray_text} · instancia {'adquirida' if instance_ok else 'no confirmada'} · inicio Windows {auto_text}"
+            reason = str(status.get("last_shutdown_reason") or "")
+            if reason:
+                detail += f" · último cierre: {reason}"
+            errors = list(status.get("recent_errors") or [])
+            if errors:
+                detail += f" · {len(errors)} error(es) recientes de lifecycle"
+            severity = "ok" if (not status.get("resident_enabled") or tray.get("available")) else "warn"
+            return self._result("Resident Mode", severity, detail, resident=status)
+        except Exception as exc:
+            return self._result("Resident Mode", "warn", f"{type(exc).__name__}: {str(exc)[:220]}")
+
     def run(self) -> dict[str, Any]:
         started = time.perf_counter()
         checks: list[Callable[[], dict[str, Any]]] = [
-            self._python,
-            self._core_files,
-            self._architecture,
-            self._dependencies,
-            self._memory,
-            self._semantic_memory,
-            self._perception,
-            self._ollama,
-            self._gpu,
-            self._system,
-            self._github,
-            self._browser,
+            self._python, self._core_files, self._architecture, self._dependencies,
+            self._memory, self._semantic_memory, self._perception, self._ollama,
+            self._gpu, self._system, self._github, self._browser, self._resident_runtime,
         ]
         results: list[dict[str, Any]] = []
         with ThreadPoolExecutor(max_workers=6, thread_name_prefix="nova-doctor") as pool:
@@ -244,13 +228,11 @@ class NovaDoctor:
                     results.append(self._result(future_map[future], "error", str(exc)))
         wanted = [
             "Python", "Core Nova", "Arquitectura", "Dependencias", "Memoria",
-            "Semantic Memory", "Perception Engine", "Ollama", "GPU", "Sistema", "GitHub", "Browser Agent",
+            "Semantic Memory", "Perception Engine", "Ollama", "GPU", "Sistema", "GitHub", "Browser Agent", "Resident Mode",
         ]
         results.sort(key=lambda x: wanted.index(x["name"]) if x["name"] in wanted else 999)
         duration = round(time.perf_counter() - started, 2)
-        severity = "error" if any(x["status"] == "error" for x in results) else (
-            "warn" if any(x["status"] == "warn" for x in results) else "ok"
-        )
+        severity = "error" if any(x["status"] == "error" for x in results) else ("warn" if any(x["status"] == "warn" for x in results) else "ok")
         report = {"ok": severity != "error", "severity": severity, "duration_seconds": duration, "checks": results}
         try:
             report["repairs"] = SelfRepairManager(self.config, self.memory).available_actions(report)
@@ -260,8 +242,6 @@ class NovaDoctor:
             profiler = get_profiler(self.config)
             windows = profiler.windows()
             report["performance_windows"] = windows
-            # Compatibilidad: `performance` ahora representa la sesión actual y
-            # evita mezclar una versión recién actualizada con eventos antiguos.
             report["performance"] = windows.get("session") or {"ok": False, "operations": []}
         except Exception:
             report["performance"] = {"ok": False, "operations": []}
@@ -301,9 +281,5 @@ class NovaDoctor:
 
         llm = report.get("llm_performance") if isinstance(report.get("llm_performance"), dict) else {}
         if llm.get("calls"):
-            lines.append(
-                "LLM esta sesión: "
-                f"{llm.get('avg_wall_ms')} ms prom. · {llm.get('avg_eval_tps')} tok/s · "
-                f"carga {llm.get('avg_load_ms')} ms · prompt {llm.get('avg_prompt_eval_ms')} ms · generación {llm.get('avg_eval_ms')} ms"
-            )
+            lines.append("LLM esta sesión: " f"{llm.get('avg_wall_ms')} ms prom. · {llm.get('avg_eval_tps')} tok/s · " f"carga {llm.get('avg_load_ms')} ms · prompt {llm.get('avg_prompt_eval_ms')} ms · generación {llm.get('avg_eval_ms')} ms")
         return "\n".join(lines)
