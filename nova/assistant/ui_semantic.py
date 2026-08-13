@@ -21,11 +21,13 @@ def install_ui_v063():
         except Exception:
             pass
         try:
-            status = self.agent.memory.semantic_status()
+            # Startup no debe bloquear esperando Ollama/red. La comprobación activa
+            # sigue disponible por comando y en Nova Doctor.
+            status = self.agent.memory.semantic_status(refresh=False)
             if status.get("enabled") and status.get("model_available"):
                 self._append("system", f"Semantic Memory activa · {status.get('model')} · búsqueda híbrida local disponible.")
             elif status.get("enabled"):
-                self._append("system", f"Semantic Memory preparada, pero falta {status.get('model')}. Nova seguirá usando búsqueda léxica hasta instalarlo.")
+                self._append("system", f"Semantic Memory preparada · estado del modelo pendiente de comprobación. Nova mantiene búsqueda léxica como fallback.")
         except Exception:
             pass
 
