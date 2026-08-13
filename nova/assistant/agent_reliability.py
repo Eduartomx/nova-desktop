@@ -25,8 +25,10 @@ def reliability_direct_intent(text: str) -> str | None:
         return "status"
     if any(cue in t for cue in (
         "habilidades que estan fallando", "skills que estan fallando", "habilidades fallando",
-        "skills fallando", "habilidades obsoletas", "skills obsoletas", "habilidades degradadas",
-        "skills degradadas", "que habilidades debo revisar", "que skills debo revisar",
+        "skills fallando", "que habilidades estan fallando", "que skills estan fallando",
+        "habilidades obsoletas", "skills obsoletas", "que habilidades estan obsoletas",
+        "que skills estan obsoletas", "habilidades degradadas", "skills degradadas",
+        "que habilidades debo revisar", "que skills debo revisar",
     )):
         return "review"
     if "fiabilidad" in t or "reliability" in t:
@@ -142,7 +144,7 @@ REGLAS DE FIABILIDAD DE SKILLS
 - El trust_level de una Skill no garantiza que siga funcionando en el entorno actual. Considera también su fiabilidad reciente.
 - Una Skill `degraded` o `stale` requiere revalidación. No ocultes la advertencia ni asumas que un procedimiento antiguo sigue siendo correcto.
 - No edites, deshabilites ni sustituyas silenciosamente una Skill por detectar degradación. Propón revisar/actualizar el playbook y conserva el historial.
-- Los fallos recientes pesan más que la reputación histórica: una Skill previously verified puede volver a `draft` si aparece evidencia negativa.
+- Los fallos recientes pesan más que la reputación histórica: una Skill previamente verified puede volver a `draft` si aparece evidencia negativa.
 - `skill_reliability.db` contiene metadatos de resultados, no prompts, argumentos, outputs ni contenido de los playbooks.
 - Si una Skill falla porque cambió una versión de software, dependencia, ruta o interfaz, crea/actualiza una nueva versión solo después de comprobar el procedimiento corregido.
 """
