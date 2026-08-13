@@ -23,8 +23,6 @@ def install_core_runtime():
     from .config_gaming import install_config_gaming
     install_config_gaming()
 
-    # Gaming Mode puede reducir temporalmente el polling de Perception sin
-    # reiniciar su hilo ni cambiar el valor persistente del usuario.
     from .perception_gaming import install_perception_gaming
     install_perception_gaming()
     from .gaming_status_sync import install_gaming_status_sync
@@ -98,9 +96,6 @@ def install_core_runtime():
     install_agent_expert()
     install_agent_learning()
     install_agent_reliability()
-    # Fast Routing sigue por fuera del pipeline de dominios. Instant Wake añade
-    # keep_alive y Gaming Awareness envuelve finalmente los comandos directos y
-    # la política temporal de VRAM.
     install_agent_fast_routing()
     install_agent_instant_wake()
     install_agent_gaming()
@@ -133,8 +128,6 @@ def install_core_runtime():
     install_ui_expert()
     install_ui_voice_wake()
     install_ui_instant_wake()
-    # Gaming Awareness va después de Instant Wake porque coordina su Warm
-    # Manager y añade estado visual/Doctor sobre la UI final.
     install_ui_gaming()
     install_profiler_v066()
 
@@ -161,6 +154,7 @@ def architecture_status() -> dict:
         "fast_routing", "adaptive_memory_context", "llm_performance_intelligence", "llm_benchmark",
         "llm_warm_manager", "instant_wake", "configurable_hotkeys",
         "gaming_awareness", "gaming_vram_policy", "gaming_perception_throttle", "gaming_state_sync",
+        "runtime_lifecycle", "resident_mode", "system_tray", "single_instance", "windows_autostart",
         "agent", "tools", "ui", "task_engine",
     ]
     return {
