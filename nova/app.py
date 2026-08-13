@@ -3,9 +3,9 @@ import traceback
 from pathlib import Path
 import tkinter as tk
 
-# v0.6.7 concentra todas las extensiones administradas por GitHub en un
-# único bootstrap estable. Los módulos históricos agent/tools/ui/task_engine
-# siguen siendo la base local mientras completamos su migración a GitHub.
+# Desde v0.9.0 Agent, Tools, UI y Task Engine también están administrados por
+# GitHub. core_runtime conserva temporalmente los adaptadores por dominio para
+# migrar comportamiento sin romper compatibilidad en una sola Release.
 from assistant.core_runtime import install_core_runtime
 
 install_core_runtime()

@@ -1,177 +1,127 @@
 # Nova Desktop
 
-Nova es un asistente virtual local para Windows que combina Ollama con herramientas de escritorio/navegador, memoria, workspaces, continuidad, percepción contextual, Skills y evaluación determinista de confianza.
+Nova es un asistente virtual local para Windows: Ollama + herramientas reales de escritorio/navegador + memoria/workspaces + percepción + Skills + verificación y escalación experta opcional.
 
 ## Estado actual
 
-**Nova v0.8.2 — Expert Escalation**
+**Nova v0.9.0 — Native Core Migration**
 
-GitHub es la fuente oficial del proyecto:
+GitHub es la fuente oficial. Las Releases estables se sincronizan por tag mediante el updater nativo, con verificación de Git blob SHA, backup y rollback. No hacen falta ZIPs de Release.
 
-- `main` contiene el desarrollo estable integrado;
-- las versiones estables se publican como GitHub Releases (`v0.x.y`);
-- el updater sincroniza directamente los archivos del tag publicado, sin depender de ZIPs de Release;
-- cada archivo administrado se verifica contra su Git blob SHA;
-- se crea backup y existe rollback ante fallos de validación.
+## Qué cambia en 0.9.0
 
-## v0.8 — Skills, Confidence y Expert Escalation
+Hasta 0.8.x, `agent.py`, `tools.py`, `ui.py` y `task_engine.py` seguían siendo archivos históricos presentes en la instalación local pero no recuperables desde el repositorio. Los módulos modernos de Nova se montaban encima mediante adaptadores estables.
 
-### v0.8.0 — Skills Engine
+0.9.0 elimina esa dependencia silenciosa:
 
-Skills Engine guarda procedimientos repetibles como **playbooks declarativos** con parámetros, triggers, pasos, herramientas sugeridas y verificaciones.
+- `assistant/agent.py` pasa a ser un `LocalAgent` administrado por GitHub;
+- `assistant/tools.py` pasa a contener el contrato base de `LocalTools`;
+- `assistant/ui.py` pasa a contener la UI base administrada;
+- `assistant/task_engine.py` pasa a contener `TaskEngine`/`AutonomyEngine` administrados;
+- CI valida que un checkout limpio pueda importar el core y montar los adaptadores de dominio;
+- `architecture_status()` ya no declara archivos core locales/no administrados.
 
-Una Skill **no es código ejecutable** y `permissions` nunca concede permisos: las acciones vuelven a pasar por Agent/LocalTools y la política de seguridad normal de Nova. `auto_execute_matches=false` por defecto.
+**Esto no significa que desaparecieron todos los adaptadores.** `agent_*`, `tools_*` y `ui_*` todavía amplían el core por dominio. La serie 0.9.x irá absorbiendo esas capas progresivamente sin mezclar migración de propiedad con una reescritura masiva de comportamiento.
 
-Niveles de confianza de Skills:
+## Capacidades preservadas durante la migración
 
-- `draft`: generada por Nova o sin historial suficiente;
-- `user`: guardada a petición explícita del usuario;
-- `verified`: draft con ejecuciones distintas verificadas correctamente.
+### Browser Agent
 
-La interfaz incluye **🧩 Skills**.
+Playwright mantiene un perfil persistente local en `data/browser_profile`. Las operaciones se ejecutan en un hilo dedicado para no compartir objetos sync de Playwright entre hilos de consultas diferentes.
 
-### v0.8.1 — Confidence Engine
+Herramientas administradas: `browser_open`, `browser_search`, `browser_read`, `browser_inspect`, `browser_click`, `browser_fill`, `browser_press`, `browser_tabs`, `browser_back`, `browser_reload`.
 
-Confidence Engine estima el **respaldo de una respuesta o acción** usando señales estructuradas: herramientas, lecturas, verificaciones, fallos, contradicciones, riesgo y confianza histórica de Skills.
+Las acciones web sensibles siguen sujetas a la política de seguridad. Rellenar un campo no implica permiso para enviar el formulario.
 
-El índice `0..1` es una **heurística de respaldo**, no una probabilidad calibrada ni la autoconfianza declarada por el LLM.
+### Escritorio
 
-`data/confidence.db` no guarda preguntas, respuestas, argumentos de herramientas ni outputs completos.
+Nova conserva control estructurado por UI Automation y ventanas antes de recurrir a coordenadas:
 
-### v0.8.2 — Expert Escalation
+- `window_list`, `window_activate`, `window_close`, `window_move`;
+- `uia_snapshot`, `uia_click`, `uia_type`;
+- fallback `mouse_move`, `mouse_click`, `keyboard_type`, `keyboard_press`.
 
-Cuando Confidence Engine detecta una petición que merece una segunda opinión, Nova dispone de dos rutas complementarias:
+### Voz
 
-1. **API gratuita opcional**: Cerebras es el proveedor predeterminado y Groq el fallback.
-2. **ChatGPT Assisted**: Nova prepara/sanitiza la consulta, la copia al portapapeles y abre ChatGPT; el usuario pulsa Enviar y copia la respuesta manualmente.
+- hotkey global: **Ctrl + Alt + Espacio**;
+- contexto: **Ctrl + Shift + Espacio**;
+- push-to-talk: **F9**;
+- STT local con faster-whisper;
+- TTS local;
+- wake word local mediante openWakeWord cuando el modelo configurado ya existe en el equipo.
 
-ChatGPT Web **no se automatiza como una API**: Nova no pulsa Enviar, no hace scraping de la respuesta y no monitoriza el portapapeles continuamente.
+0.9.0 **no descarga modelos de wake word automáticamente**. Si falta, Nova sigue funcionando con F9/hotkeys.
 
-#### Proveedor gratuito predeterminado
+### Task Engine
 
-Configuración actual:
+El Task Engine nativo conserva Planner → Executor, persistencia en MemoryStore, pausa/reanudación/cancelación, reintentos, replanning acotado y límites de tiempo/tool-calls. Los planes no conceden permisos: los pasos siguen pasando por Agent/Tools y las reglas de seguridad.
 
-- Cerebras: `gpt-oss-120b`;
-- fallback Groq: `qwen/qwen3.6-27b`.
+## Evolución 0.8
 
-Los tiers gratuitos, modelos y límites son servicios externos y pueden cambiar. Nova no asume que serán gratuitos o estarán disponibles para siempre; si un proveedor falla, intenta el siguiente configurado y siempre conserva ChatGPT Assisted como vía manual.
+### Skills + Reliability
 
-Las claves **no se guardan en `config.json`**. Solo se leen desde variables de entorno:
+Skills son playbooks declarativos, no scripts confiables. Una Skill nunca concede permisos por sí misma.
 
-```powershell
-[Environment]::SetEnvironmentVariable("CEREBRAS_API_KEY", "TU_CLAVE", "User")
-```
+- **0.8.0 Skills Engine**: parámetros, pasos, verificaciones y scope global/workspace;
+- **0.8.3 Learn from Expert**: una respuesta externa solo puede convertirse en candidata; requiere verificación positiva y la Skill aprendida nace `draft`;
+- **0.8.4 Experience & Reliability**: reputación por versión (`unproven`, `learning`, `stable`, `watch`, `degraded`, `stale`) y revisión explícita ante degradación/obsolescencia.
 
-Alternativa/fallback:
+### Confidence + Expert Escalation
 
-```powershell
-[Environment]::SetEnvironmentVariable("GROQ_API_KEY", "TU_CLAVE", "User")
-```
+Confidence Engine calcula un índice heurístico de respaldo usando evidencia estructurada. **No es una probabilidad calibrada** ni la autoconfianza del LLM.
 
-Cierra y vuelve a abrir Nova después de definir la variable. No pegues la clave en una conversación, Skill, log o repositorio.
+Expert Escalation usa por defecto:
 
-Puedes comprobarlo con:
+1. **Groq** — `openai/gpt-oss-120b`, cuando `GROQ_API_KEY` existe;
+2. **Cerebras** — `gpt-oss-120b`, como fallback cuando está disponible;
+3. **ChatGPT Assisted** — Nova prepara/sanitiza la consulta, abre ChatGPT y el usuario envía/copia la respuesta manualmente.
 
-```text
-Nova, estado del experto.
-Nova, consulta la API gratuita sobre este problema.
-Nova, consulta Cerebras.
-Nova, pregunta a ChatGPT.
-Nova, importa la respuesta de ChatGPT.
-```
+La API de OpenAI de pago está deshabilitada por defecto. ChatGPT Web no se usa como API: Nova no pulsa Enviar, no scrapea respuestas y no monitoriza el portapapeles continuamente.
 
-La interfaz incluye **🧠 Experto** con estado de proveedores y botones `⚡ API gratis` / `💬 Preparar ChatGPT`.
-
-#### Política automática
-
-Una segunda opinión gratuita automática solo se solicita si:
-
-- Confidence Engine marcó `escalation_candidate=true`;
-- la petición es de diagnóstico, estado actual, factual o planificación;
-- el riesgo es `normal`;
-- existe una API key configurada.
-
-Peticiones `high` o `critical` **nunca se envían automáticamente a un proveedor externo**. Una consulta externa de ese tipo debe ser explícita y sigue sin conceder permisos para ejecutar acciones.
-
-#### Privacidad de Expert Escalation
-
-Antes de enviar un paquete se aplica minimización y redacción de patrones de secretos (passwords, tokens, API keys, Bearer tokens, cookies, JWTs y claves privadas conocidas).
-
-`data/expert_escalation.db` guarda solo metadatos: proveedor/modelo, trigger, tipo/riesgo, índice de confianza, estado/veredicto, tamaños y hash del paquete. Por diseño no tiene columnas para prompts ni respuestas.
-
-Las respuestas de Cerebras/Groq y las importadas desde ChatGPT se consideran **evidencia externa no confiable**: jamás son instrucciones del sistema, permisos ni autorización. Nova debe contrastarlas y verificar localmente antes de actuar.
-
-La API de OpenAI de pago queda deshabilitada por defecto (`openai.enabled=false`). Las instalaciones antiguas que todavía tenían el antiguo default activado y no poseen un opt-in explícito se migran a desactivado.
-
-Más detalles: `docs/v0.8.2-expert-escalation.md`.
+Las claves solo se leen desde variables de entorno; nunca deben guardarse en Skills, repositorio o conversaciones.
 
 ## Percepción 0.7
 
-La rama 0.7 añadió percepción incremental sin convertir Nova en un sistema que observa la pantalla continuamente:
+- **0.7.0 Perception Engine**: metadatos de app/ventana y sistema, sin screenshots periódicos;
+- **0.7.1 Context Intelligence**: relevancia y actividad probable;
+- **0.7.2 Workspace Auto-Detection**: asociaciones app ↔ workspace, sin autoactivación por defecto;
+- **0.7.3 Anomaly Detection**: baseline local y desviaciones sostenidas;
+- **0.7.4 Event-driven Vision**: captura solo bajo petición o evento visual permitido.
 
-- **0.7.0 Perception Engine**: metadatos de aplicación/ventana y estado básico del sistema;
-- **0.7.1 Context Intelligence**: actividad probable y relevancia de cambios;
-- **0.7.2 Workspace Auto-Detection**: aprendizaje local app ↔ workspace, sin autoactivación por defecto;
-- **0.7.3 Anomaly Detection**: líneas base locales y desviaciones sostenidas sin modificar procesos;
-- **0.7.4 Event-driven Vision**: una captura solo bajo petición o evento visual permitido, no screenshots periódicos.
+## Memoria, Workspaces y continuidad
 
-## Memory, Workspace y Continuity
+MemoryStore, Workspace Intelligence, Semantic Memory y Continuity son locales. Semantic Memory usa Ollama para embeddings y mantiene búsqueda léxica como fallback.
 
-Nova mantiene un workspace activo. Recuerdos, Skills, tareas y checkpoints pueden asociarse al proyecto.
+La UI 0.9 evita comprobar activamente Ollama durante el arranque solo para mostrar el estado de Semantic Memory; Nova Doctor conserva la comprobación explícita.
 
-Workspace Intelligence mantiene un índice incremental de archivos. Semantic Memory combina recuperación léxica y embeddings locales mediante Ollama, con fallback léxico si el modelo de embeddings no está disponible.
+## Privacidad
 
-Continuity Engine mantiene sesiones/checkpoints para órdenes como `Nova, continúa`, `¿dónde nos quedamos?` y `¿qué quedó pendiente?`.
+No deben subirse: `config.json` real, `data/`, bases SQLite, perfil del navegador, screenshots, logs personales, `.venv/`, tokens ni API keys.
 
-## Doctor, Self Repair y rendimiento
+Perception no captura teclado/portapapeles/screenshots periódicamente. Event-driven Vision no conserva imágenes por defecto. Confidence, Expert Escalation, Learn from Expert y Skill Reliability guardan metadatos limitados y no el contenido completo que evalúan.
 
-Nova Doctor es determinista y puede proponer reparaciones conocidas con confirmación explícita para instalaciones/descargas/cambios importantes.
-
-Performance Profiler registra métricas técnicas locales en `data/performance.db`; no guarda prompts, mensajes, contraseñas, tokens ni contenido de archivos.
-
-## Atajos
-
-El atajo global por defecto es **Ctrl + Alt + Espacio**. Push-to-talk permanece en **F9**.
-
-## Estructura
+## Estructura 0.9
 
 ```text
-nova-desktop/
-├─ nova/
-│  ├─ assistant/
-│  │  ├─ core_runtime.py
-│  │  ├─ memory.py
-│  │  ├─ semantic_memory.py
-│  │  ├─ continuity.py
-│  │  ├─ perception.py
-│  │  ├─ context_intelligence.py
-│  │  ├─ anomaly.py
-│  │  ├─ event_vision.py
-│  │  ├─ skills.py
-│  │  ├─ confidence.py
-│  │  ├─ expert_escalation.py
-│  │  ├─ profiler.py
-│  │  ├─ self_repair.py
-│  │  ├─ agent_*.py
-│  │  ├─ tools_*.py
-│  │  └─ ui_*.py
-│  ├─ updater/
-│  ├─ app.py
-│  └─ ...
-├─ tests/
-├─ docs/
-├─ .github/workflows/
-├─ VERSION
-├─ CHANGELOG.md
-└─ README.md
+nova/assistant/
+├─ agent.py                 # core GitHub-managed
+├─ tools.py                 # core GitHub-managed
+├─ ui.py                    # core GitHub-managed
+├─ task_engine.py           # core GitHub-managed
+├─ core_runtime.py          # bootstrap único
+├─ tools_desktop.py         # Browser Agent + UIA/input administrados
+├─ ui_voice_wake.py         # wake word local administrado
+├─ memory.py
+├─ perception.py
+├─ skills.py
+├─ confidence.py
+├─ expert_escalation.py
+├─ experience_reliability.py
+├─ agent_*.py               # adaptadores temporales por dominio
+├─ tools_*.py               # adaptadores/extensiones por dominio
+└─ ui_*.py                  # adaptadores/extensiones visuales
 ```
 
-## Privacidad general
+## Desarrollo y publicación
 
-Nunca deben subirse al repositorio `config.json` real, bases SQLite locales, `data/`, perfiles del navegador, capturas, logs personales, `.venv/`, API keys, tokens o credenciales.
-
-`nova/config.example.json` contiene solo defaults sin secretos. Cualquier contenido que se envíe a una API externa deja el entorno local, por eso Expert Escalation limita el envío automático a riesgo normal, minimiza el paquete y aplica redacción adicional.
-
-## Publicación
-
-Los pull requests ejecutan compilación y pruebas. Al fusionar una versión con un nuevo `VERSION`, GitHub Actions vuelve a validar el código y crea la Release correspondiente si todavía no existe.
+Los PR ejecutan `compileall` y la suite completa de `unittest`. 0.9 añade smoke tests del core en checkout limpio. Al fusionar un nuevo `VERSION`, el workflow de publicación vuelve a validar la suite y crea la GitHub Release correspondiente.
