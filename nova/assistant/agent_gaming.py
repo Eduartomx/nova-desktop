@@ -31,16 +31,18 @@ def gaming_direct_intent(text: str) -> str | None:
         "prioriza vram al jugar", "vuelve a liberar qwen al jugar", "libera el llm durante juegos",
     )):
         return "release_llm"
-    if any(cue in t for cue in (
-        "activa modo juego", "activar modo juego", "entra en modo juego",
-        "fuerza modo juego", "enciende modo juego", "gaming mode on",
-    )):
-        return "on"
+    # `desactiva` contiene literalmente `activa`; por eso las órdenes de salida
+    # se evalúan antes que las de entrada.
     if any(cue in t for cue in (
         "desactiva modo juego", "desactivar modo juego", "sal del modo juego",
         "apaga modo juego", "modo normal", "gaming mode off",
     )):
         return "off"
+    if any(cue in t for cue in (
+        "activa modo juego", "activar modo juego", "entra en modo juego",
+        "fuerza modo juego", "enciende modo juego", "gaming mode on",
+    )):
+        return "on"
     if any(cue in t for cue in (
         "modo juego automatico", "modo juego en automatico", "deteccion automatica de juegos",
         "detecta juegos automaticamente", "gaming mode auto", "vuelve a modo juego automatico",
