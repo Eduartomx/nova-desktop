@@ -20,6 +20,11 @@ def install_core_runtime():
     if _INSTALLED:
         return
 
+    # Expert Resilience modifica defaults/migración y parchea el transporte antes
+    # de que Tools/Agent/UI creen el singleton de Expert Escalation.
+    from .expert_resilience import install_expert_resilience
+    install_expert_resilience()
+
     # Herramientas por dominio. Expert se registra antes que Confidence para que
     # sus herramientas también queden instrumentadas por el motor de confianza.
     from .tools_workspace import install_tools_v060
@@ -118,6 +123,7 @@ def architecture_status() -> dict:
             "continuity", "doctor", "profiler", "self_repair", "perception",
             "context_intelligence", "workspace_autodetect", "anomaly_detection",
             "event_driven_vision", "skills", "confidence", "expert_escalation",
+            "expert_resilience",
         ],
         "compatibility_adapters": ["agent", "tools", "ui", "task_engine"],
         "versioned_runtime_chain": False,
