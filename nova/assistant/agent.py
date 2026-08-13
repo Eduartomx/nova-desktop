@@ -74,11 +74,13 @@ Sé breve y práctico salvo que el usuario pida detalle.
         }
         if tools:
             payload["tools"] = tools
+        local_cfg = self.config.get("local_llm", {}) if isinstance(self.config, dict) else {}
+        local_timeout = float(local_cfg.get("timeout_seconds", 45) or 45)
         response = requests.post(
             self.ollama_host + "/api/chat",
             json=payload,
-            timeout=float(timeout or self.config.get("internet", {}).get("timeout_seconds", 35) or 35),
-            headers={"User-Agent": "Nova-Agent/0.9.0"},
+            timeout=float(timeout if timeout is not None else local_timeout),
+            headers={"User-Agent": "Nova-Agent/0.9.2"},
         )
         response.raise_for_status()
         data = response.json()

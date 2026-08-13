@@ -70,6 +70,7 @@ def install_core_runtime():
     from .agent_expert import install_agent_expert
     from .agent_learning import install_agent_learning
     from .agent_reliability import install_agent_reliability
+    from .agent_fast_routing import install_agent_fast_routing
     install_agent_v060()
     install_agent_v063()
     install_agent_v065()
@@ -82,6 +83,9 @@ def install_core_runtime():
     install_agent_expert()
     install_agent_learning()
     install_agent_reliability()
+    # Debe quedar por fuera del resto del pipeline: las rutas locales simples no
+    # necesitan Confidence/Expert/LLM. Profiler se instala después y sí las mide.
+    install_agent_fast_routing()
 
     from .ui_workspace import install_ui_v060
     from .ui_semantic import install_ui_v063
@@ -130,6 +134,7 @@ def architecture_status() -> dict:
         "event_driven_vision", "skills", "confidence", "expert_escalation",
         "expert_resilience", "learn_from_expert", "experience_reliability",
         "desktop_browser_control", "file_write_safety", "voice_wake",
+        "fast_routing", "adaptive_memory_context",
         "agent", "tools", "ui", "task_engine",
     ]
     return {

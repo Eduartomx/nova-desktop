@@ -4,11 +4,23 @@ Nova es un asistente virtual local para Windows: Ollama + herramientas reales de
 
 ## Estado actual
 
-**Nova v0.9.0 — Native Core Migration**
+**Nova v0.9.2 — Fast Routing & Latency Fix**
 
 GitHub es la fuente oficial. Las Releases estables se sincronizan por tag mediante el updater nativo, con verificación de Git blob SHA, backup y rollback. No hacen falta ZIPs de Release.
 
-## Qué cambia en 0.9.0
+## Qué cambia en 0.9.2
+
+0.9.2 corrige trabajo costoso innecesario detectado por Performance Profiler:
+
+- preguntas deterministas como `Nova, ¿qué versión tienes?`, estado del sistema, top de procesos y workspace activo se resuelven antes de Semantic Memory/Ollama/Confidence/Expert;
+- el contexto de memoria pasa a modo adaptativo: la recuperación léxica SQLite es la ruta barata por defecto y los embeddings se reservan para referencias a conversaciones previas, preferencias, continuidad o proyecto;
+- si no existen recuerdos, `memory_search` no despierta Ollama para embeddings;
+- el timeout del LLM local deja de reutilizar `internet.timeout_seconds`; el valor local por defecto es 45 s para evitar abortar inferencias válidas solo porque Internet esté configurado a 12 s;
+- Fast Routing mantiene el turno en el historial local y Performance Profiler continúa midiendo su latencia, pero no genera una escalación experta innecesaria.
+
+El objetivo es que una consulta de metadatos locales se mida en milisegundos/cientos de milisegundos, mientras que Qwen se reserve para consultas que realmente necesitan generación o razonamiento.
+
+## Qué cambió en 0.9.0
 
 Hasta 0.8.x, `agent.py`, `tools.py`, `ui.py` y `task_engine.py` seguían siendo archivos históricos presentes en la instalación local pero no recuperables desde el repositorio. Los módulos modernos de Nova se montaban encima mediante adaptadores estables.
 
@@ -90,7 +102,7 @@ Las claves solo se leen desde variables de entorno; nunca deben guardarse en Ski
 
 ## Memoria, Workspaces y continuidad
 
-MemoryStore, Workspace Intelligence, Semantic Memory y Continuity son locales. Semantic Memory usa Ollama para embeddings y mantiene búsqueda léxica como fallback.
+MemoryStore, Workspace Intelligence, Semantic Memory y Continuity son locales. Semantic Memory usa Ollama para embeddings y mantiene búsqueda léxica como fallback. Desde 0.9.2 el contexto automático usa recuperación semántica de forma adaptativa para no pagar el coste de embeddings en preguntas simples.
 
 La UI 0.9 evita comprobar activamente Ollama durante el arranque solo para mostrar el estado de Semantic Memory; Nova Doctor conserva la comprobación explícita.
 
@@ -105,6 +117,7 @@ Perception no captura teclado/portapapeles/screenshots periódicamente. Event-dr
 ```text
 nova/assistant/
 ├─ agent.py                 # core GitHub-managed
+├─ agent_fast_routing.py    # rutas deterministas de baja latencia
 ├─ tools.py                 # core GitHub-managed
 ├─ ui.py                    # core GitHub-managed
 ├─ task_engine.py           # core GitHub-managed
