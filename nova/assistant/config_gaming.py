@@ -7,6 +7,18 @@ from copy import deepcopy
 from .gaming_awareness import DEFAULT_GAMING_CONFIG
 
 
+def _merge_default_list(existing, defaults):
+    out = []
+    seen = set()
+    for value in list(existing or []) + list(defaults or []):
+        text = str(value or "").strip()
+        key = text.casefold().replace("/", "\\")
+        if text and key not in seen:
+            seen.add(key)
+            out.append(text)
+    return out
+
+
 def install_config_gaming():
     # Los filtros amplían DEFAULT_GAMING_CONFIG con exclusiones de utilidades
     # antes de que la configuración persistente haga su migración.
@@ -31,6 +43,10 @@ def install_config_gaming():
         else:
             merged = deepcopy(DEFAULT_GAMING_CONFIG)
             merged.update(gaming)
+            # Las nuevas exclusiones se añaden sin borrar exclusiones propias del
+            # usuario. Esto permite que configs 0.9.7 hereden launchers/helpers.
+            for key in ("ignored_game_processes", "ignored_game_path_markers"):
+                merged[key] = _merge_default_list(gaming.get(key), DEFAULT_GAMING_CONFIG.get(key))
             policy = str(merged.get("release_policy") or "smart").casefold().strip()
             if policy not in {"smart", "always", "never"}:
                 merged["release_policy"] = "smart"

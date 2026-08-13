@@ -239,6 +239,7 @@
     "restore_preload_after_game": true,
     "restore_delay_seconds": 4.0,
     "perception_poll_ms_during_game": 2500,
+    "perception_max_age_seconds": 6.0,
     "game_processes": [
       "fortniteclient-win64-shipping.exe",
       "robloxplayerbeta.exe",
@@ -252,6 +253,38 @@
       "/xboxgames/",
       "\\epic games\\",
       "/epic games/"
+    ],
+    "ignored_game_processes": [
+      "wallpaper32.exe",
+      "wallpaper64.exe",
+      "wallpaper_engine.exe",
+      "steam.exe",
+      "steamwebhelper.exe",
+      "gameoverlayui.exe",
+      "epicgameslauncher.exe",
+      "epicwebhelper.exe",
+      "minecraftlauncher.exe",
+      "riotclientservices.exe",
+      "riotclientux.exe",
+      "riotclientuxrender.exe",
+      "battle.net.exe",
+      "agent.exe",
+      "eadesktop.exe",
+      "ea.exe",
+      "upc.exe",
+      "ubisoftconnect.exe",
+      "rockstar-games-launcher.exe",
+      "socialclubhelper.exe",
+      "galaxyclient.exe",
+      "crashpad_handler.exe",
+      "unitycrashhandler32.exe",
+      "unitycrashhandler64.exe",
+      "werfault.exe",
+      "cefsharp.browsersubprocess.exe"
+    ],
+    "ignored_game_path_markers": [
+      "\\steamapps\\common\\wallpaper_engine\\",
+      "/steamapps/common/wallpaper_engine/"
     ],
     "minecraft_command_markers": ["minecraft", "net.minecraft", "forge", "fabric-loader", "lwjgl"]
   },
