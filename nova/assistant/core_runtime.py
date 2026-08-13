@@ -27,6 +27,8 @@ def install_core_runtime():
     # reiniciar su hilo ni cambiar el valor persistente del usuario.
     from .perception_gaming import install_perception_gaming
     install_perception_gaming()
+    from .gaming_status_sync import install_gaming_status_sync
+    install_gaming_status_sync()
 
     from .expert_resilience import install_expert_resilience
     install_expert_resilience()
@@ -158,7 +160,7 @@ def architecture_status() -> dict:
         "desktop_browser_control", "file_write_safety", "voice_wake",
         "fast_routing", "adaptive_memory_context", "llm_performance_intelligence", "llm_benchmark",
         "llm_warm_manager", "instant_wake", "configurable_hotkeys",
-        "gaming_awareness", "gaming_vram_policy", "gaming_perception_throttle",
+        "gaming_awareness", "gaming_vram_policy", "gaming_perception_throttle", "gaming_state_sync",
         "agent", "tools", "ui", "task_engine",
     ]
     return {
