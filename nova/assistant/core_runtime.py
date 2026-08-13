@@ -6,8 +6,9 @@ Desde v0.6.7 Memory/Workspace/Semantic Memory/Continuity y Nova Doctor son
 módulos nativos administrados por GitHub. En v0.7 Perception Engine, Context
 Intelligence, Workspace Auto-Detection, Anomaly Detection y Event-driven Vision
 se suman como dominios nativos. En v0.8 Skills Engine añade playbooks locales
-declarativos y reutilizables. Agent/Tools/UI/TaskEngine todavía usan la base
-histórica local v0.5, por lo que aquí se instalan únicamente adaptadores por dominio.
+declarativos y Confidence Engine añade evaluación determinista del respaldo de
+cada petición. Agent/Tools/UI/TaskEngine todavía usan la base histórica local v0.5,
+por lo que aquí se instalan únicamente adaptadores por dominio.
 """
 
 _INSTALLED = False
@@ -18,7 +19,8 @@ def install_core_runtime():
     if _INSTALLED:
         return
 
-    # Herramientas por dominio.
+    # Herramientas por dominio. Confidence se instala al final para poder
+    # instrumentar las herramientas ya registradas sin crear evidencia circular.
     from .tools_workspace import install_tools_v060
     from .tools_workspace_index import install_tools_v061
     from .tools_semantic import install_tools_v063
@@ -30,6 +32,7 @@ def install_core_runtime():
     from .tools_anomaly import install_tools_anomaly
     from .tools_vision import install_tools_vision
     from .tools_skills import install_tools_skills
+    from .tools_confidence import install_tools_confidence
     install_tools_v060()
     install_tools_v061()
     install_tools_v063()
@@ -41,9 +44,10 @@ def install_core_runtime():
     install_tools_anomaly()
     install_tools_vision()
     install_tools_skills()
+    install_tools_confidence()
 
-    # Agent: contexto estructurado primero; visión como fallback y Skills al final
-    # para poder reutilizar todo el conjunto de herramientas ya instalado.
+    # Agent: Confidence queda como wrapper externo para observar la petición
+    # completa después de que las demás capas hayan hecho su trabajo.
     from .agent_workspace import install_agent_v060
     from .agent_semantic import install_agent_v063
     from .agent_continuity import install_agent_v065
@@ -52,6 +56,7 @@ def install_core_runtime():
     from .agent_anomaly import install_agent_anomaly
     from .agent_vision import install_agent_vision
     from .agent_skills import install_agent_skills
+    from .agent_confidence import install_agent_confidence
     install_agent_v060()
     install_agent_v063()
     install_agent_v065()
@@ -60,9 +65,10 @@ def install_core_runtime():
     install_agent_anomaly()
     install_agent_vision()
     install_agent_skills()
+    install_agent_confidence()
 
     # UI y hooks del profiler al final. Skills agrega un gestor ligero sin
-    # sustituir la interfaz histórica.
+    # sustituir la interfaz histórica; Confidence no necesita otro hilo/UI.
     from .ui_workspace import install_ui_v060
     from .ui_semantic import install_ui_v063
     from .ui_continuity import install_ui_v065
@@ -105,7 +111,7 @@ def architecture_status() -> dict:
             "memory", "workspace", "workspace_index", "semantic_memory",
             "continuity", "doctor", "profiler", "self_repair", "perception",
             "context_intelligence", "workspace_autodetect", "anomaly_detection",
-            "event_driven_vision", "skills",
+            "event_driven_vision", "skills", "confidence",
         ],
         "compatibility_adapters": ["agent", "tools", "ui", "task_engine"],
         "versioned_runtime_chain": False,

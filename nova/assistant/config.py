@@ -206,6 +206,17 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "generated_skills_start_as_draft": True,
         "auto_execute_matches": False,
     },
+    "confidence": {
+        "enabled": True,
+        "persist_assessments": True,
+        "max_assessments": 1800,
+        "low_threshold": 0.52,
+        "high_threshold": 0.78,
+        "escalation_candidate_threshold": 0.50,
+        "inject_context": True,
+        "surface_low_confidence": True,
+        "minimum_evidence_for_high": 2,
+    },
     "hotkey": "<ctrl>+<alt>+<space>",
     "desktop": {
         "auto_context": True,
