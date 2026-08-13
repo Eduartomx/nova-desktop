@@ -25,7 +25,8 @@ def _claim_instance():
     if not lock.acquire():
         mailbox.send("show")
         return None, mailbox
-    mailbox.clear()
+    # No se borra el buzón aquí: una segunda ejecución puede haber escrito
+    # `show` justo después de adquirir el lock. El buzón descarta mensajes viejos.
     return lock, mailbox
 
 
@@ -37,12 +38,10 @@ def main(argv=None):
     args = _arguments(argv)
     instance_lock, command_mailbox = _claim_instance()
     if instance_lock is None:
-        # La instancia existente recibió la orden local `show`.
         return 0
 
     root = None
     try:
-        # El núcleo pesado solo se instala después de adquirir la instancia.
         from assistant.core_runtime import install_core_runtime
         install_core_runtime()
         from assistant.config import load_config
@@ -59,8 +58,6 @@ def main(argv=None):
         root.mainloop()
         return 0
     finally:
-        # request_shutdown normalmente libera el lock. Este finally cubre error
-        # de arranque, destroy externo o cierre inesperado de mainloop.
         try:
             instance_lock.release()
         except Exception:
