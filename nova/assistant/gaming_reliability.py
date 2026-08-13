@@ -490,17 +490,31 @@ def install_gaming_reliability():
     Manager.add_state_listener = add_state_listener
     Manager.remove_state_listener = remove_state_listener
     Manager._emit_state = _emit_state
+
+    # Alias canónicos usados internamente por esta capa.
+    Manager._identity = _identity
+    Manager._explicit_processes = _explicit_processes
+    Manager._ignored_processes = _ignored_processes
+    Manager._ignored_paths = _ignored_paths
+    Manager._path_markers = _path_markers
+    Manager._is_ignored = _is_ignored
+    Manager._perception_game = _perception_game
+    Manager._tracked_alive = _tracked_alive
+    Manager._cancel_restore = _cancel_restore
+
+    # Alias con prefijo para diagnóstico/compatibilidad futura.
     Manager._gaming_identity = _identity
     Manager._gaming_explicit_processes = _explicit_processes
     Manager._gaming_ignored_processes = _ignored_processes
     Manager._gaming_ignored_paths = _ignored_paths
     Manager._gaming_path_markers = _path_markers
     Manager._gaming_is_ignored = _is_ignored
+    Manager._gaming_tracked_alive = _tracked_alive
+    Manager._gaming_cancel_restore = _cancel_restore
+
     Manager._foreground_game = _perception_game
     Manager._scan_processes = _scan_processes
     Manager.detect_game = detect_game
-    Manager._gaming_tracked_alive = _tracked_alive
-    Manager._gaming_cancel_restore = _cancel_restore
     Manager._schedule_restore = _schedule_restore
     Manager._enter = _enter
     Manager._exit = _exit
