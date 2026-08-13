@@ -24,6 +24,14 @@ class CoreConsolidationTests(unittest.TestCase):
         self.assertNotIn("install_v065", app)
         self.assertNotIn("install_v066", app)
 
+    def test_instance_is_claimed_before_core_runtime_and_background_is_supported(self):
+        app = (Path(__file__).resolve().parents[1] / "nova" / "app.py").read_text(encoding="utf-8")
+        claim = app.index("instance_lock, command_mailbox = _claim_instance()")
+        core = app.index("from assistant.core_runtime import install_core_runtime")
+        self.assertLess(claim, core)
+        self.assertIn('parser.add_argument("--background", action="store_true")', app)
+        self.assertIn('parser.add_argument("--post-update", action="store_true")', app)
+
     def test_memory_features_are_native_without_installers(self):
         with tempfile.TemporaryDirectory() as td:
             store = MemoryStore(Path(td) / "assistant.db")
@@ -39,7 +47,7 @@ class CoreConsolidationTests(unittest.TestCase):
 
     def test_core_files_are_repository_managed(self):
         assistant_dir = Path(__file__).resolve().parents[1] / "nova" / "assistant"
-        for filename in ("agent.py", "tools.py", "ui.py", "task_engine.py"):
+        for filename in ("agent.py", "tools.py", "ui.py", "task_engine.py", "runtime_lifecycle.py", "tray_controller.py"):
             path = assistant_dir / filename
             self.assertTrue(path.is_file(), filename)
             self.assertGreater(path.stat().st_size, 500, filename)
