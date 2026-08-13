@@ -6,9 +6,10 @@ Desde v0.6.7 Memory/Workspace/Semantic Memory/Continuity y Nova Doctor son
 módulos nativos administrados por GitHub. En v0.7 Perception Engine, Context
 Intelligence, Workspace Auto-Detection, Anomaly Detection y Event-driven Vision
 se suman como dominios nativos. En v0.8 Skills Engine añade playbooks locales
-declarativos y Confidence Engine añade evaluación determinista del respaldo de
-cada petición. Agent/Tools/UI/TaskEngine todavía usan la base histórica local v0.5,
-por lo que aquí se instalan únicamente adaptadores por dominio.
+declarativos, Confidence Engine evalúa el respaldo de cada petición y Expert
+Escalation aporta segunda opinión gratuita + ChatGPT Assisted sin API de pago.
+Agent/Tools/UI/TaskEngine todavía usan la base histórica local v0.5, por lo que
+aquí se instalan únicamente adaptadores por dominio.
 """
 
 _INSTALLED = False
@@ -19,8 +20,8 @@ def install_core_runtime():
     if _INSTALLED:
         return
 
-    # Herramientas por dominio. Confidence se instala al final para poder
-    # instrumentar las herramientas ya registradas sin crear evidencia circular.
+    # Herramientas por dominio. Expert se registra antes que Confidence para que
+    # sus herramientas también queden instrumentadas por el motor de confianza.
     from .tools_workspace import install_tools_v060
     from .tools_workspace_index import install_tools_v061
     from .tools_semantic import install_tools_v063
@@ -32,6 +33,7 @@ def install_core_runtime():
     from .tools_anomaly import install_tools_anomaly
     from .tools_vision import install_tools_vision
     from .tools_skills import install_tools_skills
+    from .tools_expert import install_tools_expert
     from .tools_confidence import install_tools_confidence
     install_tools_v060()
     install_tools_v061()
@@ -44,10 +46,11 @@ def install_core_runtime():
     install_tools_anomaly()
     install_tools_vision()
     install_tools_skills()
+    install_tools_expert()
     install_tools_confidence()
 
-    # Agent: Confidence queda como wrapper externo para observar la petición
-    # completa después de que las demás capas hayan hecho su trabajo.
+    # Confidence observa la petición normal completa; Expert queda por fuera para
+    # poder reaccionar al assessment final sin recursión.
     from .agent_workspace import install_agent_v060
     from .agent_semantic import install_agent_v063
     from .agent_continuity import install_agent_v065
@@ -57,6 +60,7 @@ def install_core_runtime():
     from .agent_vision import install_agent_vision
     from .agent_skills import install_agent_skills
     from .agent_confidence import install_agent_confidence
+    from .agent_expert import install_agent_expert
     install_agent_v060()
     install_agent_v063()
     install_agent_v065()
@@ -66,9 +70,9 @@ def install_core_runtime():
     install_agent_vision()
     install_agent_skills()
     install_agent_confidence()
+    install_agent_expert()
 
-    # UI y hooks del profiler al final. Skills agrega un gestor ligero sin
-    # sustituir la interfaz histórica; Confidence no necesita otro hilo/UI.
+    # UI y hooks del profiler al final.
     from .ui_workspace import install_ui_v060
     from .ui_semantic import install_ui_v063
     from .ui_continuity import install_ui_v065
@@ -78,6 +82,7 @@ def install_core_runtime():
     from .ui_anomaly import install_ui_anomaly
     from .ui_vision import install_ui_vision
     from .ui_skills import install_ui_skills
+    from .ui_expert import install_ui_expert
     from .profiler_hooks import install_profiler_v066
     install_ui_v060()
     install_ui_v063()
@@ -88,6 +93,7 @@ def install_core_runtime():
     install_ui_anomaly()
     install_ui_vision()
     install_ui_skills()
+    install_ui_expert()
     install_profiler_v066()
 
     _INSTALLED = True
@@ -111,7 +117,7 @@ def architecture_status() -> dict:
             "memory", "workspace", "workspace_index", "semantic_memory",
             "continuity", "doctor", "profiler", "self_repair", "perception",
             "context_intelligence", "workspace_autodetect", "anomaly_detection",
-            "event_driven_vision", "skills", "confidence",
+            "event_driven_vision", "skills", "confidence", "expert_escalation",
         ],
         "compatibility_adapters": ["agent", "tools", "ui", "task_engine"],
         "versioned_runtime_chain": False,
