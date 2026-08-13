@@ -57,8 +57,14 @@ def _format_warm_status(report: dict[str, Any]) -> str:
     lines = [
         f"LLM Warm Manager · {report.get('model', '?')}",
         f"- Estado: {state}",
-        f"- Keep-alive: {report.get('keep_alive', '?')}",
+        f"- Keep-alive: {report.get('effective_keep_alive', report.get('keep_alive', '?'))}",
     ]
+    if report.get("runtime_keep_alive_reason"):
+        lines.append(f"- Política temporal: {report.get('runtime_keep_alive_reason')}")
+    if report.get("preload_suppressed_by"):
+        lines.append(f"- Precarga suspendida por: {report.get('preload_suppressed_by')}")
+    if report.get("active_inferences"):
+        lines.append(f"- Inferencias activas: {report.get('active_inferences')}")
     if report.get("size_vram_mb"):
         lines.append(f"- VRAM del modelo: {report.get('size_vram_mb')} MB")
     if report.get("last_preload_ms"):
@@ -116,55 +122,63 @@ def install_agent_instant_wake():
         context = monitor.context_metrics(messages, tools)
         gpu_before = monitor.sample_gpu()
         started = time.perf_counter()
+        warm.begin_inference()
         try:
-            response = requests.post(
-                self.ollama_host + "/api/chat",
-                json=payload,
-                timeout=float(timeout if timeout is not None else local_timeout),
-                headers={"User-Agent": "Nova-Agent/0.9.4"},
-            )
-            response.raise_for_status()
-            data = response.json()
-            if not isinstance(data, dict):
-                raise RuntimeError("Ollama devolvió una respuesta no estructurada.")
-        except Exception as exc:
+            try:
+                response = requests.post(
+                    self.ollama_host + "/api/chat",
+                    json=payload,
+                    timeout=float(timeout if timeout is not None else local_timeout),
+                    headers={"User-Agent": "Nova-Agent/0.9.5"},
+                )
+                response.raise_for_status()
+                data = response.json()
+                if not isinstance(data, dict):
+                    raise RuntimeError("Ollama devolvió una respuesta no estructurada.")
+            except Exception as exc:
+                wall_ms = (time.perf_counter() - started) * 1000.0
+                gpu_after = monitor.sample_gpu()
+                self._last_llm_metrics = monitor.record_failure(
+                    model=self.model,
+                    label=performance_label,
+                    wall_ms=wall_ms,
+                    context=context,
+                    gpu_before=gpu_before,
+                    gpu_after=gpu_after,
+                    error_type=type(exc).__name__,
+                )
+                raise
+
             wall_ms = (time.perf_counter() - started) * 1000.0
             gpu_after = monitor.sample_gpu()
-            self._last_llm_metrics = monitor.record_failure(
+            self._last_llm_metrics = monitor.record_success(
                 model=self.model,
                 label=performance_label,
                 wall_ms=wall_ms,
+                response=data,
                 context=context,
                 gpu_before=gpu_before,
                 gpu_after=gpu_after,
-                error_type=type(exc).__name__,
             )
-            raise
-
-        wall_ms = (time.perf_counter() - started) * 1000.0
-        gpu_after = monitor.sample_gpu()
-        self._last_llm_metrics = monitor.record_success(
-            model=self.model,
-            label=performance_label,
-            wall_ms=wall_ms,
-            response=data,
-            context=context,
-            gpu_before=gpu_before,
-            gpu_after=gpu_after,
-        )
-        return data
+            return data
+        finally:
+            warm.end_inference()
 
     def ask(self, user_text):
         action = warm_direct_intent(user_text)
         if action:
             manager = getattr(self, "llm_warm", None) or get_llm_warm_manager(self.config)
             if action == "preload":
-                report = manager.preload()
+                report = manager.preload(reason="user")
                 if report.get("loaded"):
                     return "Qwen quedó precargado.\n\n" + _format_warm_status(report)
+                if report.get("preload_skipped_reason"):
+                    return "La precarga está suspendida temporalmente.\n\n" + _format_warm_status(report)
                 return "No pude precargar Qwen.\n\n" + _format_warm_status(report)
             if action == "unload":
-                report = manager.unload()
+                report = manager.unload(reason="user")
+                if report.get("unload_deferred"):
+                    return "Esperaré a que termine la inferencia actual antes de liberar el modelo.\n\n" + _format_warm_status(report)
                 if not report.get("loaded"):
                     return "Liberé el modelo local de la memoria de Ollama.\n\n" + _format_warm_status(report)
                 return "Intenté liberar el modelo, pero Ollama todavía lo reporta cargado.\n\n" + _format_warm_status(report)
@@ -179,6 +193,7 @@ INSTANT WAKE / LLM WARM MANAGER
 - Nova puede precargar el modelo local con una petición vacía de Ollama; esa precarga no contiene un prompt de usuario.
 - No confundas "modelo cargado" con "GPU libre": informa la VRAM observada cuando esté disponible.
 - Si el usuario pide liberar VRAM, el Warm Manager puede descargar explícitamente el modelo de Ollama.
+- Una política temporal como Gaming Awareness puede reducir keep_alive o suspender precarga; nunca interrumpas una inferencia activa para descargar el modelo.
 """
 
     Agent.__init__ = init

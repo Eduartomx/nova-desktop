@@ -4,9 +4,38 @@ Nova es un asistente virtual local para Windows: Ollama + herramientas reales de
 
 ## Estado actual
 
-**Nova v0.9.4 — Instant Wake & Hotkeys**
+**Nova v0.9.5 — Gaming Awareness**
 
 GitHub es la fuente oficial. Las Releases estables se sincronizan por tag mediante el updater nativo, con verificación de Git blob SHA, backup y rollback. No hacen falta ZIPs de Release.
+
+## Qué cambia en 0.9.5
+
+0.9.5 hace que Instant Wake sea consciente de juegos y de la presión de VRAM:
+
+- `GamingAwarenessManager` combina Perception Engine con procesos conocidos, rutas de bibliotecas Steam/Xbox/Epic y señales de Minecraft Java;
+- usa tiempos de permanencia al entrar/salir para evitar rebotes por alt-tab o procesos breves;
+- la política `smart` libera Qwen cuando el juego está en primer plano o existe presión real de VRAM;
+- antes de liberar el modelo suspende nuevas precargas y aplica temporalmente `keep_alive=0` a las inferencias locales;
+- una inferencia activa nunca se interrumpe para descargar Qwen;
+- si Nova necesita responder mientras juegas, Qwen puede cargarse para esa consulta y volver a liberarse después;
+- al salir del juego, Nova restaura la política normal y puede precargar Qwen otra vez si Gaming Mode fue quien lo descargó;
+- Perception reduce temporalmente su polling de 1100 ms a 2500 ms durante Gaming Mode;
+- el nuevo botón **🎮 Juego** permite modo automático/forzado/desactivado, política `smart/always/never` y decidir si Qwen debe permanecer cargado;
+- Nova Doctor muestra juego detectado, razón de la política de VRAM, VRAM observada/recuperada y frecuencia efectiva de Perception.
+
+Comandos útiles:
+
+```text
+Nova, ¿estás en modo juego?
+Nova, activa modo juego.
+Nova, desactiva modo juego.
+Nova, vuelve a modo juego automático.
+Nova, mantén Qwen cargado aunque esté jugando.
+Nova, libera Qwen cuando juegue.
+Nova, ¿por qué liberaste Qwen?
+```
+
+Gaming Awareness no lee memoria del juego, no inyecta DLLs/código, no captura teclado y no usa screenshots para detectar juegos.
 
 ## Qué cambia en 0.9.4
 
@@ -21,7 +50,7 @@ GitHub es la fuente oficial. Las Releases estables se sincronizan por tag median
 - los antiguos defaults basados en Espacio se migran automáticamente;
 - el botón **⚙ Atajos** permite validar, guardar y aplicar nuevas combinaciones globales sin reiniciar Nova.
 
-La precarga usa `messages: []`: no envía prompts, respuestas ni resultados a servicios externos. Gaming Awareness todavía no actúa automáticamente en 0.9.4, pero el estado cargado/descargado, la descarga voluntaria y la política de keep-alive dejan preparada esa integración.
+La precarga usa `messages: []`: no envía prompts, respuestas ni resultados a servicios externos.
 
 ## Qué cambia en 0.9.3
 
@@ -141,13 +170,13 @@ Las claves solo se leen desde variables de entorno; nunca deben guardarse en Ski
 
 MemoryStore, Workspace Intelligence, Semantic Memory y Continuity son locales. Semantic Memory usa Ollama para embeddings y mantiene búsqueda léxica como fallback. Desde 0.9.2 el contexto automático usa recuperación semántica de forma adaptativa para no pagar el coste de embeddings en preguntas simples.
 
-Desde 0.9.4 la UI puede precargar explícitamente el LLM principal mediante Warm Manager; esta operación es independiente de Semantic Memory y no ejecuta una consulta de usuario.
+Desde 0.9.4 la UI puede precargar explícitamente el LLM principal mediante Warm Manager; esta operación es independiente de Semantic Memory y no ejecuta una consulta de usuario. Desde 0.9.5 Gaming Awareness puede suspender esa precarga temporalmente para priorizar un juego.
 
 ## Privacidad
 
 No deben subirse: `config.json` real, `data/`, bases SQLite, perfil del navegador, screenshots, logs personales, `.venv/`, tokens ni API keys.
 
-Perception no captura teclado/portapapeles/screenshots periódicamente. Event-driven Vision no conserva imágenes por defecto. Confidence, Expert Escalation, Learn from Expert y Skill Reliability guardan metadatos limitados y no el contenido completo que evalúan. LLM Performance Intelligence guarda únicamente métricas técnicas, conteos y muestras puntuales de recursos; nunca persiste el texto del prompt o de la respuesta. Instant Wake usa una petición local con `messages: []` y no transmite contenido a servicios externos.
+Perception no captura teclado/portapapeles/screenshots periódicamente. Event-driven Vision no conserva imágenes por defecto. Confidence, Expert Escalation, Learn from Expert y Skill Reliability guardan metadatos limitados y no el contenido completo que evalúan. LLM Performance Intelligence guarda únicamente métricas técnicas, conteos y muestras puntuales de recursos; nunca persiste el texto del prompt o de la respuesta. Instant Wake usa una petición local con `messages: []` y no transmite contenido a servicios externos. Gaming Awareness solo usa metadatos de ventana/proceso, rutas de ejecutables y telemetría local de GPU; no inspecciona memoria del juego ni inyecta código.
 
 ## Estructura 0.9
 
@@ -156,14 +185,19 @@ nova/assistant/
 ├─ agent.py                 # core GitHub-managed + instrumentación Ollama
 ├─ agent_fast_routing.py    # rutas deterministas de baja latencia
 ├─ agent_instant_wake.py    # keep_alive + comandos Warm Manager
+├─ agent_gaming.py          # comandos y contexto de Gaming Awareness
 ├─ llm_performance.py       # métricas locales detalladas de inferencia
 ├─ llm_benchmark.py         # benchmark explícito y acotado
-├─ llm_warm.py              # precarga/descarga/estado de Ollama
+├─ llm_warm.py              # precarga/descarga/estado/política runtime de Ollama
+├─ gaming_awareness.py      # detección de juegos + política de VRAM
+├─ perception_gaming.py     # throttle temporal de Perception
 ├─ hotkeys.py               # normalización y validación de atajos
 ├─ config_instant_wake.py   # defaults/migración 0.9.4
+├─ config_gaming.py         # defaults/migración 0.9.5
 ├─ tools.py                 # core GitHub-managed
 ├─ ui.py                    # core GitHub-managed
 ├─ ui_instant_wake.py       # estado LLM + editor de hotkeys
+├─ ui_gaming.py             # estado/ajustes de Gaming Awareness
 ├─ task_engine.py           # core GitHub-managed
 ├─ core_runtime.py          # bootstrap único
 ├─ tools_desktop.py         # Browser Agent + UIA/input administrados

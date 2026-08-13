@@ -5,6 +5,10 @@ from __future__ import annotations
 La precarga usa una petición vacía a ``/api/chat`` de Ollama. No envía prompts,
 no genera contenido y no usa servicios externos. El mismo ``keep_alive`` se
 aplica a las inferencias normales para evitar cold starts innecesarios.
+
+Desde 0.9.5 el manager acepta overrides de ejecución para Gaming Awareness: se
+puede suspender la precarga, reducir temporalmente keep_alive y diferir una
+descarga mientras exista una inferencia activa.
 """
 
 import threading
@@ -42,12 +46,17 @@ class LLMWarmManager:
         self._lock = threading.RLock()
         self._thread: threading.Thread | None = None
         self._warming = False
+        self._active_inferences = 0
+        self._runtime_keep_alive_override: str | int | float | None = None
+        self._runtime_keep_alive_reason = ""
+        self._preload_suppressed_by = ""
         self._last_preload_at = ""
         self._last_preload_ms = 0.0
         self._last_error = ""
         self._last_loaded: bool | None = None
         self._last_size_vram_mb = 0.0
         self._last_expires_at = ""
+        self._last_unload_reason = ""
         self.update_config(config or {})
 
     def update_config(self, config: dict[str, Any] | None = None) -> None:
@@ -83,9 +92,48 @@ class LLMWarmManager:
         text = str(value or "20m").strip()
         return text or "20m"
 
+    @property
+    def effective_keep_alive(self) -> str | int | float:
+        with self._lock:
+            if self._runtime_keep_alive_override is not None:
+                return self._runtime_keep_alive_override
+        return self.keep_alive
+
+    def set_runtime_keep_alive_override(self, value: str | int | float, reason: str = "runtime") -> None:
+        if not isinstance(value, (str, int, float)):
+            raise TypeError("keep_alive runtime debe ser str, int o float")
+        with self._lock:
+            self._runtime_keep_alive_override = value
+            self._runtime_keep_alive_reason = str(reason or "runtime")[:120]
+
+    def clear_runtime_keep_alive_override(self, reason: str | None = None) -> None:
+        with self._lock:
+            if reason and self._runtime_keep_alive_reason and self._runtime_keep_alive_reason != str(reason):
+                return
+            self._runtime_keep_alive_override = None
+            self._runtime_keep_alive_reason = ""
+
+    def suppress_preload(self, reason: str = "runtime") -> None:
+        with self._lock:
+            self._preload_suppressed_by = str(reason or "runtime")[:120]
+
+    def clear_preload_suppression(self, reason: str | None = None) -> None:
+        with self._lock:
+            if reason and self._preload_suppressed_by and self._preload_suppressed_by != str(reason):
+                return
+            self._preload_suppressed_by = ""
+
+    def begin_inference(self) -> None:
+        with self._lock:
+            self._active_inferences += 1
+
+    def end_inference(self) -> None:
+        with self._lock:
+            self._active_inferences = max(0, self._active_inferences - 1)
+
     def apply_keep_alive(self, payload: dict[str, Any]) -> dict[str, Any]:
         if self.enabled:
-            payload["keep_alive"] = self.keep_alive
+            payload["keep_alive"] = self.effective_keep_alive
         return payload
 
     def _model_matches(self, candidate: Any) -> bool:
@@ -106,13 +154,18 @@ class LLMWarmManager:
                 "enabled": self.enabled,
                 "preload_on_start": self.preload_on_start,
                 "warming": self._warming,
+                "active_inferences": self._active_inferences,
                 "model": self.model,
                 "keep_alive": self.keep_alive,
+                "effective_keep_alive": self.effective_keep_alive,
+                "runtime_keep_alive_reason": self._runtime_keep_alive_reason,
+                "preload_suppressed_by": self._preload_suppressed_by,
                 "loaded": self._last_loaded,
                 "size_vram_mb": self._last_size_vram_mb,
                 "expires_at": self._last_expires_at,
                 "last_preload_at": self._last_preload_at,
                 "last_preload_ms": self._last_preload_ms,
+                "last_unload_reason": self._last_unload_reason,
                 "last_error": self._last_error,
             }
 
@@ -123,7 +176,7 @@ class LLMWarmManager:
             response = requests.get(
                 self.ollama_host + "/api/ps",
                 timeout=float(self.warm_config.get("status_timeout_seconds", 2.5) or 2.5),
-                headers={"User-Agent": "Nova-Warm/0.9.4"},
+                headers={"User-Agent": "Nova-Warm/0.9.5"},
             )
             response.raise_for_status()
             data = response.json()
@@ -149,11 +202,15 @@ class LLMWarmManager:
             })
             return status
 
-    def preload(self) -> dict[str, Any]:
+    def preload(self, reason: str = "manual") -> dict[str, Any]:
         if not self.enabled:
             return self.cached_status()
 
         with self._lock:
+            if self._preload_suppressed_by:
+                report = self.cached_status()
+                report["preload_skipped_reason"] = self._preload_suppressed_by
+                return report
             self._warming = True
             self._last_error = ""
         started = time.perf_counter()
@@ -162,14 +219,14 @@ class LLMWarmManager:
                 "model": self.model,
                 "messages": [],
                 "stream": False,
-                "keep_alive": self.keep_alive,
+                "keep_alive": self.effective_keep_alive,
                 "options": {"num_ctx": self.context_tokens},
             }
             response = requests.post(
                 self.ollama_host + "/api/chat",
                 json=payload,
                 timeout=float(self.warm_config.get("request_timeout_seconds", 30.0) or 30.0),
-                headers={"User-Agent": "Nova-Warm/0.9.4"},
+                headers={"User-Agent": "Nova-Warm/0.9.5"},
             )
             response.raise_for_status()
             data = response.json()
@@ -181,6 +238,8 @@ class LLMWarmManager:
                 self._last_preload_ms = round(elapsed_ms, 2)
                 self._last_loaded = True
                 self._last_error = ""
+                if str(reason or "") != "gaming_restore":
+                    self._last_unload_reason = ""
             report = self.status(refresh=True)
             if report.get("reachable") is False:
                 report["ok"] = True
@@ -196,15 +255,21 @@ class LLMWarmManager:
             with self._lock:
                 self._warming = False
 
-    def unload(self, timeout: float | None = None) -> dict[str, Any]:
+    def unload(self, timeout: float | None = None, reason: str = "manual", force: bool = False) -> dict[str, Any]:
         if not self.enabled:
             return self.cached_status()
+        with self._lock:
+            if not force and (self._warming or self._active_inferences > 0):
+                report = self.cached_status()
+                report["unload_deferred"] = True
+                report["unload_deferred_reason"] = "warming" if self._warming else "active_inference"
+                return report
         try:
             response = requests.post(
                 self.ollama_host + "/api/chat",
                 json={"model": self.model, "messages": [], "stream": False, "keep_alive": 0},
                 timeout=float(timeout if timeout is not None else self.warm_config.get("status_timeout_seconds", 2.5) or 2.5),
-                headers={"User-Agent": "Nova-Warm/0.9.4"},
+                headers={"User-Agent": "Nova-Warm/0.9.5"},
             )
             response.raise_for_status()
             with self._lock:
@@ -212,13 +277,18 @@ class LLMWarmManager:
                 self._last_size_vram_mb = 0.0
                 self._last_expires_at = ""
                 self._last_error = ""
+                self._last_unload_reason = str(reason or "manual")[:120]
             return self.cached_status()
         except Exception as exc:
             with self._lock:
                 self._last_error = f"{type(exc).__name__}: {exc}"
             return self.cached_status()
 
-    def start_background(self, callback: Callable[[dict[str, Any]], None] | None = None) -> threading.Thread | None:
+    def start_background(
+        self,
+        callback: Callable[[dict[str, Any]], None] | None = None,
+        reason: str = "startup",
+    ) -> threading.Thread | None:
         if not self.preload_on_start:
             return None
         with self._lock:
@@ -230,7 +300,7 @@ class LLMWarmManager:
             def worker():
                 if delay:
                     time.sleep(delay)
-                report = self.preload()
+                report = self.preload(reason=reason)
                 if callback is not None:
                     try:
                         callback(report)
