@@ -134,7 +134,7 @@ def architecture_status() -> dict:
         "event_driven_vision", "skills", "confidence", "expert_escalation",
         "expert_resilience", "learn_from_expert", "experience_reliability",
         "desktop_browser_control", "file_write_safety", "voice_wake",
-        "fast_routing", "adaptive_memory_context",
+        "fast_routing", "adaptive_memory_context", "llm_performance_intelligence", "llm_benchmark",
         "agent", "tools", "ui", "task_engine",
     ]
     return {
