@@ -224,6 +224,37 @@
     "status_timeout_seconds": 2.5,
     "unload_on_exit": true
   },
+  "gaming_awareness": {
+    "enabled": true,
+    "auto_detect": true,
+    "poll_seconds": 2.0,
+    "enter_dwell_seconds": 2.5,
+    "exit_dwell_seconds": 7.0,
+    "release_policy": "smart",
+    "auto_release_llm": true,
+    "keep_llm_loaded_during_game": false,
+    "llm_keep_alive_during_game": 0,
+    "vram_release_percent": 65.0,
+    "vram_min_free_mb": 2600.0,
+    "restore_preload_after_game": true,
+    "restore_delay_seconds": 4.0,
+    "perception_poll_ms_during_game": 2500,
+    "game_processes": [
+      "fortniteclient-win64-shipping.exe",
+      "robloxplayerbeta.exe",
+      "vrchat.exe",
+      "minecraft.windows.exe"
+    ],
+    "game_path_markers": [
+      "\\steamapps\\common\\",
+      "/steamapps/common/",
+      "\\xboxgames\\",
+      "/xboxgames/",
+      "\\epic games\\",
+      "/epic games/"
+    ],
+    "minecraft_command_markers": ["minecraft", "net.minecraft", "forge", "fabric-loader", "lwjgl"]
+  },
   "hotkey": "<ctrl>+<alt>+n",
   "desktop": {
     "auto_context": true,
