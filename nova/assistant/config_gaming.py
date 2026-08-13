@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""Defaults y migración de configuración para Nova 0.9.5."""
+"""Defaults y migración de configuración para Gaming Awareness."""
 
 from copy import deepcopy
 
@@ -8,6 +8,11 @@ from .gaming_awareness import DEFAULT_GAMING_CONFIG
 
 
 def install_config_gaming():
+    # Los filtros amplían DEFAULT_GAMING_CONFIG con exclusiones de utilidades
+    # antes de que la configuración persistente haga su migración.
+    from .gaming_detection_filters import install_gaming_detection_filters
+    install_gaming_detection_filters()
+
     from . import config as mod
 
     if getattr(mod, "_nova_gaming_awareness_patched", False):
