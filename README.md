@@ -4,9 +4,31 @@ Nova es un asistente virtual local para Windows: Ollama + herramientas reales de
 
 ## Estado actual
 
-**Nova v0.9.2 — Fast Routing & Latency Fix**
+**Nova v0.9.3 — LLM Performance Intelligence**
 
 GitHub es la fuente oficial. Las Releases estables se sincronizan por tag mediante el updater nativo, con verificación de Git blob SHA, backup y rollback. No hacen falta ZIPs de Release.
+
+## Qué cambia en 0.9.3
+
+0.9.3 convierte la latencia de Ollama en un problema medible en vez de una única cifra agregada:
+
+- cada llamada local a `/api/chat` captura las métricas que Ollama ya devuelve: `total_duration`, `load_duration`, `prompt_eval_count`, `prompt_eval_duration`, `eval_count` y `eval_duration`;
+- Nova calcula velocidad de evaluación/generación, tokens de entrada/salida, tamaño estructural del contexto, cantidad de mensajes y cantidad de tools expuestas;
+- en NVIDIA puede tomar una muestra puntual de GPU/VRAM antes y después de la inferencia mediante `nvidia-smi`; no existe polling agresivo de GPU por esta función;
+- `data/llm_performance.db` persiste únicamente métricas técnicas. No guarda prompts, respuestas, argumentos de herramientas ni secretos;
+- Performance Profiler añade `session_id`, por lo que Nova Doctor separa **sesión actual**, **15 min**, **1 h** y **24 h** en vez de mezclar una versión recién actualizada con eventos históricos;
+- Nova clasifica causas probables como cold start, prompt/contexto pesado, generación lenta, presión de VRAM, demasiadas tools o una proporción elevada de timeouts;
+- `Nova, prueba tu rendimiento` ejecuta un benchmark local explícito y acotado con tres casos: respuesta corta, razonamiento breve y selección con tools;
+- el benchmark nunca se ejecuta automáticamente, no llama a proveedores externos y limita la generación con `num_predict`.
+
+Comandos útiles:
+
+```text
+Nova, prueba tu rendimiento.
+Nova, ¿por qué Ollama tarda tanto?
+Nova, rendimiento de Qwen de esta sesión.
+Nova, muestra tu rendimiento de los últimos 15 minutos.
+```
 
 ## Qué cambia en 0.9.2
 
@@ -110,14 +132,16 @@ La UI 0.9 evita comprobar activamente Ollama durante el arranque solo para mostr
 
 No deben subirse: `config.json` real, `data/`, bases SQLite, perfil del navegador, screenshots, logs personales, `.venv/`, tokens ni API keys.
 
-Perception no captura teclado/portapapeles/screenshots periódicamente. Event-driven Vision no conserva imágenes por defecto. Confidence, Expert Escalation, Learn from Expert y Skill Reliability guardan metadatos limitados y no el contenido completo que evalúan.
+Perception no captura teclado/portapapeles/screenshots periódicamente. Event-driven Vision no conserva imágenes por defecto. Confidence, Expert Escalation, Learn from Expert y Skill Reliability guardan metadatos limitados y no el contenido completo que evalúan. LLM Performance Intelligence guarda únicamente métricas técnicas, conteos y muestras puntuales de recursos; nunca persiste el texto del prompt o de la respuesta.
 
 ## Estructura 0.9
 
 ```text
 nova/assistant/
-├─ agent.py                 # core GitHub-managed
+├─ agent.py                 # core GitHub-managed + instrumentación Ollama
 ├─ agent_fast_routing.py    # rutas deterministas de baja latencia
+├─ llm_performance.py       # métricas locales detalladas de inferencia
+├─ llm_benchmark.py         # benchmark explícito y acotado
 ├─ tools.py                 # core GitHub-managed
 ├─ ui.py                    # core GitHub-managed
 ├─ task_engine.py           # core GitHub-managed

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from .llm_performance import get_llm_performance
 from .profiler import get_profiler
 from .self_repair import SelfRepairManager
 
@@ -25,12 +26,23 @@ def schemas_v066() -> list[dict[str, Any]]:
         fn(
             "performance_summary",
             "Resume el rendimiento local de Nova sin enviar telemetría fuera del PC.",
-            {"hours": {"type": "number", "minimum": 0.1, "maximum": 720}},
+            {
+                "hours": {"type": "number", "minimum": 0.1, "maximum": 720},
+                "session_only": {"type": "boolean"},
+            },
         ),
         fn(
             "performance_recent",
             "Lista las operaciones recientes medidas por el profiler local de Nova.",
             {"limit": {"type": "integer", "minimum": 1, "maximum": 100}},
+        ),
+        fn(
+            "llm_performance_summary",
+            "Resume métricas locales de Ollama: carga, prompt eval, generación, tokens/s y presión puntual de GPU/VRAM. No contiene prompts ni respuestas.",
+            {
+                "hours": {"type": "number", "minimum": 0.1, "maximum": 720},
+                "session_only": {"type": "boolean"},
+            },
         ),
         fn(
             "doctor_repairs",
@@ -49,14 +61,19 @@ def install_tools_v066():
 
     LocalTools = mod.LocalTools
     if not getattr(LocalTools, "_nova_v066_patched", False):
-        def performance_summary(self, hours=24):
+        def performance_summary(self, hours=24, session_only=False):
             profiler = get_profiler(self.config)
-            report = profiler.summary(float(hours or 24))
+            report = profiler.summary(float(hours or 24), session_only=bool(session_only))
             return {"ok": True, "report": report, "text": profiler.format_summary(report)}
 
         def performance_recent(self, limit=20):
             profiler = get_profiler(self.config)
             return {"ok": True, "events": profiler.recent(int(limit or 20))}
+
+        def llm_performance_summary(self, hours=24, session_only=False):
+            monitor = get_llm_performance(self.config)
+            report = monitor.summary(float(hours or 24), session_only=bool(session_only))
+            return {"ok": True, "report": report, "text": monitor.format_summary(report)}
 
         def doctor_repairs(self):
             from .doctor import NovaDoctor
@@ -67,16 +84,18 @@ def install_tools_v066():
 
         LocalTools.performance_summary = performance_summary
         LocalTools.performance_recent = performance_recent
+        LocalTools.llm_performance_summary = llm_performance_summary
         LocalTools.doctor_repairs = doctor_repairs
         LocalTools._nova_v066_patched = True
 
     original_selector = mod.select_tool_schemas
     if not getattr(original_selector, "_nova_v066", False):
         by_name = {x["function"]["name"]: x for x in mod.TOOL_SCHEMAS}
-        names = {"performance_summary", "performance_recent", "doctor_repairs"}
+        names = {"performance_summary", "performance_recent", "llm_performance_summary", "doctor_repairs"}
         cues = (
             "rendimiento", "performance", "profiler", "perfil de rendimiento",
             "lento", "lentitud", "cuello de botella", "cuellos de botella",
+            "ollama", "qwen", "llm", "tokens por segundo", "tok/s", "cold start",
             "doctor", "reparar nova", "que puedes reparar", "qué puedes reparar",
         )
 

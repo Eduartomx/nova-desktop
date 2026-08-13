@@ -9,12 +9,14 @@ la migración 0.9.x.
 
 import json
 import re
+import time
 from pathlib import Path
 from typing import Any
 
 import requests
 
 from .memory import MemoryStore
+from .llm_performance import get_llm_performance
 from . import tools as tools_mod
 
 LocalTools = tools_mod.LocalTools
@@ -36,8 +38,10 @@ class LocalAgent:
         self.tools = tools or LocalTools(self.config, self.memory)
         self.model = str(self.config.get("model") or "qwen3.5:4b")
         self.ollama_host = str(self.config.get("ollama_host") or "http://127.0.0.1:11434").rstrip("/")
+        self.llm_performance = get_llm_performance(self.config)
         self._last_tool_trace: list[dict[str, Any]] = []
         self._last_response = ""
+        self._last_llm_metrics: dict[str, Any] = {}
 
     def _system_prompt(self) -> str:
         name = str(self.config.get("assistant_name") or "Nova")
@@ -65,27 +69,65 @@ Sé breve y práctico salvo que el usuario pida detalle.
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
         timeout: float | None = None,
+        options_override: dict[str, Any] | None = None,
+        performance_label: str = "",
     ) -> dict[str, Any]:
+        options: dict[str, Any] = {"num_ctx": int(self.config.get("context_tokens", 8192))}
+        if isinstance(options_override, dict):
+            for key, value in options_override.items():
+                if isinstance(value, (str, int, float, bool)) or value is None:
+                    options[str(key)] = value
         payload: dict[str, Any] = {
             "model": self.model,
             "messages": messages,
             "stream": False,
-            "options": {"num_ctx": int(self.config.get("context_tokens", 8192))},
+            "options": options,
         }
         if tools:
             payload["tools"] = tools
         local_cfg = self.config.get("local_llm", {}) if isinstance(self.config, dict) else {}
         local_timeout = float(local_cfg.get("timeout_seconds", 45) or 45)
-        response = requests.post(
-            self.ollama_host + "/api/chat",
-            json=payload,
-            timeout=float(timeout if timeout is not None else local_timeout),
-            headers={"User-Agent": "Nova-Agent/0.9.2"},
+
+        monitor = getattr(self, "llm_performance", None) or get_llm_performance(self.config)
+        context = monitor.context_metrics(messages, tools)
+        gpu_before = monitor.sample_gpu()
+        started = time.perf_counter()
+        try:
+            response = requests.post(
+                self.ollama_host + "/api/chat",
+                json=payload,
+                timeout=float(timeout if timeout is not None else local_timeout),
+                headers={"User-Agent": "Nova-Agent/0.9.3"},
+            )
+            response.raise_for_status()
+            data = response.json()
+            if not isinstance(data, dict):
+                raise RuntimeError("Ollama devolvió una respuesta no estructurada.")
+        except Exception as exc:
+            wall_ms = (time.perf_counter() - started) * 1000.0
+            gpu_after = monitor.sample_gpu()
+            self._last_llm_metrics = monitor.record_failure(
+                model=self.model,
+                label=performance_label,
+                wall_ms=wall_ms,
+                context=context,
+                gpu_before=gpu_before,
+                gpu_after=gpu_after,
+                error_type=type(exc).__name__,
+            )
+            raise
+
+        wall_ms = (time.perf_counter() - started) * 1000.0
+        gpu_after = monitor.sample_gpu()
+        self._last_llm_metrics = monitor.record_success(
+            model=self.model,
+            label=performance_label,
+            wall_ms=wall_ms,
+            response=data,
+            context=context,
+            gpu_before=gpu_before,
+            gpu_after=gpu_after,
         )
-        response.raise_for_status()
-        data = response.json()
-        if not isinstance(data, dict):
-            raise RuntimeError("Ollama devolvió una respuesta no estructurada.")
         return data
 
     _chat = _ollama_chat

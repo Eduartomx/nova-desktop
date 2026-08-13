@@ -98,6 +98,11 @@ def _known_deterministic_route(text: str) -> bool:
         checks.append(perception_direct_intent(text) is not None)
     except Exception:
         pass
+    try:
+        from .agent_diagnostics import performance_direct_intent
+        checks.append(performance_direct_intent(text) is not None)
+    except Exception:
+        pass
     return any(checks)
 
 
