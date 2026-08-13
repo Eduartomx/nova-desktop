@@ -10,14 +10,18 @@ from assistant.expert_resilience import (
     install_expert_resilience,
     normalize_expert_config,
 )
-
-install_expert_resilience()
-
 from assistant.core_runtime import architecture_status
 from assistant.expert_escalation import ExpertEscalation
 
 
 class ExpertResilienceTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        # unittest discovery importa todos los módulos antes de ejecutarlos. Aplicar
+        # el parche aquí evita alterar las pruebas de compatibilidad de v0.8.2 que
+        # se ejecutan antes de este módulo.
+        install_expert_resilience()
+
     @staticmethod
     def assessment():
         return {
