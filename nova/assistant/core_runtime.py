@@ -5,9 +5,9 @@ from __future__ import annotations
 Desde v0.6.7 Memory/Workspace/Semantic Memory/Continuity y Nova Doctor son
 módulos nativos administrados por GitHub. En v0.7 Perception Engine, Context
 Intelligence, Workspace Auto-Detection, Anomaly Detection y Event-driven Vision
-se suman como dominios nativos. En v0.8 Skills Engine añade playbooks locales
-declarativos, Confidence Engine evalúa el respaldo de cada petición y Expert
-Escalation aporta segunda opinión gratuita + ChatGPT Assisted sin API de pago.
+se suman como dominios nativos. En v0.8 Skills Engine añade playbooks locales,
+Confidence Engine evalúa respaldo, Expert Escalation aporta segunda opinión y
+Learn from Expert convierte soluciones verificadas en conocimiento reutilizable.
 Agent/Tools/UI/TaskEngine todavía usan la base histórica local v0.5, por lo que
 aquí se instalan únicamente adaptadores por dominio.
 """
@@ -25,8 +25,8 @@ def install_core_runtime():
     from .expert_resilience import install_expert_resilience
     install_expert_resilience()
 
-    # Herramientas por dominio. Expert se registra antes que Confidence para que
-    # sus herramientas también queden instrumentadas por el motor de confianza.
+    # Herramientas por dominio. Learning se registra antes de Confidence para que
+    # sus llamadas también queden observables por la instrumentación normal.
     from .tools_workspace import install_tools_v060
     from .tools_workspace_index import install_tools_v061
     from .tools_semantic import install_tools_v063
@@ -39,6 +39,7 @@ def install_core_runtime():
     from .tools_vision import install_tools_vision
     from .tools_skills import install_tools_skills
     from .tools_expert import install_tools_expert
+    from .tools_learning import install_tools_learning
     from .tools_confidence import install_tools_confidence
     install_tools_v060()
     install_tools_v061()
@@ -52,10 +53,11 @@ def install_core_runtime():
     install_tools_vision()
     install_tools_skills()
     install_tools_expert()
+    install_tools_learning()
     install_tools_confidence()
 
-    # Confidence observa la petición normal completa; Expert queda por fuera para
-    # poder reaccionar al assessment final sin recursión.
+    # Confidence observa la petición normal completa; Expert reacciona al
+    # assessment y Learning queda por fuera para capturar la opinión resultante.
     from .agent_workspace import install_agent_v060
     from .agent_semantic import install_agent_v063
     from .agent_continuity import install_agent_v065
@@ -66,6 +68,7 @@ def install_core_runtime():
     from .agent_skills import install_agent_skills
     from .agent_confidence import install_agent_confidence
     from .agent_expert import install_agent_expert
+    from .agent_learning import install_agent_learning
     install_agent_v060()
     install_agent_v063()
     install_agent_v065()
@@ -76,6 +79,7 @@ def install_core_runtime():
     install_agent_skills()
     install_agent_confidence()
     install_agent_expert()
+    install_agent_learning()
 
     # UI y hooks del profiler al final.
     from .ui_workspace import install_ui_v060
@@ -123,7 +127,7 @@ def architecture_status() -> dict:
             "continuity", "doctor", "profiler", "self_repair", "perception",
             "context_intelligence", "workspace_autodetect", "anomaly_detection",
             "event_driven_vision", "skills", "confidence", "expert_escalation",
-            "expert_resilience",
+            "expert_resilience", "learn_from_expert",
         ],
         "compatibility_adapters": ["agent", "tools", "ui", "task_engine"],
         "versioned_runtime_chain": False,
