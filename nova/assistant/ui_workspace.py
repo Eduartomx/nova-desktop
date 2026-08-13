@@ -38,7 +38,7 @@ def install_ui_v060():
     def init(self, *a, **kw):
         self.workspace_window = None; self.workspace_listbox = None; self.workspace_rows = []
         original_init(self, *a, **kw)
-        self.root.title(f'{self.name} · Asistente local v0.6.2')
+        self.root.title(f'{self.name} · Asistente local')
         self.root.after(280, self._refresh_workspace_label)
         self.root.after(900, self._consume_update_status)
 
@@ -52,13 +52,18 @@ def install_ui_v060():
             before = str(data.get('before') or '?')
             after = str(data.get('after') or '?')
             log = str(data.get('log') or '')
+            tray = getattr(self, 'tray_controller', None)
             if data.get('ok'):
                 self._append('system', f'Actualización completada: Nova {before} → {after}.')
                 self.status_var.set(f'Nova {after} · actualización correcta')
+                if tray is not None:
+                    tray.notify('update_finished', 'Nova actualizada', f'Actualización a Nova {after} completada.')
             else:
                 error = str(data.get('error') or 'Error desconocido')
                 self._append('system', f'La actualización no se pudo completar. Nova se reinició sin quedar cerrada.\n{error}\nLog: {log}')
                 self.status_var.set('La actualización falló; Nova fue restaurada/reiniciada')
+                if tray is not None:
+                    tray.notify('update_error', 'Nova necesita atención', 'La actualización no pudo completarse. Abre Nova para revisarla.')
                 messagebox.showwarning('Nova · Actualización', f'La actualización no se completó.\n\n{error}\n\nLog:\n{log}', parent=self.root)
         except Exception:
             pass
@@ -142,7 +147,7 @@ def install_ui_v060():
                 creationflags=getattr(subprocess, 'CREATE_NEW_CONSOLE', 0),
             )
             self.status_var.set('Actualizando desde GitHub… Nova se cerrará y volverá a abrirse automáticamente.')
-            self.root.after(250, self._close)
+            self.request_shutdown('update')
         except Exception as exc:
             messagebox.showerror('Nova · Actualizador', str(exc), parent=self.root)
 
