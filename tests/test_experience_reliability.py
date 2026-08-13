@@ -39,7 +39,7 @@ class ExperienceReliabilityTests(unittest.TestCase):
         )
 
     @staticmethod
-    def run(registry, skill, success, summary=""):
+    def execute_skill(registry, skill, success, summary=""):
         compiled = registry.compile(skill)
         run_id = registry.start_run(compiled)
         registry.finish_run(run_id, success, summary)
@@ -49,8 +49,8 @@ class ExperienceReliabilityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             registry, engine = self.make_pair(td, consecutive_failures_review=2)
             skill = self.save_skill(registry, trust="verified")
-            self.run(registry, skill, False)
-            self.run(registry, skill, False)
+            self.execute_skill(registry, skill, False)
+            self.execute_skill(registry, skill, False)
             state = engine.report(skill["id"])
             self.assertEqual(state["band"], "degraded")
             self.assertTrue(state["needs_review"])
@@ -64,7 +64,7 @@ class ExperienceReliabilityTests(unittest.TestCase):
             registry, engine = self.make_pair(td, minimum_runs=3, stable_threshold=0.78)
             skill = self.save_skill(registry, trust="draft")
             for _ in range(3):
-                self.run(registry, skill, True)
+                self.execute_skill(registry, skill, True)
             state = engine.report(skill["id"])
             self.assertEqual(state["band"], "stable")
             self.assertGreaterEqual(state["score"], 0.78)
@@ -75,7 +75,7 @@ class ExperienceReliabilityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             registry, engine = self.make_pair(td)
             skill = self.save_skill(registry, name="Skill versionada", trust="verified")
-            self.run(registry, skill, False)
+            self.execute_skill(registry, skill, False)
             updated = registry.save(
                 name="Skill versionada",
                 description="Procedimiento corregido",
@@ -97,7 +97,7 @@ class ExperienceReliabilityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             registry, engine = self.make_pair(td, stale_days=1)
             skill = self.save_skill(registry, name="Skill antigua", trust="verified")
-            run_id = self.run(registry, skill, True)
+            run_id = self.execute_skill(registry, skill, True)
             old = time.time() - (3 * 86400)
             with engine._connect() as conn:
                 conn.execute(
@@ -127,7 +127,7 @@ class ExperienceReliabilityTests(unittest.TestCase):
                 source="user",
                 trust_level="draft",
             )
-            self.run(registry, skill, True, unique_output)
+            self.execute_skill(registry, skill, True, unique_output)
             raw = Path(td, "reliability.db").read_bytes()
             self.assertNotIn(unique_instruction.encode(), raw)
             self.assertNotIn(unique_output.encode(), raw)
