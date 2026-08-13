@@ -52,6 +52,13 @@ class InstanceLock:
         self.acquired = True
         return True
 
+    def status(self) -> dict:
+        return {
+            "acquired": bool(self.acquired),
+            "ownership": "windows_kernel_file_lock",
+            "scope": "current_user_session",
+        }
+
     def release(self) -> None:
         if not self.acquired or self._file is None:
             return
