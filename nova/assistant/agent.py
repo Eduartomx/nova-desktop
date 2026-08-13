@@ -15,7 +15,9 @@ from typing import Any
 import requests
 
 from .memory import MemoryStore
-from .tools import LocalTools, select_tool_schemas
+from . import tools as tools_mod
+
+LocalTools = tools_mod.LocalTools
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = PROJECT_ROOT / "data"
@@ -84,7 +86,6 @@ Sé breve y práctico salvo que el usuario pida detalle.
             raise RuntimeError("Ollama devolvió una respuesta no estructurada.")
         return data
 
-    # Alias mantenidos para profiler/compatibilidad histórica.
     _chat = _ollama_chat
     _call_model = _ollama_chat
 
@@ -150,13 +151,15 @@ Sé breve y práctico salvo que el usuario pida detalle.
 
         messages: list[dict[str, Any]] = [{"role": "system", "content": self._system_prompt()}]
         history = self._history_messages()
-        # `add_message` ya agregó el turno actual; evitamos duplicarlo si es el último.
         if history and history[-1].get("role") == "user" and history[-1].get("content") == text:
             history = history[:-1]
         messages.extend(history)
         messages.append({"role": "user", "content": text})
 
-        schemas = select_tool_schemas(text)
+        # IMPORTANTE: se resuelve desde el módulo en cada petición. Los dominios
+        # (Skills, Expert, Perception, etc.) reemplazan/componen este selector al
+        # instalar core_runtime; una referencia importada tempranamente quedaría obsoleta.
+        schemas = tools_mod.select_tool_schemas(text)
         max_steps = max(1, min(int(self.config.get("max_agent_steps", 10) or 10), 20))
         final_text = ""
         try:
@@ -170,8 +173,7 @@ Sé breve y práctico salvo que el usuario pida detalle.
                     final_text = content or "Terminé, pero el modelo local no devolvió texto."
                     break
 
-                assistant_message: dict[str, Any] = {"role": "assistant", "content": content}
-                assistant_message["tool_calls"] = calls
+                assistant_message: dict[str, Any] = {"role": "assistant", "content": content, "tool_calls": calls}
                 messages.append(assistant_message)
 
                 for call in calls:
