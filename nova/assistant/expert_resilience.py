@@ -223,7 +223,6 @@ def install_expert_resilience():
             conn.commit()
         return provider_health(self, provider)
 
-    @staticmethod
     def post_json(endpoint: str, headers: dict[str, str], payload: dict[str, Any], timeout: float) -> dict[str, Any]:
         import requests
 
