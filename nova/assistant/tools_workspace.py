@@ -60,8 +60,13 @@ def install_tools_v060():
 
         def memory_search(self, query, limit=8):
             active = self.memory.active_workspace(); wid = int(active['id']) if active else None
+            # Evita despertar Ollama/embeddings si no hay nada que recuperar.
+            if not self.memory.recent_memory_items(1, workspace_id=wid):
+                results = []
+            else:
+                results = self.memory.search_memory(query, limit, workspace_id=wid)
             return {'ok': True, 'query': query, 'workspace': active.get('name') if active else None,
-                    'results': self.memory.search_memory(query, limit, workspace_id=wid)}
+                    'results': results}
 
         def workspace_list(self):
             rows = self.workspaces.list(40)
