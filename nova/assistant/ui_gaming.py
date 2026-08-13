@@ -23,6 +23,17 @@ def _gaming_label(report):
     return "🎮 Juego: auto" if mode == "auto" else "🎮 Juego: preparado"
 
 
+def _warm_label(report):
+    if report.get("warming"):
+        return "LLM: precargando…"
+    if report.get("loaded"):
+        vram = float(report.get("size_vram_mb") or 0)
+        return f"LLM: listo · {vram:.0f} MB VRAM" if vram else "LLM: listo"
+    if report.get("last_error"):
+        return "LLM: precarga no disponible"
+    return "LLM: descargado"
+
+
 def install_ui_gaming():
     from . import ui as mod
 
@@ -68,15 +79,13 @@ def install_ui_gaming():
             if manager is not None:
                 report = manager.status(refresh=False)
                 self.gaming_mode_var.set(_gaming_label(report))
-                if report.get("active") and report.get("llm_released") and hasattr(self, "llm_warm_var"):
-                    self.llm_warm_var.set("LLM: liberado · Gaming Mode")
-                elif report.get("active") and report.get("keep_llm_loaded_during_game") and hasattr(self, "llm_warm_var"):
-                    warm = getattr(self, "llm_warm_manager", None)
-                    if warm is not None:
-                        cached = warm.cached_status()
-                        if cached.get("loaded"):
-                            vram = float(cached.get("size_vram_mb") or 0)
-                            self.llm_warm_var.set(f"LLM: listo · {vram:.0f} MB VRAM" if vram else "LLM: listo")
+                if hasattr(self, "llm_warm_var"):
+                    if report.get("active") and report.get("llm_released"):
+                        self.llm_warm_var.set("LLM: liberado · Gaming Mode")
+                    else:
+                        warm = getattr(self, "llm_warm_manager", None)
+                        if warm is not None:
+                            self.llm_warm_var.set(_warm_label(warm.cached_status()))
         except Exception:
             pass
         try:
