@@ -1,27 +1,70 @@
+import argparse
 import sys
 import traceback
 from pathlib import Path
 import tkinter as tk
 
-# Desde v0.9.0 Agent, Tools, UI y Task Engine también están administrados por
-# GitHub. core_runtime conserva temporalmente los adaptadores por dominio para
-# migrar comportamiento sin romper compatibilidad en una sola Release.
-from assistant.core_runtime import install_core_runtime
 
-install_core_runtime()
-
-from assistant.config import load_config
-from assistant.ui import AssistantUI
+def _arguments(argv=None):
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--background", action="store_true")
+    parser.add_argument("--post-update", action="store_true")
+    args, _unknown = parser.parse_known_args(argv)
+    return args
 
 
-def main():
+def _claim_instance():
+    # Esta comprobación ocurre antes de core_runtime/AssistantUI: una segunda
+    # ejecución no construye Agent, no registra hotkeys y no precarga Qwen.
+    from assistant.instance_commands import InstanceCommandMailbox
+    from assistant.instance_lock import InstanceLock, runtime_directory
+
+    directory = runtime_directory()
+    lock = InstanceLock(path=directory / "nova.lock")
+    mailbox = InstanceCommandMailbox(directory / "nova.command")
+    if not lock.acquire():
+        mailbox.send("show")
+        return None, mailbox
+    mailbox.clear()
+    return lock, mailbox
+
+
+def main(argv=None):
     if sys.platform != "win32":
         print("Esta versión está preparada específicamente para Windows.")
         return 1
-    root = tk.Tk()
-    AssistantUI(root, load_config())
-    root.mainloop()
-    return 0
+
+    args = _arguments(argv)
+    instance_lock, command_mailbox = _claim_instance()
+    if instance_lock is None:
+        # La instancia existente recibió la orden local `show`.
+        return 0
+
+    root = None
+    try:
+        # El núcleo pesado solo se instala después de adquirir la instancia.
+        from assistant.core_runtime import install_core_runtime
+        install_core_runtime()
+        from assistant.config import load_config
+        from assistant.ui import AssistantUI
+
+        root = tk.Tk()
+        AssistantUI(
+            root,
+            load_config(),
+            instance_lock=instance_lock,
+            command_mailbox=command_mailbox,
+            start_hidden=bool(args.background and not args.post_update),
+        )
+        root.mainloop()
+        return 0
+    finally:
+        # request_shutdown normalmente libera el lock. Este finally cubre error
+        # de arranque, destroy externo o cierre inesperado de mainloop.
+        try:
+            instance_lock.release()
+        except Exception:
+            pass
 
 
 def report_startup_error(exc: BaseException):
