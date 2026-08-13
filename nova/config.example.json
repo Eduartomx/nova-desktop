@@ -163,6 +163,17 @@
     "generated_skills_start_as_draft": true,
     "auto_execute_matches": false
   },
+  "confidence": {
+    "enabled": true,
+    "persist_assessments": true,
+    "max_assessments": 1800,
+    "low_threshold": 0.52,
+    "high_threshold": 0.78,
+    "escalation_candidate_threshold": 0.50,
+    "inject_context": true,
+    "surface_low_confidence": true,
+    "minimum_evidence_for_high": 2
+  },
   "hotkey": "<ctrl>+<alt>+<space>",
   "desktop": {
     "auto_context": true,
