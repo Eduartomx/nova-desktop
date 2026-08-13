@@ -3,9 +3,10 @@ from __future__ import annotations
 """Bootstrap consolidado de Nova.
 
 Desde v0.9.0 Agent, LocalTools, AssistantUI y TaskEngine también viven en
-GitHub. Browser Agent y control estructurado del escritorio forman parte del
-núcleo administrado. Las capas `agent_*`, `tools_*` y `ui_*` se conservan
-temporalmente por dominio mientras 0.9.x absorbe su comportamiento.
+GitHub. Browser Agent, control estructurado del escritorio y activación local
+por wake word forman parte del núcleo administrado. Las capas `agent_*`,
+`tools_*` y `ui_*` se conservan temporalmente por dominio mientras 0.9.x
+absorbe su comportamiento.
 """
 
 _INSTALLED = False
@@ -22,8 +23,6 @@ def install_core_runtime():
     from .experience_reliability import install_skill_reliability_hooks
     install_skill_reliability_hooks()
 
-    # Herramientas administradas. Desktop/Browser se instala primero para que
-    # Confidence/Profiler también observen estas capacidades.
     from .tools_desktop import install_tools_desktop
     from .tools_workspace import install_tools_v060
     from .tools_workspace_index import install_tools_v061
@@ -57,7 +56,6 @@ def install_core_runtime():
     install_tools_learning()
     install_tools_confidence()
 
-    # Capas del Agent sobre LocalAgent nativo.
     from .agent_workspace import install_agent_v060
     from .agent_semantic import install_agent_v063
     from .agent_continuity import install_agent_v065
@@ -83,7 +81,6 @@ def install_core_runtime():
     install_agent_learning()
     install_agent_reliability()
 
-    # Capas visuales sobre AssistantUI nativa.
     from .ui_workspace import install_ui_v060
     from .ui_semantic import install_ui_v063
     from .ui_continuity import install_ui_v065
@@ -95,6 +92,7 @@ def install_core_runtime():
     from .ui_skills import install_ui_skills
     from .ui_reliability import install_ui_reliability
     from .ui_expert import install_ui_expert
+    from .ui_voice_wake import install_ui_voice_wake
     from .profiler_hooks import install_profiler_v066
     install_ui_v060()
     install_ui_v063()
@@ -107,6 +105,7 @@ def install_core_runtime():
     install_ui_skills()
     install_ui_reliability()
     install_ui_expert()
+    install_ui_voice_wake()
     install_profiler_v066()
 
     _INSTALLED = True
@@ -128,13 +127,12 @@ def architecture_status() -> dict:
         "context_intelligence", "workspace_autodetect", "anomaly_detection",
         "event_driven_vision", "skills", "confidence", "expert_escalation",
         "expert_resilience", "learn_from_expert", "experience_reliability",
-        "desktop_browser_control", "agent", "tools", "ui", "task_engine",
+        "desktop_browser_control", "voice_wake", "agent", "tools", "ui", "task_engine",
     ]
     return {
         "ok": all(managed_core.values()),
         "bootstrap": "assistant.core_runtime",
         "github_managed_core": managed_core,
-        # Campo conservado para consumidores antiguos; en 0.9 ya no hay contrato local.
         "legacy_local_contract": {},
         "github_managed_native": native_domains,
         "compatibility_adapters": ["agent_domain", "tools_domain", "ui_domain"],
