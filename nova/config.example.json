@@ -174,6 +174,47 @@
     "surface_low_confidence": true,
     "minimum_evidence_for_high": 2
   },
+  "expert_escalation": {
+    "enabled": true,
+    "auto_free_second_opinion": true,
+    "auto_free_max_risk": "normal",
+    "provider_order": ["cerebras", "groq"],
+    "max_events": 800,
+    "free_api": {
+      "cerebras": {
+        "enabled": true,
+        "model": "gpt-oss-120b",
+        "endpoint": "https://api.cerebras.ai/v1/chat/completions",
+        "api_key_env": "CEREBRAS_API_KEY",
+        "timeout_seconds": 24,
+        "max_completion_tokens": 900,
+        "reasoning_effort": "medium"
+      },
+      "groq": {
+        "enabled": true,
+        "model": "qwen/qwen3.6-27b",
+        "endpoint": "https://api.groq.com/openai/v1/chat/completions",
+        "api_key_env": "GROQ_API_KEY",
+        "timeout_seconds": 24,
+        "max_completion_tokens": 900
+      }
+    },
+    "chatgpt_assisted": {
+      "enabled": true,
+      "url": "https://chatgpt.com/",
+      "open_browser": true,
+      "copy_query_to_clipboard": true,
+      "auto_prepare_on_conflict": false
+    },
+    "privacy": {
+      "redact_secrets": true,
+      "max_problem_chars": 5200,
+      "max_local_answer_chars": 5200,
+      "max_external_response_chars": 6500,
+      "persist_prompts": false,
+      "persist_responses": false
+    }
+  },
   "hotkey": "<ctrl>+<alt>+<space>",
   "desktop": {
     "auto_context": true,
@@ -213,9 +254,10 @@
     "snapshot_depth": 6
   },
   "openai": {
-    "enabled": true,
+    "enabled": false,
     "model": "gpt-5.6-luna",
-    "confirm_paid_requests": true
+    "confirm_paid_requests": true,
+    "paid_api_opt_in": false
   },
   "security": {
     "profile": "trusted",
