@@ -217,6 +217,47 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "surface_low_confidence": True,
         "minimum_evidence_for_high": 2,
     },
+    "expert_escalation": {
+        "enabled": True,
+        "auto_free_second_opinion": True,
+        "auto_free_max_risk": "normal",
+        "provider_order": ["cerebras", "groq"],
+        "max_events": 800,
+        "free_api": {
+            "cerebras": {
+                "enabled": True,
+                "model": "gpt-oss-120b",
+                "endpoint": "https://api.cerebras.ai/v1/chat/completions",
+                "api_key_env": "CEREBRAS_API_KEY",
+                "timeout_seconds": 24,
+                "max_completion_tokens": 900,
+                "reasoning_effort": "medium"
+            },
+            "groq": {
+                "enabled": True,
+                "model": "qwen/qwen3.6-27b",
+                "endpoint": "https://api.groq.com/openai/v1/chat/completions",
+                "api_key_env": "GROQ_API_KEY",
+                "timeout_seconds": 24,
+                "max_completion_tokens": 900
+            }
+        },
+        "chatgpt_assisted": {
+            "enabled": True,
+            "url": "https://chatgpt.com/",
+            "open_browser": True,
+            "copy_query_to_clipboard": True,
+            "auto_prepare_on_conflict": False
+        },
+        "privacy": {
+            "redact_secrets": True,
+            "max_problem_chars": 5200,
+            "max_local_answer_chars": 5200,
+            "max_external_response_chars": 6500,
+            "persist_prompts": False,
+            "persist_responses": False
+        }
+    },
     "hotkey": "<ctrl>+<alt>+<space>",
     "desktop": {
         "auto_context": True,
@@ -251,7 +292,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "command_timeout_seconds": 35,
         "snapshot_depth": 6,
     },
-    "openai": {"enabled": True, "model": "gpt-5.6-luna", "confirm_paid_requests": True},
+    "openai": {
+        "enabled": False,
+        "model": "gpt-5.6-luna",
+        "confirm_paid_requests": True,
+        "paid_api_opt_in": False,
+    },
     "security": {
         "profile": "trusted",
         "restrict_files_to_allowed_roots": True,
@@ -292,6 +338,16 @@ def load_config() -> dict[str, Any]:
     migrated = False
     if str(data.get("hotkey") or "").strip().casefold() == "<ctrl>+<space>":
         merged["hotkey"] = "<ctrl>+<alt>+<space>"
+        migrated = True
+
+    # v0.8.2: el antiguo default permitía la API de OpenAI de pago. La preferencia
+    # actual del proyecto es no usarla. Solo migramos una configuración antigua que
+    # aún no posee el marcador de opt-in; un usuario puede habilitarla de nuevo
+    # explícitamente estableciendo paid_api_opt_in=true.
+    old_openai = data.get("openai", {}) if isinstance(data.get("openai", {}), dict) else {}
+    if old_openai.get("enabled") is True and "paid_api_opt_in" not in old_openai:
+        merged.setdefault("openai", {})["enabled"] = False
+        merged["openai"]["paid_api_opt_in"] = False
         migrated = True
 
     original_security = data.get("security", {}) if isinstance(data.get("security", {}), dict) else {}
