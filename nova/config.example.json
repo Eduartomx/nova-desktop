@@ -215,11 +215,20 @@
       "persist_responses": false
     }
   },
-  "hotkey": "<ctrl>+<alt>+<space>",
+  "llm_warm": {
+    "enabled": true,
+    "preload_on_start": true,
+    "startup_delay_seconds": 0.35,
+    "keep_alive": "20m",
+    "request_timeout_seconds": 30.0,
+    "status_timeout_seconds": 2.5,
+    "unload_on_exit": true
+  },
+  "hotkey": "<ctrl>+<alt>+n",
   "desktop": {
     "auto_context": true,
     "auto_visual_context": true,
-    "context_hotkey": "<ctrl>+<shift>+<space>",
+    "context_hotkey": "<ctrl>+<alt>+<shift>+n",
     "refresh_context_ms": 900
   },
   "voice": {
