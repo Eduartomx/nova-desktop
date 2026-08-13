@@ -10,13 +10,12 @@ import subprocess
 import sys
 import tempfile
 import time
-import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
 
 APP_NAME = "Nova"
-UPDATER_VERSION = "2.0-github-native"
+UPDATER_VERSION = "2.1-resident-aware"
 USER_AGENT = f"Nova-Updater/{UPDATER_VERSION}"
 
 
@@ -140,7 +139,8 @@ def download_bytes(repo: str, ref: str, path: str) -> bytes:
             timeout=60,
         )
         if p.returncode != 0:
-            raise RuntimeError((p.stderr or p.stdout or "descarga gh falló".encode("utf-8")).decode("utf-8", errors="ignore"))
+            detail = (p.stderr or p.stdout or b"descarga gh falló").decode("utf-8", errors="ignore")
+            raise RuntimeError(detail)
         return p.stdout
 
 
@@ -353,22 +353,39 @@ def check_only() -> int:
     return 0
 
 
+def _delegate_direct_update() -> int | None:
+    """Direct interactive execution uses the same resident-safe supervisor."""
+    runner = ROOT / "updater" / "update_runner.py"
+    if not runner.exists():
+        return None
+    print("Delegando la actualización al supervisor de ciclo de vida de Nova…")
+    return int(subprocess.call([sys.executable, str(runner)], cwd=str(ROOT)))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--check", action="store_true")
-    ap.add_argument("--yes", action="store_true")
+    ap.add_argument("--yes", action="store_true", help=argparse.SUPPRESS)
     args = ap.parse_args()
 
     try:
         if args.check:
             return check_only()
+        # --yes is the internal non-interactive path used by update_runner.
+        # A normal direct launch first coordinates a real resident shutdown and
+        # a single post-update relaunch through the supervisor.
+        if not args.yes:
+            delegated = _delegate_direct_update()
+            if delegated is not None:
+                return delegated
+
         cfg = load_config()
         current = version_text()
         release = get_release(cfg)
         latest = str(release.get("tag_name", "")).lstrip("vV")
         notes = (release.get("body") or "").strip()
         print("=" * 58)
-        print("NOVA UPDATER 2.0 - GitHub Native")
+        print("NOVA UPDATER 2.1 - GitHub Native · Resident-aware")
         print("=" * 58)
         print(f"Repositorio : {cfg['repository']}")
         print(f"Canal       : {cfg.get('channel', 'stable')}")
@@ -379,20 +396,10 @@ def main():
             return 0
         if notes:
             print("\nCambios:\n" + notes[:2500])
-        if not args.yes:
-            ans = input(f"\n¿Actualizar Nova {current} -> {latest}? (S/n): ").strip().lower()
-            if ans in {"n", "no"}:
-                return 0
         sync_release(cfg, release)
         print("\n" + "=" * 58)
         print(f"NOVA {latest} INSTALADA DESDE GITHUB")
         print("=" * 58)
-        if not args.yes:
-            start = input("¿Iniciar Nova ahora? (S/n): ").strip().lower()
-            if start not in {"n", "no"}:
-                bat = ROOT / "INICIAR.bat"
-                if bat.exists():
-                    os.startfile(str(bat))
         return 0
     except Exception as e:
         print(f"[ERROR] {e}")
