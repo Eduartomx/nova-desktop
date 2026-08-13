@@ -1,13 +1,6 @@
 from __future__ import annotations
 
-"""Sincronización de estado visual para Gaming Awareness.
-
-0.9.5 conservaba correctamente el historial interno de la última liberación de
-Qwen para poder restaurarlo al salir del juego, pero ese historial se exponía
-como si siguiera siendo el estado actual cuando Gaming Mode ya estaba inactivo.
-Este adaptador separa estado actual de historial sin alterar la lógica de
-restauración del manager.
-"""
+"""Corrige la presentación del estado de Gaming Awareness tras salir de un juego."""
 
 
 def install_gaming_status_sync():
@@ -18,12 +11,10 @@ def install_gaming_status_sync():
         return Manager
 
     original_status = Manager.status
+    original_format_status = Manager.format_status
 
     def status(self, refresh: bool = False):
         report = dict(original_status(self, refresh=refresh))
-        # Estos campos pertenecen a la sesión de juego que acaba de terminar.
-        # Se conservan con nombre explícito para diagnóstico/historial, pero no
-        # deben hacer parecer que Qwen sigue liberado cuando el modo ya es normal.
         report["last_release_reason"] = report.get("release_reason") or ""
         report["last_release_vram_reclaimed_mb"] = report.get("vram_reclaimed_mb") or 0.0
         if not report.get("active"):
@@ -32,6 +23,15 @@ def install_gaming_status_sync():
             report["vram_reclaimed_mb"] = 0.0
         return report
 
+    def format_status(report):
+        text = original_format_status(report)
+        if not report.get("active") and report.get("last_release_reason"):
+            reclaimed = float(report.get("last_release_vram_reclaimed_mb") or 0)
+            suffix = f" · ~{reclaimed:.0f} MB recuperados" if reclaimed else ""
+            text += f"\n- Última liberación: {report.get('last_release_reason')}{suffix}"
+        return text
+
     Manager.status = status
+    Manager.format_status = staticmethod(format_status)
     Manager._nova_gaming_status_sync_patched = True
     return Manager
