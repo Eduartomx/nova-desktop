@@ -144,6 +144,11 @@ class TrayController:
         save_config(self.ui.config)
 
     def notify(self, key: str, title: str, message: str) -> bool:
+        # Base UI historically reports every inference as a completed result.
+        # Resident Mode intentionally ignores that generic signal; only the
+        # TaskEngine emits the dedicated long_task_completed notification.
+        if str(key) == "task_completed":
+            return False
         resident = self.ui.config.get("resident_mode", {}) if isinstance(self.ui.config, dict) else {}
         if not bool(resident.get("notifications", True)) or not self.available or self.icon is None:
             return False
