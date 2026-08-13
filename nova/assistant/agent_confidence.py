@@ -65,7 +65,7 @@ def format_assessment(row: dict[str, Any]) -> str:
     if readable:
         lines.append("Motivos: " + "; ".join(readable) + ".")
     if row.get("escalation_candidate"):
-        lines.append("Esta petición sería candidata para una segunda opinión asistida cuando habilitemos Expert Escalation.")
+        lines.append("Esta petición es candidata para Expert Escalation y puede recibir una segunda opinión externa según la política configurada.")
     return "\n".join(lines)
 
 
@@ -202,7 +202,7 @@ REGLAS DE CONFIANZA
 - Para diagnóstico, estado actual, hechos verificables y acciones de impacto alto, prefiere obtener evidencia estructurada antes de afirmar algo con seguridad.
 - Si herramientas/evidencias se contradicen, dilo y busca una comprobación adicional en vez de ocultar la discrepancia.
 - Una Skill `verified` aporta evidencia histórica, pero nunca sustituye verificar que el contexto actual siga siendo compatible.
-- Cuando Confidence Engine marque una petición como candidata a escalación, no inventes certeza para evitar pedir ayuda. En v0.8.1 solo se registra la candidatura; la consulta asistida a ChatGPT llegará en la siguiente etapa.
+- Cuando Confidence Engine marque una petición como candidata a escalación, no inventes certeza para evitar pedir ayuda. Expert Escalation puede obtener una segunda opinión gratuita en riesgo normal o preparar una consulta asistida a ChatGPT.
 """
 
     Agent.__init__ = init
