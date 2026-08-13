@@ -6,13 +6,15 @@ import json
 import os
 from pathlib import Path
 import tempfile
+import time
 
 ALLOWED_COMMANDS = {"show", "shutdown_for_update", "status"}
 
 
 class InstanceCommandMailbox:
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, *, max_age_seconds: float = 8.0):
         self.path = Path(path)
+        self.max_age_seconds = max(1.0, float(max_age_seconds))
 
     @staticmethod
     def validate(command: str) -> str:
@@ -27,7 +29,7 @@ class InstanceCommandMailbox:
         try:
             fd, tmp = tempfile.mkstemp(prefix="nova-runtime-command-", dir=str(self.path.parent))
             with os.fdopen(fd, "w", encoding="utf-8") as stream:
-                json.dump({"command": command}, stream)
+                json.dump({"command": command, "created_at": time.time()}, stream)
             os.replace(tmp, self.path)
             return True
         except Exception:
@@ -40,10 +42,17 @@ class InstanceCommandMailbox:
             raw = self.path.read_text(encoding="utf-8")
             self.path.unlink(missing_ok=True)
             data = json.loads(raw)
-            if not isinstance(data, dict) or set(data) != {"command"}:
+            if not isinstance(data, dict) or set(data) != {"command", "created_at"}:
                 return {"ok": False, "error": "invalid_message"}
+            created = float(data.get("created_at") or 0.0)
+            if created <= 0 or time.time() - created > self.max_age_seconds:
+                return {"ok": False, "error": "stale_message"}
             return {"ok": True, "command": self.validate(data.get("command"))}
-        except (ValueError, UnicodeError, json.JSONDecodeError):
+        except (ValueError, TypeError, UnicodeError, json.JSONDecodeError):
+            try:
+                self.path.unlink(missing_ok=True)
+            except OSError:
+                pass
             return {"ok": False, "error": "invalid_message"}
 
     def clear(self) -> None:
