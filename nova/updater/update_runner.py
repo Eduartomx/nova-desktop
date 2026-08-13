@@ -40,7 +40,6 @@ def wait_for_parent(pid: int | None, timeout: float = 20.0) -> bool:
     if os.name == "nt":
         try:
             import ctypes
-
             SYNCHRONIZE = 0x00100000
             WAIT_OBJECT_0 = 0
             handle = ctypes.windll.kernel32.OpenProcess(SYNCHRONIZE, False, int(pid))
@@ -65,7 +64,6 @@ def wait_for_parent(pid: int | None, timeout: float = 20.0) -> bool:
 
 
 def request_runtime_shutdown(root: Path, timeout: float = 20.0, *, lock_factory=None, mailbox=None) -> bool:
-    """Ask a resident Nova to exit and wait for its kernel lock to be released."""
     if str(root) not in sys.path:
         sys.path.insert(0, str(root))
     if lock_factory is None:
@@ -76,14 +74,12 @@ def request_runtime_shutdown(root: Path, timeout: float = 20.0, *, lock_factory=
         from assistant.instance_commands import InstanceCommandMailbox
         from assistant.instance_lock import runtime_directory
         mailbox = InstanceCommandMailbox(runtime_directory() / "nova.command")
-
     probe = lock_factory()
     if probe.acquire():
         probe.release()
         return True
     if not mailbox.send("shutdown_for_update"):
         return False
-
     deadline = time.monotonic() + max(0.0, float(timeout))
     event = threading.Event()
     while time.monotonic() < deadline:
@@ -102,19 +98,11 @@ def status_path(root: Path) -> Path:
 def write_status(root: Path, *, ok: bool, before: str, after: str, log: Path, error: str = "") -> None:
     path = status_path(root)
     path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {
-        "ok": bool(ok),
-        "before": before,
-        "after": after,
-        "error": str(error or ""),
-        "log": str(log),
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-    }
+    payload = {"ok": bool(ok), "before": before, "after": after, "error": str(error or ""), "log": str(log), "timestamp": datetime.now(timezone.utc).isoformat()}
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def launch_nova(root: Path) -> tuple[bool, str]:
-    """Relaunch exactly one visible post-update Nova process."""
     try:
         pyw = root / ".venv" / "Scripts" / "pythonw.exe"
         py = pyw if pyw.exists() else console_python(root)
@@ -124,13 +112,7 @@ def launch_nova(root: Path) -> tuple[bool, str]:
         flags = 0
         if os.name == "nt":
             flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-        subprocess.Popen(
-            [str(py), str(app), "--post-update"],
-            cwd=str(root),
-            creationflags=flags,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+        subprocess.Popen([str(py), str(app), "--post-update"], cwd=str(root), creationflags=flags, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return True, f"{py} {app} --post-update"
     except Exception as exc:
         return False, str(exc)
@@ -141,19 +123,13 @@ def run_update(root: Path, log: Path) -> tuple[int, str]:
     updater = root / "updater" / "nova_updater.py"
     if not updater.exists():
         return 2, f"No existe {updater}"
-    cmd = [str(py), str(updater), "--yes", "--managed-runner"]
+    cmd = [str(py), str(updater), "--yes"]
     try:
         with open(log, "w", encoding="utf-8", errors="replace") as stream:
             stream.write("Nova Update Runner\n")
             stream.write("Comando: " + subprocess.list2cmdline(cmd) + "\n\n")
             stream.flush()
-            proc = subprocess.run(
-                cmd,
-                cwd=str(root),
-                stdout=stream,
-                stderr=subprocess.STDOUT,
-                text=True,
-            )
+            proc = subprocess.run(cmd, cwd=str(root), stdout=stream, stderr=subprocess.STDOUT, text=True)
         return int(proc.returncode), ""
     except Exception as exc:
         return 2, str(exc)
@@ -164,31 +140,21 @@ def main(argv=None) -> int:
     parser.add_argument("--parent-pid", type=int, default=0)
     parser.add_argument("--wait-seconds", type=float, default=20.0)
     args = parser.parse_args(argv)
-
     root = nova_root()
     logs = root / "data" / "updater_logs"
     logs.mkdir(parents=True, exist_ok=True)
     log = logs / ("update_" + time.strftime("%Y%m%d_%H%M%S") + ".log")
     before = read_version(root)
-
-    if args.parent_pid:
-        ready = wait_for_parent(args.parent_pid, args.wait_seconds)
-    else:
-        ready = request_runtime_shutdown(root, args.wait_seconds)
+    ready = wait_for_parent(args.parent_pid, args.wait_seconds) if args.parent_pid else request_runtime_shutdown(root, args.wait_seconds)
     if not ready:
         error = "Nova no terminó dentro del tiempo de espera; no se modificaron archivos."
         write_status(root, ok=False, before=before, after=before, log=log, error=error)
         return 4
-
     rc, runner_error = run_update(root, log)
     after = read_version(root)
     ok = rc == 0
-    error = runner_error
-    if not ok and not error:
-        error = f"El updater terminó con código {rc}. Revisa {log}."
-
+    error = runner_error or ("" if ok else f"El updater terminó con código {rc}. Revisa {log}.")
     write_status(root, ok=ok, before=before, after=after, log=log, error=error)
-
     launched, launch_detail = launch_nova(root)
     if not launched:
         with open(log, "a", encoding="utf-8", errors="replace") as stream:
