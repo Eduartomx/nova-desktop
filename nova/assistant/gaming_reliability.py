@@ -2,10 +2,8 @@ from __future__ import annotations
 
 """Confiabilidad de ciclo de vida para Gaming Awareness.
 
-Este adaptador mantiene la arquitectura 0.9.x sin convertir la corrección en una
-reescritura general. Refuerza identidad de procesos, frescura de Perception,
-cambios de juego, callbacks de estado y restauraciones de Qwen protegidas contra
-carreras entre temporizadores.
+Esta capa refuerza identidad de procesos, frescura de Perception, eventos de UI y
+restauraciones de Qwen sin convertir Nova 0.9.x en una reescritura general.
 """
 
 import threading
@@ -15,6 +13,7 @@ from typing import Any, Callable
 import psutil
 
 from .gaming_awareness import GamingAwarenessManager
+from .gaming_detection_filters import is_mandatory_gaming_exclusion
 
 
 def _norm(value: Any) -> str:
@@ -58,7 +57,6 @@ def install_gaming_reliability():
         return self
 
     def init(self, *args, **kwargs):
-        # Sensor inyectable solo para pruebas deterministas; producción usa psutil.
         self._gaming_identity_sensor = kwargs.pop("identity_sensor", None)
         original_init(self, *args, **kwargs)
         self._gaming_state_listeners: list[Callable[[str, dict[str, Any]], None]] = []
@@ -66,6 +64,8 @@ def install_gaming_reliability():
         self._gaming_candidate_key: tuple[int, str, float] | None = None
         self._tracked_game_identity: dict[str, Any] = {}
         self._restore_generation = 0
+        self._restore_inflight_generation = 0
+        self._gaming_restore_transition_lock = threading.RLock()
 
     def add_state_listener(self, callback):
         if not callable(callback):
@@ -155,8 +155,9 @@ def install_gaming_reliability():
         return [_norm(x) for x in self.gaming_config.get("game_path_markers", []) if str(x).strip()]
 
     def _is_ignored(self, process: str, exe: str = "") -> bool:
+        if is_mandatory_gaming_exclusion(process, exe):
+            return True
         proc = _norm(process)
-        # Una inclusión explícita del usuario mantiene prioridad por compatibilidad.
         if proc and proc in self._explicit_processes():
             return False
         if proc and proc in self._ignored_processes():
@@ -207,8 +208,6 @@ def install_gaming_reliability():
                 })
                 return base
 
-            # Una ruta Steam/Epic/Xbox solo es una señal válida combinada con la
-            # ventana realmente en primer plano; nunca basta por sí sola.
             norm_exe = _norm(exe)
             if is_foreground and norm_exe and any(marker and marker in norm_exe for marker in self._path_markers()):
                 base.update({
@@ -239,8 +238,6 @@ def install_gaming_reliability():
             return dict(found)
 
         configured = self._explicit_processes()
-        ignored = self._ignored_processes()
-        ignored_paths = self._ignored_paths()
         mc_markers = [str(x).casefold() for x in self.gaming_config.get("minecraft_command_markers", []) if str(x).strip()]
         try:
             rows = psutil.process_iter(["pid", "name", "exe", "cmdline", "create_time"])
@@ -253,10 +250,11 @@ def install_gaming_reliability():
                 name = str(info.get("name") or "")
                 norm_name = _norm(name)
                 exe = str(info.get("exe") or "")
-                norm_exe = _norm(exe)
                 cmdline = " ".join(str(x) for x in (info.get("cmdline") or [])).casefold()
                 created = _safe_float(info.get("create_time"))
 
+                if self._is_ignored(name, exe):
+                    continue
                 if norm_name in configured:
                     return {
                         "pid": pid,
@@ -267,8 +265,6 @@ def install_gaming_reliability():
                         "reason": "proceso configurado como juego",
                         "foreground": False,
                     }
-                if norm_name in ignored or (norm_exe and any(marker and marker in norm_exe for marker in ignored_paths)):
-                    continue
                 if norm_name == "javaw.exe" and any(marker in cmdline for marker in mc_markers):
                     return {
                         "pid": pid,
@@ -279,8 +275,6 @@ def install_gaming_reliability():
                         "reason": "javaw con argumentos de Minecraft/Forge/Fabric",
                         "foreground": False,
                     }
-                # No existe fallback por ruta aquí: estar instalado en Steam,
-                # Epic o Xbox no demuestra que el proceso sea un juego.
             except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
                 continue
             except Exception:
@@ -311,11 +305,28 @@ def install_gaming_reliability():
             return False
         return True
 
-    def _cancel_restore(self):
+    def _apply_game_warm_guards(self, warm=None):
+        warm = warm or self._warm_manager()
+        if bool(self.gaming_config.get("keep_llm_loaded_during_game", False)):
+            warm.clear_preload_suppression("gaming_mode")
+            warm.clear_runtime_keep_alive_override("gaming_mode")
+            return
+        warm.suppress_preload("gaming_mode")
+        warm.set_runtime_keep_alive_override(
+            self.gaming_config.get("llm_keep_alive_during_game", 0),
+            reason="gaming_mode",
+        )
+
+    def _invalidate_restore_locked(self):
         with self._lock:
             self._restore_generation += 1
             timer = self._restore_timer
             self._restore_timer = None
+            return timer
+
+    def _cancel_restore(self):
+        with self._gaming_restore_transition_lock:
+            timer = self._invalidate_restore_locked()
         try:
             if timer is not None:
                 timer.cancel()
@@ -333,54 +344,128 @@ def install_gaming_reliability():
             return
 
         delay = max(0.0, float(self.gaming_config.get("restore_delay_seconds", 4.0) or 0.0))
-        with self._lock:
-            self._restore_generation += 1
-            generation = self._restore_generation
-            previous = self._restore_timer
-        try:
-            if previous is not None:
-                previous.cancel()
-        except Exception:
-            pass
-
-        def restore():
+        with self._gaming_restore_transition_lock:
             with self._lock:
-                if generation != self._restore_generation or self._active or self._manual_mode == "on":
-                    return
-            warm.clear_preload_suppression("gaming_mode")
-            warm.clear_runtime_keep_alive_override("gaming_mode")
-            if warm.preload_on_start:
-                report = warm.preload(reason="gaming_restore")
-                with self._lock:
-                    if generation != self._restore_generation or self._active:
-                        return
-                    self._last_action = (
-                        "Qwen precargado de nuevo al salir del juego"
-                        if report.get("loaded")
-                        else "Qwen quedó bajo demanda al salir del juego"
-                    )
-                    try:
-                        from .gaming_awareness import _utc_now
-                        self._last_action_at = _utc_now()
-                    except Exception:
-                        self._last_action_at = ""
-                    self._restore_timer = None
-                self._emit_state("resources_changed")
+                self._restore_generation += 1
+                generation = self._restore_generation
+                previous = self._restore_timer
 
-        timer = threading.Timer(delay, restore)
-        timer.daemon = True
-        with self._lock:
-            if generation != self._restore_generation:
-                return
-            self._restore_timer = timer
-        timer.start()
+            try:
+                if previous is not None:
+                    previous.cancel()
+            except Exception:
+                pass
+
+            def restore():
+                with self._gaming_restore_transition_lock:
+                    with self._lock:
+                        if generation != self._restore_generation or self._active or self._manual_mode == "on":
+                            return
+                        self._restore_inflight_generation = generation
+                    warm.clear_preload_suppression("gaming_mode")
+                    warm.clear_runtime_keep_alive_override("gaming_mode")
+                    with self._lock:
+                        stale_before_preload = (
+                            generation != self._restore_generation
+                            or self._active
+                            or self._manual_mode == "on"
+                        )
+                    if stale_before_preload:
+                        if self._active:
+                            self._apply_game_warm_guards(warm)
+                        with self._lock:
+                            if self._restore_inflight_generation == generation:
+                                self._restore_inflight_generation = 0
+                        return
+
+                if warm.preload_on_start:
+                    report = warm.preload(reason="gaming_restore")
+                else:
+                    report = warm.cached_status()
+
+                with self._gaming_restore_transition_lock:
+                    with self._lock:
+                        stale = (
+                            generation != self._restore_generation
+                            or self._active
+                            or self._manual_mode == "on"
+                        )
+                        active_now = bool(self._active)
+
+                    if stale:
+                        if active_now:
+                            self._apply_game_warm_guards(warm)
+                            warm_state = warm.cached_status()
+                            keep_loaded = bool(self.gaming_config.get("keep_llm_loaded_during_game", False))
+                            can_compensate = (
+                                not keep_loaded
+                                and bool(warm_state.get("loaded"))
+                                and not bool(warm_state.get("warming"))
+                                and int(warm_state.get("active_inferences") or 0) <= 0
+                            )
+                            if can_compensate:
+                                unload_report = warm.unload(timeout=4.0, reason="gaming_mode")
+                                self._apply_game_warm_guards(warm)
+                                if unload_report.get("loaded") is False:
+                                    with self._lock:
+                                        if self._active:
+                                            self._llm_released = True
+                                            self._last_action = "Qwen liberado tras cancelar una restauración obsoleta"
+                                            try:
+                                                from .gaming_awareness import _utc_now
+                                                self._last_action_at = _utc_now()
+                                            except Exception:
+                                                self._last_action_at = ""
+                        with self._lock:
+                            if self._restore_inflight_generation == generation:
+                                self._restore_inflight_generation = 0
+                            if generation == self._restore_generation:
+                                self._restore_timer = None
+                        return
+
+                    with self._lock:
+                        self._last_action = (
+                            "Qwen precargado de nuevo al salir del juego"
+                            if report.get("loaded")
+                            else "Qwen quedó bajo demanda al salir del juego"
+                        )
+                        try:
+                            from .gaming_awareness import _utc_now
+                            self._last_action_at = _utc_now()
+                        except Exception:
+                            self._last_action_at = ""
+                        self._restore_timer = None
+                        self._restore_inflight_generation = 0
+                    self._emit_state("resources_changed")
+
+            timer = threading.Timer(delay, restore)
+            timer.daemon = True
+            with self._lock:
+                if generation != self._restore_generation:
+                    return
+                self._restore_timer = timer
+            timer.start()
 
     def _enter(self, game):
         game = dict(game or {})
-        self._cancel_restore()
+        warm = self._warm_manager()
+        with self._gaming_restore_transition_lock:
+            timer = self._invalidate_restore_locked()
+            self._apply_game_warm_guards(warm)
+        try:
+            if timer is not None:
+                timer.cancel()
+        except Exception:
+            pass
+
         was_active = bool(self._active)
         old_key = _game_key(self._game)
         original_enter(self, game)
+
+        with self._gaming_restore_transition_lock:
+            if self._active:
+                self._apply_game_warm_guards(warm)
+
         with self._lock:
             self._tracked_game_identity = dict(game)
             self._gaming_candidate_key = None
@@ -395,7 +480,8 @@ def install_gaming_reliability():
 
     def _exit(self, reason="juego cerrado"):
         was_active = bool(self._active)
-        original_exit(self, reason)
+        with self._gaming_restore_transition_lock:
+            original_exit(self, reason)
         if was_active:
             with self._lock:
                 self._tracked_game_identity = {}
@@ -443,8 +529,6 @@ def install_gaming_reliability():
                 self._apply_active_policy()
                 return self.status(refresh=False)
 
-            # Una vez identificado el juego, mantener el modo por identidad del
-            # proceso, no por launchers ni por el último contexto retenido.
             if tracked_alive:
                 with self._lock:
                     self._clear_since = 0.0
@@ -476,12 +560,11 @@ def install_gaming_reliability():
         with self._lock:
             report["tracked_game_identity"] = dict(self._tracked_game_identity)
             report["restore_generation"] = int(self._restore_generation)
+            report["restore_inflight_generation"] = int(self._restore_inflight_generation)
         return report
 
     def stop(self, timeout=1.0):
         result = original_stop(self, timeout=timeout)
-        # original_stop puede salir del modo juego y programar una restauración;
-        # al cerrar Nova esa restauración ya no debe quedar viva.
         self._cancel_restore()
         return result
 
@@ -491,7 +574,6 @@ def install_gaming_reliability():
     Manager.remove_state_listener = remove_state_listener
     Manager._emit_state = _emit_state
 
-    # Alias canónicos usados internamente por esta capa.
     Manager._identity = _identity
     Manager._explicit_processes = _explicit_processes
     Manager._ignored_processes = _ignored_processes
@@ -500,9 +582,10 @@ def install_gaming_reliability():
     Manager._is_ignored = _is_ignored
     Manager._perception_game = _perception_game
     Manager._tracked_alive = _tracked_alive
+    Manager._apply_game_warm_guards = _apply_game_warm_guards
+    Manager._invalidate_restore_locked = _invalidate_restore_locked
     Manager._cancel_restore = _cancel_restore
 
-    # Alias con prefijo para diagnóstico/compatibilidad futura.
     Manager._gaming_identity = _identity
     Manager._gaming_explicit_processes = _explicit_processes
     Manager._gaming_ignored_processes = _ignored_processes
