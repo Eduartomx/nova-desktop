@@ -10,8 +10,8 @@ modelo, resultado y muestras puntuales de GPU/VRAM cuando están disponibles.
 import shutil
 import sqlite3
 import subprocess
-import time
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock
@@ -39,14 +39,14 @@ def _ns_to_ms(value: Any) -> float:
         return 0.0
 
 
-def _safe_float(value: Any) -> float:
+def _float(value: Any) -> float:
     try:
         return float(value or 0)
     except Exception:
         return 0.0
 
 
-def _safe_int(value: Any) -> int:
+def _int(value: Any) -> int:
     try:
         return int(value or 0)
     except Exception:
@@ -63,7 +63,7 @@ class LLMPerformanceMonitor:
         self.session_id = uuid.uuid4().hex[:16]
         self.session_started_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
         self._lock = Lock()
-        self._nvidia_smi: str | None | bool = None
+        self._nvidia_smi: str | bool | None = None
         self._init_db()
 
     @property
@@ -76,8 +76,23 @@ class LLMPerformanceMonitor:
         conn.execute("PRAGMA busy_timeout=5000")
         return conn
 
+    @contextmanager
+    def _connection(self):
+        # sqlite3.Connection.__exit__ hace commit/rollback, pero no garantiza el
+        # cierre del handle. Nova usa conexiones explícitamente cortas para evitar
+        # bloqueos WinError 32 durante actualización/backup en Windows.
+        conn = self._connect()
+        try:
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
     def _init_db(self):
-        with self._connect() as conn:
+        with self._connection() as conn:
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS llm_calls (
@@ -122,21 +137,16 @@ class LLMPerformanceMonitor:
         system_chars = 0
         for row in rows:
             content = row.get("content", "") if isinstance(row, dict) else ""
-            if isinstance(content, str):
-                size = len(content)
-            else:
-                size = len(str(content))
+            size = len(content) if isinstance(content, str) else len(str(content))
             prompt_chars += size
             if isinstance(row, dict) and str(row.get("role") or "") == "system":
                 system_chars += size
-        # Aproximación deliberadamente estructural: no se guarda ningún texto.
-        history_messages = max(0, len(rows) - 2) if rows else 0
         return {
             "message_count": len(rows),
             "tool_count": len(list(tools or [])),
             "prompt_chars": prompt_chars,
             "system_chars": system_chars,
-            "history_messages": history_messages,
+            "history_messages": max(0, len(rows) - 2) if rows else 0,
         }
 
     def sample_gpu(self) -> dict[str, float] | None:
@@ -165,11 +175,7 @@ class LLMPerformanceMonitor:
             parts = [x.strip() for x in cp.stdout.splitlines()[0].split(",")]
             if len(parts) < 3:
                 return None
-            return {
-                "utilization": float(parts[0]),
-                "vram_used_mb": float(parts[1]),
-                "vram_total_mb": float(parts[2]),
-            }
+            return {"utilization": float(parts[0]), "vram_used_mb": float(parts[1]), "vram_total_mb": float(parts[2])}
         except Exception:
             return None
 
@@ -177,7 +183,7 @@ class LLMPerformanceMonitor:
         if not self.enabled:
             return
         try:
-            with self._lock, self._connect() as conn:
+            with self._lock, self._connection() as conn:
                 conn.execute(
                     """
                     INSERT INTO llm_calls(
@@ -188,115 +194,65 @@ class LLMPerformanceMonitor:
                     ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                     """,
                     (
-                        self.session_id,
-                        str(row.get("model") or "")[:120],
-                        str(row.get("label") or "")[:80],
-                        round(_safe_float(row.get("wall_ms")), 3),
-                        round(_safe_float(row.get("server_total_ms")), 3),
-                        round(_safe_float(row.get("load_ms")), 3),
-                        round(_safe_float(row.get("prompt_eval_ms")), 3),
-                        round(_safe_float(row.get("eval_ms")), 3),
-                        _safe_int(row.get("prompt_tokens")),
-                        _safe_int(row.get("output_tokens")),
-                        round(_safe_float(row.get("prompt_tps")), 3),
-                        round(_safe_float(row.get("eval_tps")), 3),
-                        _safe_int(row.get("message_count")),
-                        _safe_int(row.get("tool_count")),
-                        _safe_int(row.get("prompt_chars")),
-                        _safe_int(row.get("system_chars")),
-                        _safe_int(row.get("history_messages")),
-                        row.get("gpu_before_util"), row.get("gpu_after_util"),
-                        row.get("vram_before_mb"), row.get("vram_after_mb"), row.get("vram_total_mb"),
-                        1 if row.get("success", True) else 0,
-                        str(row.get("error_type") or "")[:120],
-                        str(row.get("done_reason") or "")[:120],
+                        self.session_id, str(row.get("model") or "")[:120], str(row.get("label") or "")[:80],
+                        round(_float(row.get("wall_ms")), 3), round(_float(row.get("server_total_ms")), 3),
+                        round(_float(row.get("load_ms")), 3), round(_float(row.get("prompt_eval_ms")), 3),
+                        round(_float(row.get("eval_ms")), 3), _int(row.get("prompt_tokens")), _int(row.get("output_tokens")),
+                        round(_float(row.get("prompt_tps")), 3), round(_float(row.get("eval_tps")), 3),
+                        _int(row.get("message_count")), _int(row.get("tool_count")), _int(row.get("prompt_chars")),
+                        _int(row.get("system_chars")), _int(row.get("history_messages")),
+                        row.get("gpu_before_util"), row.get("gpu_after_util"), row.get("vram_before_mb"),
+                        row.get("vram_after_mb"), row.get("vram_total_mb"), 1 if row.get("success", True) else 0,
+                        str(row.get("error_type") or "")[:120], str(row.get("done_reason") or "")[:120],
                     ),
                 )
                 max_events = max(200, int(self.config.get("max_events", 1800) or 1800))
-                conn.execute(
-                    "DELETE FROM llm_calls WHERE id <= (SELECT MAX(id)-? FROM llm_calls)",
-                    (max_events,),
-                )
+                conn.execute("DELETE FROM llm_calls WHERE id <= (SELECT MAX(id)-? FROM llm_calls)", (max_events,))
         except Exception:
-            # La observabilidad jamás puede romper una inferencia.
+            # La observabilidad jamás debe romper la inferencia observada.
             pass
 
-    def record_success(
-        self,
-        *,
-        model: str,
-        label: str,
-        wall_ms: float,
-        response: dict[str, Any],
-        context: dict[str, int],
-        gpu_before: dict[str, float] | None,
-        gpu_after: dict[str, float] | None,
-    ) -> dict[str, Any]:
+    def record_success(self, *, model: str, label: str, wall_ms: float, response: dict[str, Any],
+                       context: dict[str, int], gpu_before: dict[str, float] | None,
+                       gpu_after: dict[str, float] | None) -> dict[str, Any]:
         server_total_ms = _ns_to_ms(response.get("total_duration"))
         load_ms = _ns_to_ms(response.get("load_duration"))
         prompt_eval_ms = _ns_to_ms(response.get("prompt_eval_duration"))
         eval_ms = _ns_to_ms(response.get("eval_duration"))
-        prompt_tokens = _safe_int(response.get("prompt_eval_count"))
-        output_tokens = _safe_int(response.get("eval_count"))
-        prompt_tps = (prompt_tokens / (prompt_eval_ms / 1000.0)) if prompt_tokens and prompt_eval_ms > 0 else 0.0
-        eval_tps = (output_tokens / (eval_ms / 1000.0)) if output_tokens and eval_ms > 0 else 0.0
+        prompt_tokens = _int(response.get("prompt_eval_count"))
+        output_tokens = _int(response.get("eval_count"))
         row = {
-            "model": model,
-            "label": label,
-            "wall_ms": wall_ms,
-            "server_total_ms": server_total_ms,
-            "load_ms": load_ms,
-            "prompt_eval_ms": prompt_eval_ms,
-            "eval_ms": eval_ms,
-            "prompt_tokens": prompt_tokens,
-            "output_tokens": output_tokens,
-            "prompt_tps": prompt_tps,
-            "eval_tps": eval_tps,
+            "model": model, "label": label, "wall_ms": wall_ms,
+            "server_total_ms": server_total_ms, "load_ms": load_ms,
+            "prompt_eval_ms": prompt_eval_ms, "eval_ms": eval_ms,
+            "prompt_tokens": prompt_tokens, "output_tokens": output_tokens,
+            "prompt_tps": prompt_tokens / (prompt_eval_ms / 1000.0) if prompt_tokens and prompt_eval_ms > 0 else 0,
+            "eval_tps": output_tokens / (eval_ms / 1000.0) if output_tokens and eval_ms > 0 else 0,
             **context,
             "gpu_before_util": (gpu_before or {}).get("utilization"),
             "gpu_after_util": (gpu_after or {}).get("utilization"),
             "vram_before_mb": (gpu_before or {}).get("vram_used_mb"),
             "vram_after_mb": (gpu_after or {}).get("vram_used_mb"),
             "vram_total_mb": (gpu_after or gpu_before or {}).get("vram_total_mb"),
-            "success": True,
-            "error_type": "",
-            "done_reason": str(response.get("done_reason") or ""),
+            "success": True, "error_type": "", "done_reason": str(response.get("done_reason") or ""),
         }
         self._insert(row)
         return row
 
-    def record_failure(
-        self,
-        *,
-        model: str,
-        label: str,
-        wall_ms: float,
-        context: dict[str, int],
-        gpu_before: dict[str, float] | None,
-        gpu_after: dict[str, float] | None,
-        error_type: str,
-    ) -> dict[str, Any]:
+    def record_failure(self, *, model: str, label: str, wall_ms: float, context: dict[str, int],
+                       gpu_before: dict[str, float] | None, gpu_after: dict[str, float] | None,
+                       error_type: str) -> dict[str, Any]:
         row = {
-            "model": model,
-            "label": label,
-            "wall_ms": wall_ms,
-            "server_total_ms": 0,
-            "load_ms": 0,
-            "prompt_eval_ms": 0,
-            "eval_ms": 0,
-            "prompt_tokens": 0,
-            "output_tokens": 0,
-            "prompt_tps": 0,
-            "eval_tps": 0,
+            "model": model, "label": label, "wall_ms": wall_ms,
+            "server_total_ms": 0, "load_ms": 0, "prompt_eval_ms": 0, "eval_ms": 0,
+            "prompt_tokens": 0, "output_tokens": 0, "prompt_tps": 0, "eval_tps": 0,
             **context,
             "gpu_before_util": (gpu_before or {}).get("utilization"),
             "gpu_after_util": (gpu_after or {}).get("utilization"),
             "vram_before_mb": (gpu_before or {}).get("vram_used_mb"),
             "vram_after_mb": (gpu_after or {}).get("vram_used_mb"),
             "vram_total_mb": (gpu_after or gpu_before or {}).get("vram_total_mb"),
-            "success": False,
-            "error_type": str(error_type or "")[:120],
-            "done_reason": "",
+            "success": False, "error_type": str(error_type or "")[:120], "done_reason": "",
         }
         self._insert(row)
         return row
@@ -311,79 +267,56 @@ class LLMPerformanceMonitor:
         if label:
             where.append("label=?")
             params.append(str(label))
-        sql = "SELECT * FROM llm_calls WHERE " + " AND ".join(where) + " ORDER BY id DESC"
-        with self._lock, self._connect() as conn:
-            rows = conn.execute(sql, tuple(params)).fetchall()
+        with self._lock, self._connection() as conn:
+            rows = conn.execute("SELECT * FROM llm_calls WHERE " + " AND ".join(where) + " ORDER BY id DESC", tuple(params)).fetchall()
         return [dict(row) for row in rows]
 
     def summary(self, hours: float = 24, session_only: bool = False, label: str | None = None) -> dict[str, Any]:
-        rows = self._rows(hours=hours, session_only=session_only, label=label)
+        rows = self._rows(hours, session_only, label)
         if not rows:
-            return {
-                "ok": True,
-                "hours": hours,
-                "session_only": session_only,
-                "session_id": self.session_id,
-                "calls": 0,
-                "failures": 0,
-                "cause_codes": [],
-                "rows": [],
-            }
+            return {"ok": True, "hours": hours, "session_only": session_only, "session_id": self.session_id,
+                    "calls": 0, "failures": 0, "cause_codes": [], "rows": []}
 
-        def avg(key: str, only_positive: bool = False) -> float:
-            values = [_safe_float(row.get(key)) for row in rows]
-            if only_positive:
+        def avg(key: str, positive: bool = False) -> float:
+            values = [_float(row.get(key)) for row in rows]
+            if positive:
                 values = [x for x in values if x > 0]
             return round(sum(values) / len(values), 2) if values else 0.0
 
         calls = len(rows)
         failures = sum(1 for row in rows if not bool(row.get("success")))
-        max_wall = round(max(_safe_float(row.get("wall_ms")) for row in rows), 2)
-        avg_wall = avg("wall_ms")
-        avg_server = avg("server_total_ms", True)
-        avg_load = avg("load_ms", True)
-        avg_prompt_eval = avg("prompt_eval_ms", True)
-        avg_eval = avg("eval_ms", True)
-        avg_prompt_tokens = avg("prompt_tokens", True)
-        avg_output_tokens = avg("output_tokens", True)
-        avg_prompt_tps = avg("prompt_tps", True)
-        avg_eval_tps = avg("eval_tps", True)
-        avg_message_count = avg("message_count")
-        avg_tool_count = avg("tool_count")
-        avg_prompt_chars = avg("prompt_chars")
+        avg_wall, avg_server = avg("wall_ms"), avg("server_total_ms", True)
+        avg_load, avg_prompt, avg_eval = avg("load_ms", True), avg("prompt_eval_ms", True), avg("eval_ms", True)
         cold_threshold = float(self.config.get("cold_start_ms", 750) or 750)
-        cold_starts = sum(1 for row in rows if _safe_float(row.get("load_ms")) >= cold_threshold)
+        cold_starts = sum(1 for row in rows if _float(row.get("load_ms")) >= cold_threshold)
 
         vram_percents: list[float] = []
         gpu_utils: list[float] = []
         for row in rows:
-            total = _safe_float(row.get("vram_total_mb"))
+            total = _float(row.get("vram_total_mb"))
             for key in ("vram_before_mb", "vram_after_mb"):
-                used = _safe_float(row.get(key))
+                used = _float(row.get(key))
                 if total > 0 and used > 0:
-                    vram_percents.append(used * 100.0 / total)
+                    vram_percents.append(used * 100 / total)
             for key in ("gpu_before_util", "gpu_after_util"):
-                value = _safe_float(row.get(key))
-                if value >= 0:
-                    gpu_utils.append(value)
-        avg_vram_percent = round(sum(vram_percents) / len(vram_percents), 1) if vram_percents else 0.0
-        max_vram_percent = round(max(vram_percents), 1) if vram_percents else 0.0
-        avg_gpu_util = round(sum(gpu_utils) / len(gpu_utils), 1) if gpu_utils else 0.0
+                if row.get(key) is not None:
+                    gpu_utils.append(_float(row.get(key)))
+        avg_vram = round(sum(vram_percents) / len(vram_percents), 1) if vram_percents else 0.0
+        max_vram = round(max(vram_percents), 1) if vram_percents else 0.0
+        avg_gpu = round(sum(gpu_utils) / len(gpu_utils), 1) if gpu_utils else 0.0
 
         causes: list[str] = []
-        if failures and failures / calls >= 0.20:
+        if failures / calls >= 0.20:
             causes.append("unstable_or_timeout")
-        if cold_starts and cold_starts / calls >= 0.25:
+        if cold_starts / calls >= 0.25:
             causes.append("cold_start")
-        if avg_server > 0:
-            if avg_prompt_eval >= 800 and avg_prompt_eval / avg_server >= float(self.config.get("prompt_heavy_ratio", 0.30)):
-                causes.append("prompt_heavy")
-            if avg_eval >= 1000 and avg_eval / avg_server >= float(self.config.get("generation_heavy_ratio", 0.45)):
-                causes.append("generation_heavy")
-        pressure = float(self.config.get("gpu_pressure_percent", 85.0) or 85.0)
-        if max_vram_percent >= pressure:
+        if avg_server > 0 and avg_prompt >= 800 and avg_prompt / avg_server >= float(self.config.get("prompt_heavy_ratio", 0.30)):
+            causes.append("prompt_heavy")
+        if avg_server > 0 and avg_eval >= 1000 and avg_eval / avg_server >= float(self.config.get("generation_heavy_ratio", 0.45)):
+            causes.append("generation_heavy")
+        if max_vram >= float(self.config.get("gpu_pressure_percent", 85.0) or 85.0):
             causes.append("gpu_memory_pressure")
-        if avg_tool_count >= 12 and avg_prompt_tokens >= 2500:
+        if avg("tool_count") >= 12 and avg("prompt_tokens", True) >= 2500:
             causes.append("tool_context_heavy")
         if avg_wall >= float(self.config.get("slow_response_ms", 6000) or 6000) and not causes:
             causes.append("unattributed_slow")
@@ -392,42 +325,24 @@ class LLMPerformanceMonitor:
         for row in rows:
             model = str(row.get("model") or "?")
             models[model] = models.get(model, 0) + 1
-
         return {
-            "ok": True,
-            "hours": hours,
-            "session_only": session_only,
-            "session_id": self.session_id,
-            "calls": calls,
-            "failures": failures,
-            "avg_wall_ms": avg_wall,
-            "max_wall_ms": max_wall,
-            "avg_server_ms": avg_server,
-            "avg_load_ms": avg_load,
-            "avg_prompt_eval_ms": avg_prompt_eval,
-            "avg_eval_ms": avg_eval,
-            "avg_prompt_tokens": avg_prompt_tokens,
-            "avg_output_tokens": avg_output_tokens,
-            "avg_prompt_tps": avg_prompt_tps,
-            "avg_eval_tps": avg_eval_tps,
-            "avg_message_count": avg_message_count,
-            "avg_tool_count": avg_tool_count,
-            "avg_prompt_chars": avg_prompt_chars,
-            "cold_starts": cold_starts,
-            "avg_vram_percent": avg_vram_percent,
-            "max_vram_percent": max_vram_percent,
-            "avg_gpu_util": avg_gpu_util,
-            "cause_codes": causes,
-            "models": models,
-            "rows": rows[:12],
+            "ok": True, "hours": hours, "session_only": session_only, "session_id": self.session_id,
+            "calls": calls, "failures": failures, "avg_wall_ms": avg_wall,
+            "max_wall_ms": round(max(_float(row.get("wall_ms")) for row in rows), 2),
+            "avg_server_ms": avg_server, "avg_load_ms": avg_load,
+            "avg_prompt_eval_ms": avg_prompt, "avg_eval_ms": avg_eval,
+            "avg_prompt_tokens": avg("prompt_tokens", True), "avg_output_tokens": avg("output_tokens", True),
+            "avg_prompt_tps": avg("prompt_tps", True), "avg_eval_tps": avg("eval_tps", True),
+            "avg_message_count": avg("message_count"), "avg_tool_count": avg("tool_count"),
+            "avg_prompt_chars": avg("prompt_chars"), "cold_starts": cold_starts,
+            "avg_vram_percent": avg_vram, "max_vram_percent": max_vram, "avg_gpu_util": avg_gpu,
+            "cause_codes": causes, "models": models, "rows": rows[:12],
         }
 
     def windows(self) -> dict[str, dict[str, Any]]:
         return {
             "session": self.summary(hours=24 * 30, session_only=True),
-            "15m": self.summary(hours=0.25),
-            "1h": self.summary(hours=1),
-            "24h": self.summary(hours=24),
+            "15m": self.summary(hours=0.25), "1h": self.summary(hours=1), "24h": self.summary(hours=24),
         }
 
     @staticmethod
@@ -446,24 +361,20 @@ class LLMPerformanceMonitor:
     def format_summary(cls, report: dict[str, Any], title: str = "Rendimiento LLM") -> str:
         if not report or not report.get("calls"):
             return f"{title}: todavía no hay llamadas de Ollama medidas en esta ventana."
-        model_text = ", ".join(f"{name}×{count}" for name, count in (report.get("models") or {}).items())
+        models = ", ".join(f"{name}×{count}" for name, count in (report.get("models") or {}).items())
         lines = [
             title,
-            f"- Modelo: {model_text or '?'} · {report.get('calls')} llamadas · {report.get('failures')} fallos",
+            f"- Modelo: {models or '?'} · {report.get('calls')} llamadas · {report.get('failures')} fallos",
             f"- Tiempo: {report.get('avg_wall_ms')} ms prom. · {report.get('max_wall_ms')} ms máx. · servidor {report.get('avg_server_ms')} ms prom.",
             f"- Carga: {report.get('avg_load_ms')} ms · prompt eval: {report.get('avg_prompt_eval_ms')} ms · generación: {report.get('avg_eval_ms')} ms",
             f"- Tokens: prompt {report.get('avg_prompt_tokens')} prom. · salida {report.get('avg_output_tokens')} prom. · generación {report.get('avg_eval_tps')} tok/s",
             f"- Contexto: {report.get('avg_message_count')} mensajes · {report.get('avg_tool_count')} tools · {report.get('avg_prompt_chars')} caracteres aprox.",
         ]
         if report.get("max_vram_percent"):
-            lines.append(
-                f"- GPU: {report.get('avg_gpu_util')}% util. puntual prom. · VRAM {report.get('avg_vram_percent')}% prom. / {report.get('max_vram_percent')}% máx."
-            )
+            lines.append(f"- GPU: {report.get('avg_gpu_util')}% util. puntual prom. · VRAM {report.get('avg_vram_percent')}% prom. / {report.get('max_vram_percent')}% máx.")
         causes = list(report.get("cause_codes") or [])
-        if causes:
-            lines.append("- Causa probable: " + "; ".join(cls._cause_text(code) for code in causes) + ".")
-        else:
-            lines.append("- No aparece un cuello de botella dominante con las muestras disponibles.")
+        lines.append("- Causa probable: " + "; ".join(cls._cause_text(x) for x in causes) + "." if causes
+                     else "- No aparece un cuello de botella dominante con las muestras disponibles.")
         return "\n".join(lines)
 
 
