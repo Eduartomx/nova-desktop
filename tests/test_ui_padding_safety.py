@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 import ast
+import json
 import tempfile
 import unittest
 from pathlib import Path
 
+from assistant.autostart import AutostartManager
+from assistant.instance_commands import InstanceCommandMailbox
+from assistant.instance_lock import InstanceLock
 from assistant.runtime_lifecycle import RuntimeLifecycleManager
+from assistant.tray_controller import TrayController
 
 
 TK_WIDGETS = {
@@ -93,8 +98,7 @@ class ResidentLifecycleTests(unittest.TestCase):
 
     def test_running_hidden_running_does_not_stop_services(self):
         manager, root, ui, _tray = self.make_manager(True)
-        manager.mark_running()
-        manager.request_window_close()
+        manager.mark_running(); manager.request_window_close()
         self.assertEqual(manager.state, "hidden")
         self.assertTrue(root.hidden)
         self.assertFalse(ui._closing)
@@ -108,8 +112,7 @@ class ResidentLifecycleTests(unittest.TestCase):
 
     def test_tray_unavailable_makes_x_close_normally(self):
         manager, root, ui, _tray = self.make_manager(False)
-        manager.mark_running()
-        manager.request_window_close()
+        manager.mark_running(); manager.request_window_close()
         self.assertEqual(manager.state, "stopped")
         self.assertTrue(ui._closing)
         self.assertEqual(root.destroy_calls, 1)
@@ -125,6 +128,89 @@ class ResidentLifecycleTests(unittest.TestCase):
         self.assertEqual(ui.perception.stop_calls, 1)
         self.assertEqual(ui.llm_warm_manager.unload_calls, 1)
         self.assertEqual(tray.stop_calls, 1)
+
+
+class _Locker:
+    def __init__(self): self.locked = False
+    def acquire(self, _stream):
+        if self.locked: return False
+        self.locked = True; return True
+    def release(self, _stream): self.locked = False
+
+
+class InstanceRuntimeTests(unittest.TestCase):
+    def test_second_instance_can_signal_show_and_lock_recovers(self):
+        with tempfile.TemporaryDirectory() as td:
+            folder = Path(td); locker = _Locker()
+            first = InstanceLock(path=folder / "nova.lock", locker=locker)
+            second = InstanceLock(path=folder / "nova.lock", locker=locker)
+            mailbox = InstanceCommandMailbox(folder / "nova.command")
+            self.assertTrue(first.acquire())
+            self.assertFalse(second.acquire())
+            self.assertTrue(mailbox.send("show"))
+            self.assertEqual(mailbox.consume()["command"], "show")
+            first.release()
+            self.assertTrue(second.acquire())
+            second.release()
+
+    def test_command_mailbox_rejects_malformed_input(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "nova.command"
+            path.write_text(json.dumps({"command": "anything"}), encoding="utf-8")
+            message = InstanceCommandMailbox(path).consume()
+            self.assertFalse(message["ok"])
+            self.assertEqual(message["error"], "invalid_message")
+
+
+class _Registry:
+    def __init__(self): self.values = {}
+    def read(self, name): return self.values.get(name)
+    def write(self, name, value): self.values[name] = value
+    def delete(self, name): self.values.pop(name, None)
+
+
+class AutostartTests(unittest.TestCase):
+    def test_enable_disable_is_idempotent_and_quotes_spaced_install(self):
+        with tempfile.TemporaryDirectory(prefix="Nova Resident Test ") as td:
+            root = Path(td)
+            pyw = root / ".venv" / "Scripts" / "pythonw.exe"
+            pyw.parent.mkdir(parents=True); pyw.write_text("", encoding="utf-8")
+            (root / "app.py").write_text("", encoding="utf-8")
+            backend = _Registry(); manager = AutostartManager(root, backend=backend)
+            self.assertIn("--background", manager.command())
+            self.assertIn('"', manager.command())
+            self.assertTrue(manager.set_enabled(True))
+            self.assertTrue(manager.is_enabled())
+            self.assertTrue(manager.set_enabled(True))
+            self.assertTrue(manager.set_enabled(False))
+            self.assertFalse(manager.status()["present"])
+
+
+class _Icon:
+    def __init__(self): self.run_calls = 0; self.stop_calls = 0
+    def run_detached(self): self.run_calls += 1
+    def stop(self): self.stop_calls += 1
+    def notify(self, *_args): pass
+    def update_menu(self): pass
+
+
+class TrayMockTests(unittest.TestCase):
+    def test_tray_start_is_idempotent(self):
+        icon = _Icon(); made = []
+        ui = type("UI", (), {"config": {}, "agent": None})()
+        lifecycle = type("Lifecycle", (), {"show_window": lambda self: True, "request_shutdown": lambda self, reason: True})()
+        tray = TrayController(ui, lifecycle, icon_factory=lambda _tray: made.append(True) or icon)
+        self.assertTrue(tray.start()); self.assertTrue(tray.start())
+        self.assertEqual(len(made), 1); self.assertEqual(icon.run_calls, 1)
+        tray.stop(); self.assertEqual(icon.stop_calls, 1)
+
+    def test_tray_failure_is_degraded(self):
+        ui = type("UI", (), {"config": {}, "agent": None})()
+        lifecycle = object()
+        tray = TrayController(ui, lifecycle, icon_factory=lambda _tray: (_ for _ in ()).throw(RuntimeError("tray unavailable")))
+        self.assertFalse(tray.start())
+        self.assertTrue(tray.degraded)
+        self.assertFalse(tray.available)
 
 
 if __name__ == "__main__":
