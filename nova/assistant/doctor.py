@@ -14,6 +14,7 @@ from typing import Any, Callable
 
 import psutil
 
+from .llm_performance import get_llm_performance
 from .perception import get_perception
 from .profiler import get_profiler
 from .self_repair import SelfRepairManager
@@ -142,7 +143,7 @@ class NovaDoctor:
         host = str(self.config.get("ollama_host", "http://127.0.0.1:11434")).rstrip("/")
         model = str(self.config.get("model", "qwen3.5:4b"))
         try:
-            req = urllib.request.Request(host + "/api/tags", headers={"User-Agent": "Nova-Doctor/0.7.0"})
+            req = urllib.request.Request(host + "/api/tags", headers={"User-Agent": "Nova-Doctor/0.9.3"})
             with urllib.request.urlopen(req, timeout=2.5) as r:
                 data = json.load(r)
             names = {str(x.get("name") or x.get("model") or "") for x in data.get("models", [])}
@@ -256,9 +257,23 @@ class NovaDoctor:
         except Exception:
             report["repairs"] = []
         try:
-            report["performance"] = get_profiler(self.config).summary(hours=24)
+            profiler = get_profiler(self.config)
+            windows = profiler.windows()
+            report["performance_windows"] = windows
+            # Compatibilidad: `performance` ahora representa la sesión actual y
+            # evita mezclar una versión recién actualizada con eventos antiguos.
+            report["performance"] = windows.get("session") or {"ok": False, "operations": []}
         except Exception:
             report["performance"] = {"ok": False, "operations": []}
+            report["performance_windows"] = {}
+        try:
+            llm_monitor = get_llm_performance(self.config)
+            llm_windows = llm_monitor.windows()
+            report["llm_performance_windows"] = llm_windows
+            report["llm_performance"] = llm_windows.get("session") or {"ok": False, "calls": 0}
+        except Exception:
+            report["llm_performance"] = {"ok": False, "calls": 0}
+            report["llm_performance_windows"] = {}
         return report
 
     @staticmethod
@@ -282,5 +297,13 @@ class NovaDoctor:
         perf = report.get("performance") if isinstance(report.get("performance"), dict) else {}
         slow = list(perf.get("slow_operations") or [])
         if slow:
-            lines += ["", "Rendimiento: " + ", ".join(f"{x.get('operation')} {x.get('avg_ms')} ms" for x in slow[:4])]
+            lines += ["", "Rendimiento de esta sesión: " + ", ".join(f"{x.get('operation')} {x.get('avg_ms')} ms" for x in slow[:4])]
+
+        llm = report.get("llm_performance") if isinstance(report.get("llm_performance"), dict) else {}
+        if llm.get("calls"):
+            lines.append(
+                "LLM esta sesión: "
+                f"{llm.get('avg_wall_ms')} ms prom. · {llm.get('avg_eval_tps')} tok/s · "
+                f"carga {llm.get('avg_load_ms')} ms · prompt {llm.get('avg_prompt_eval_ms')} ms · generación {llm.get('avg_eval_ms')} ms"
+            )
         return "\n".join(lines)
