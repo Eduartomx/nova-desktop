@@ -28,6 +28,26 @@ def fast_direct_intent(text: str) -> str | None:
     if not t:
         return None
 
+    resident_exact = {
+        "nova estas ejecutandote en segundo plano": "resident_status",
+        "estas ejecutandote en segundo plano": "resident_status",
+        "nova estas en segundo plano": "resident_status",
+        "estas en segundo plano": "resident_status",
+        "nova ocultate en la bandeja": "resident_hide",
+        "ocultate en la bandeja": "resident_hide",
+        "nova muestrate": "resident_show",
+        "muestrate": "resident_show",
+        "muestra nova": "resident_show",
+        "nova no inicies con windows": "resident_autostart_off",
+        "no inicies con windows": "resident_autostart_off",
+        "desactiva inicio con windows": "resident_autostart_off",
+        "nova inicia con windows": "resident_autostart_on",
+        "inicia con windows": "resident_autostart_on",
+        "activa inicio con windows": "resident_autostart_on",
+    }
+    if t in resident_exact:
+        return resident_exact[t]
+
     # Evita interceptar preguntas sobre versiones de Python/Ollama/modelos/apps.
     foreign_version = any(x in t for x in ("python", "ollama", "qwen", "groq", "cerebras", "windows", "driver", "cuda"))
     if not foreign_version and (
@@ -115,6 +135,40 @@ def _format_workspace(agent) -> str:
     )
 
 
+def _resident_route(agent, action: str) -> str:
+    from .runtime_lifecycle import get_current_lifecycle
+
+    lifecycle = get_current_lifecycle()
+    if lifecycle is None:
+        return "Resident Mode todavía no está disponible en esta sesión."
+
+    if action == "resident_status":
+        status = lifecycle.status()
+        tray = status.get("tray") or {}
+        visible = "oculta en la bandeja" if status.get("window_hidden") else "con la ventana visible"
+        tray_text = "bandeja activa" if tray.get("available") else "bandeja no disponible"
+        return f"Estado residente: {status.get('state')} · {visible} · {tray_text}."
+    if action == "resident_hide":
+        return "Seguiré activa en segundo plano." if lifecycle.hide_window() else "No me ocultaré porque la bandeja no está disponible."
+    if action == "resident_show":
+        lifecycle.show_window()
+        return "Ventana de Nova restaurada."
+
+    manager = getattr(lifecycle, "autostart", None)
+    if manager is None:
+        return "El inicio con Windows no está disponible en esta sesión."
+    enabled = action == "resident_autostart_on"
+    if not manager.set_enabled(enabled):
+        return "No pude cambiar el inicio con Windows."
+    agent.config.setdefault("resident_mode", {})["start_with_windows"] = enabled
+    try:
+        from .config import save_config
+        save_config(agent.config)
+    except Exception:
+        return "El inicio con Windows cambió en el sistema, pero no pude actualizar config.json."
+    return "Inicio con Windows activado." if enabled else "Inicio con Windows desactivado."
+
+
 def install_agent_fast_routing():
     from . import agent as mod
 
@@ -131,7 +185,10 @@ def install_agent_fast_routing():
             return original_ask(self, user_text)
 
         self._last_fast_route = action
-        if action == "version":
+        if action.startswith("resident_"):
+            result = _resident_route(self, action)
+            self._last_tool_trace = [{"name": action, "ok": not result.startswith("No pude")}]
+        elif action == "version":
             result = f"Soy Nova v{_read_version()}."
             self._last_tool_trace = [{"name": "nova_version", "ok": True}]
         elif action == "system_status":
@@ -146,7 +203,6 @@ def install_agent_fast_routing():
             result = _format_workspace(self)
             self._last_tool_trace = [{"name": "active_workspace", "ok": True}]
 
-        # Mantiene continuidad conversacional sin activar el pipeline costoso.
         try:
             self.memory.add_message("user", text)
             self.memory.add_message("assistant", result)
