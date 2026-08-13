@@ -60,13 +60,27 @@ class GamingDetectionFilterTests(unittest.TestCase):
         self.assertIsNone(self._manager()._scan_processes())
 
     @patch("assistant.gaming_detection_filters.psutil.process_iter")
-    def test_explicit_game_process_overrides_ignore(self, process_iter):
+    def test_wallpaper_explicit_game_process_cannot_override_mandatory_ignore(self, process_iter):
         process_iter.return_value = [
             FakeProcess(303, "wallpaper64.exe", "C:/Steam/steamapps/common/wallpaper_engine/wallpaper64.exe")
         ]
-        report = self._manager(game_processes=["wallpaper64.exe"])._scan_processes()
+        report = self._manager(
+            game_processes=["wallpaper64.exe"],
+            ignored_game_processes=["wallpaper64.exe"],
+        )._scan_processes()
+        self.assertIsNone(report)
+
+    @patch("assistant.gaming_detection_filters.psutil.process_iter")
+    def test_configurable_ignore_can_still_be_overridden_explicitly(self, process_iter):
+        process_iter.return_value = [
+            FakeProcess(304, "steam.exe", "C:/Program Files/Steam/steam.exe")
+        ]
+        report = self._manager(
+            game_processes=["steam.exe"],
+            ignored_game_processes=["steam.exe"],
+        )._scan_processes()
         self.assertIsNotNone(report)
-        self.assertEqual(report["pid"], 303)
+        self.assertEqual(report["pid"], 304)
         self.assertEqual(report["source"], "process")
 
     @patch("assistant.gaming_detection_filters.psutil.process_iter")
