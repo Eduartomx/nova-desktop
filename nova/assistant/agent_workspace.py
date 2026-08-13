@@ -56,7 +56,11 @@ def install_agent_v060():
             # Ruta barata por defecto: SQLite/lexical, sin Ollama.
             memories = self.memory.search_memory_lexical(query, limit=limit, workspace_id=wid)
             mode = str(cfg.get('semantic_context_mode', 'adaptive') or 'adaptive').casefold()
-            if mode == 'always' or (mode != 'never' and memory_query_needs_semantic(query)):
+            try:
+                has_memory = bool(self.memory.recent_memory_items(1, workspace_id=wid))
+            except Exception:
+                has_memory = bool(memories)
+            if has_memory and (mode == 'always' or (mode != 'never' and memory_query_needs_semantic(query))):
                 memories = self.memory.search_memory(query, limit=limit, workspace_id=wid)
         tasks = [t for t in self.memory.list_tasks(12) if t.get('workspace_id') == wid][:5] if active else []
         ws_text = WorkspaceManager.compact_context(active)
