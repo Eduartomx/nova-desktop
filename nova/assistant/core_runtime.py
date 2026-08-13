@@ -6,8 +6,9 @@ Desde v0.6.7 Memory/Workspace/Semantic Memory/Continuity y Nova Doctor son
 módulos nativos administrados por GitHub. En v0.7 Perception Engine, Context
 Intelligence, Workspace Auto-Detection, Anomaly Detection y Event-driven Vision
 se suman como dominios nativos. En v0.8 Skills Engine añade playbooks locales,
-Confidence Engine evalúa respaldo, Expert Escalation aporta segunda opinión y
-Learn from Expert convierte soluciones verificadas en conocimiento reutilizable.
+Confidence Engine evalúa respaldo, Expert Escalation aporta segunda opinión,
+Learn from Expert convierte soluciones verificadas en conocimiento reutilizable
+y Experience & Reliability vigila si esas Skills siguen funcionando con el tiempo.
 Agent/Tools/UI/TaskEngine todavía usan la base histórica local v0.5, por lo que
 aquí se instalan únicamente adaptadores por dominio.
 """
@@ -25,8 +26,13 @@ def install_core_runtime():
     from .expert_resilience import install_expert_resilience
     install_expert_resilience()
 
-    # Herramientas por dominio. Learning se registra antes de Confidence para que
-    # sus llamadas también queden observables por la instrumentación normal.
+    # Reliability enlaza SkillRegistry antes de crear instancias. Los hooks solo
+    # observan metadatos de ejecución/versionado; no persisten contenido.
+    from .experience_reliability import install_skill_reliability_hooks
+    install_skill_reliability_hooks()
+
+    # Herramientas por dominio. Learning/Reliability se registran antes de
+    # Confidence para que sus llamadas también queden observables normalmente.
     from .tools_workspace import install_tools_v060
     from .tools_workspace_index import install_tools_v061
     from .tools_semantic import install_tools_v063
@@ -38,6 +44,7 @@ def install_core_runtime():
     from .tools_anomaly import install_tools_anomaly
     from .tools_vision import install_tools_vision
     from .tools_skills import install_tools_skills
+    from .tools_reliability import install_tools_reliability
     from .tools_expert import install_tools_expert
     from .tools_learning import install_tools_learning
     from .tools_confidence import install_tools_confidence
@@ -52,12 +59,14 @@ def install_core_runtime():
     install_tools_anomaly()
     install_tools_vision()
     install_tools_skills()
+    install_tools_reliability()
     install_tools_expert()
     install_tools_learning()
     install_tools_confidence()
 
     # Confidence observa la petición normal completa; Expert reacciona al
-    # assessment y Learning queda por fuera para capturar la opinión resultante.
+    # assessment, Learning captura la opinión y Reliability queda al exterior para
+    # exponer alertas/estado sin interferir con la ejecución de la Skill.
     from .agent_workspace import install_agent_v060
     from .agent_semantic import install_agent_v063
     from .agent_continuity import install_agent_v065
@@ -69,6 +78,7 @@ def install_core_runtime():
     from .agent_confidence import install_agent_confidence
     from .agent_expert import install_agent_expert
     from .agent_learning import install_agent_learning
+    from .agent_reliability import install_agent_reliability
     install_agent_v060()
     install_agent_v063()
     install_agent_v065()
@@ -80,6 +90,7 @@ def install_core_runtime():
     install_agent_confidence()
     install_agent_expert()
     install_agent_learning()
+    install_agent_reliability()
 
     # UI y hooks del profiler al final.
     from .ui_workspace import install_ui_v060
@@ -91,6 +102,7 @@ def install_core_runtime():
     from .ui_anomaly import install_ui_anomaly
     from .ui_vision import install_ui_vision
     from .ui_skills import install_ui_skills
+    from .ui_reliability import install_ui_reliability
     from .ui_expert import install_ui_expert
     from .profiler_hooks import install_profiler_v066
     install_ui_v060()
@@ -102,6 +114,7 @@ def install_core_runtime():
     install_ui_anomaly()
     install_ui_vision()
     install_ui_skills()
+    install_ui_reliability()
     install_ui_expert()
     install_profiler_v066()
 
@@ -127,7 +140,7 @@ def architecture_status() -> dict:
             "continuity", "doctor", "profiler", "self_repair", "perception",
             "context_intelligence", "workspace_autodetect", "anomaly_detection",
             "event_driven_vision", "skills", "confidence", "expert_escalation",
-            "expert_resilience", "learn_from_expert",
+            "expert_resilience", "learn_from_expert", "experience_reliability",
         ],
         "compatibility_adapters": ["agent", "tools", "ui", "task_engine"],
         "versioned_runtime_chain": False,
