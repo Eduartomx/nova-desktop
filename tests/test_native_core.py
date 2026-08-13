@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -85,9 +88,25 @@ class NativeCoreTests(unittest.TestCase):
             self.assertEqual([x["status"] for x in stored["steps"]], ["completed", "completed"])
 
     def test_ui_exposes_stable_adapter_contract(self):
-        # No creamos Tk en CI/headless; compileall cubre el cuerpo visual.
         for name in ("_build", "_append", "_send", "_close", "_show_window", "_start_recording", "_stop_recording"):
             self.assertTrue(callable(getattr(AssistantUI, name, None)), name)
+
+    def test_full_core_runtime_installs_in_clean_subprocess(self):
+        code = (
+            "from assistant.core_runtime import install_core_runtime, architecture_status; "
+            "install_core_runtime(); s=architecture_status(); "
+            "assert s['ok']; assert not s['unmanaged_core_files']; "
+            "from assistant.tools import TOOL_SCHEMAS; "
+            "names={x['function']['name'] for x in TOOL_SCHEMAS}; "
+            "assert {'browser_open','uia_snapshot','skill_run','confidence_status'} <= names; "
+            "print('native-core-ok')"
+        )
+        env = dict(os.environ)
+        nova_dir = Path(__file__).resolve().parents[1] / "nova"
+        env["PYTHONPATH"] = str(nova_dir) + os.pathsep + env.get("PYTHONPATH", "")
+        cp = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, env=env, timeout=20)
+        self.assertEqual(cp.returncode, 0, cp.stdout + "\n" + cp.stderr)
+        self.assertIn("native-core-ok", cp.stdout)
 
 
 if __name__ == "__main__":
