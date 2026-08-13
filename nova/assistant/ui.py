@@ -68,8 +68,11 @@ class AssistantUI:
         self.send_button = tk.Button(composer, text="Enviar", command=self._send_from_entry, width=10)
         self.send_button.pack(side="left", padx=(8, 0))
 
-        foot = tk.Frame(self.root, padx=12, pady=(0, 8))
-        foot.pack(fill="x")
+        # `Frame(..., padx/pady=...)` configura padding interno de Tk y solo
+        # acepta una distancia escalar. El padding asimétrico pertenece al
+        # geometry manager (`pack`), que sí admite (antes, después).
+        foot = tk.Frame(self.root, padx=12)
+        foot.pack(fill="x", pady=(0, 8))
         hotkey = str(self.config.get("hotkey", "<ctrl>+<alt>+<space>"))
         tk.Label(foot, text=f"Atajo: {hotkey} · Contexto: Ctrl+Shift+Espacio · Voz: F9", anchor="w", fg="#666").pack(fill="x")
 
