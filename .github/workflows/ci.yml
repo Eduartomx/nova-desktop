@@ -10,23 +10,40 @@ permissions:
 
 jobs:
   test:
+    name: Ubuntu tests
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-
       - name: Install test runtime dependencies
         run: python -m pip install --disable-pip-version-check psutil pillow requests beautifulsoup4
-
       - name: Compile source
         run: python -m compileall -q nova
-
       - name: Nova test suite
         env:
-          PYTHONPATH: ${{ github.workspace }}/nova
+          PYTHONPATH: nova
+        run: python -m unittest discover -s tests -v
+
+  windows-smoke:
+    name: Windows / Python 3.11
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install test runtime dependencies
+        run: python -m pip install --disable-pip-version-check psutil pillow requests beautifulsoup4
+      - name: Compile source on Windows
+        run: python -m compileall -q nova
+      - name: Nova test suite on Windows
+        env:
+          PYTHONPATH: nova
         run: python -m unittest discover -s tests -v
