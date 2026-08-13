@@ -72,6 +72,7 @@ def install_ui_gaming_events():
         if manager is not None and hasattr(manager, "add_state_listener"):
             try:
                 manager.add_state_listener(listener)
+                self._gaming_event_queue.put(("initial", manager.status(refresh=False)))
             except Exception:
                 pass
         try:
