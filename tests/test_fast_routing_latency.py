@@ -87,7 +87,8 @@ print(json.dumps({
 
     def test_runtime_fast_routes_bypass_llm_and_semantic_memory(self):
         row = self._run_runtime_probe()
-        self.assertIn("Nova v0.9.2", row["version"])
+        expected_version = (ROOT / "nova" / "NOVA_VERSION.txt").read_text(encoding="utf-8").strip()
+        self.assertIn(f"Nova v{expected_version}", row["version"])
         self.assertEqual(row["route"], "version")
         self.assertEqual(row["ollama_calls"], 0)
         self.assertEqual(row["semantic_calls"], 0)
