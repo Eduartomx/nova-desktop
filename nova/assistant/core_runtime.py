@@ -17,10 +17,16 @@ def install_core_runtime():
     if _INSTALLED:
         return
 
-    # Debe instalarse antes de que app.py importe load_config: 0.9.4 añade los
-    # defaults del Warm Manager y migra los atajos antiguos con Espacio.
+    # Deben instalarse antes de que app.py importe load_config.
     from .config_instant_wake import install_config_instant_wake
     install_config_instant_wake()
+    from .config_gaming import install_config_gaming
+    install_config_gaming()
+
+    # Gaming Mode puede reducir temporalmente el polling de Perception sin
+    # reiniciar su hilo ni cambiar el valor persistente del usuario.
+    from .perception_gaming import install_perception_gaming
+    install_perception_gaming()
 
     from .expert_resilience import install_expert_resilience
     install_expert_resilience()
@@ -77,6 +83,7 @@ def install_core_runtime():
     from .agent_reliability import install_agent_reliability
     from .agent_fast_routing import install_agent_fast_routing
     from .agent_instant_wake import install_agent_instant_wake
+    from .agent_gaming import install_agent_gaming
     install_agent_v060()
     install_agent_v063()
     install_agent_v065()
@@ -89,11 +96,12 @@ def install_core_runtime():
     install_agent_expert()
     install_agent_learning()
     install_agent_reliability()
-    # Fast Routing sigue por fuera del pipeline de dominios. Instant Wake se
-    # instala después para envolver la ruta final y añadir keep_alive sin romper
-    # las rutas deterministas ya existentes.
+    # Fast Routing sigue por fuera del pipeline de dominios. Instant Wake añade
+    # keep_alive y Gaming Awareness envuelve finalmente los comandos directos y
+    # la política temporal de VRAM.
     install_agent_fast_routing()
     install_agent_instant_wake()
+    install_agent_gaming()
 
     from .ui_workspace import install_ui_v060
     from .ui_semantic import install_ui_v063
@@ -108,6 +116,7 @@ def install_core_runtime():
     from .ui_expert import install_ui_expert
     from .ui_voice_wake import install_ui_voice_wake
     from .ui_instant_wake import install_ui_instant_wake
+    from .ui_gaming import install_ui_gaming
     from .profiler_hooks import install_profiler_v066
     install_ui_v060()
     install_ui_v063()
@@ -121,9 +130,10 @@ def install_core_runtime():
     install_ui_reliability()
     install_ui_expert()
     install_ui_voice_wake()
-    # Última capa visual: necesita ver Doctor ya instalado y reemplaza el
-    # registrador de hotkeys antes de que exista una instancia de AssistantUI.
     install_ui_instant_wake()
+    # Gaming Awareness va después de Instant Wake porque coordina su Warm
+    # Manager y añade estado visual/Doctor sobre la UI final.
+    install_ui_gaming()
     install_profiler_v066()
 
     _INSTALLED = True
@@ -148,6 +158,7 @@ def architecture_status() -> dict:
         "desktop_browser_control", "file_write_safety", "voice_wake",
         "fast_routing", "adaptive_memory_context", "llm_performance_intelligence", "llm_benchmark",
         "llm_warm_manager", "instant_wake", "configurable_hotkeys",
+        "gaming_awareness", "gaming_vram_policy", "gaming_perception_throttle",
         "agent", "tools", "ui", "task_engine",
     ]
     return {
