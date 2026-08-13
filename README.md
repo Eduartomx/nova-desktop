@@ -4,9 +4,24 @@ Nova es un asistente virtual local para Windows: Ollama + herramientas reales de
 
 ## Estado actual
 
-**Nova v0.9.3 — LLM Performance Intelligence**
+**Nova v0.9.4 — Instant Wake & Hotkeys**
 
 GitHub es la fuente oficial. Las Releases estables se sincronizan por tag mediante el updater nativo, con verificación de Git blob SHA, backup y rollback. No hacen falta ZIPs de Release.
+
+## Qué cambia en 0.9.4
+
+0.9.4 usa las métricas obtenidas en 0.9.3 para atacar el cold start sin cambiar de modelo:
+
+- `LLMWarmManager` precarga Qwen localmente en segundo plano al iniciar Nova mediante una petición vacía de Ollama;
+- las inferencias normales renuevan un `keep_alive` centralizado de 20 minutos por defecto, evitando recargas innecesarias sin reservar VRAM indefinidamente;
+- Nova consulta `/api/ps` para mostrar si el modelo está cargado, la VRAM reportada por Ollama y su expiración;
+- `Nova, ¿Qwen está cargado?`, `Nova, precarga Qwen` y `Nova, libera la VRAM` son rutas locales deterministas;
+- al cerrar Nova el modelo se descarga de Ollama por defecto;
+- el atajo principal pasa a **Ctrl+Alt+N** y el de contexto a **Ctrl+Alt+Shift+N**;
+- los antiguos defaults basados en Espacio se migran automáticamente;
+- el botón **⚙ Atajos** permite validar, guardar y aplicar nuevas combinaciones globales sin reiniciar Nova.
+
+La precarga usa `messages: []`: no envía prompts, respuestas ni resultados a servicios externos. Gaming Awareness todavía no actúa automáticamente en 0.9.4, pero el estado cargado/descargado, la descarga voluntaria y la política de keep-alive dejan preparada esa integración.
 
 ## Qué cambia en 0.9.3
 
@@ -51,7 +66,7 @@ Hasta 0.8.x, `agent.py`, `tools.py`, `ui.py` y `task_engine.py` seguían siendo 
 - `assistant/agent.py` pasa a ser un `LocalAgent` administrado por GitHub;
 - `assistant/tools.py` pasa a contener el contrato base de `LocalTools`;
 - `assistant/ui.py` pasa a contener la UI base administrada;
-- `assistant/task_engine.py` pasa a contener `TaskEngine`/`AutonomyEngine` administrados;
+- `assistant/task_engine.py` pasa a contener `TaskEngine`/`AutonomyEngine` administrado;
 - CI valida que un checkout limpio pueda importar el core y montar los adaptadores de dominio;
 - `architecture_status()` ya no declara archivos core locales/no administrados.
 
@@ -77,8 +92,8 @@ Nova conserva control estructurado por UI Automation y ventanas antes de recurri
 
 ### Voz
 
-- hotkey global: **Ctrl + Alt + Espacio**;
-- contexto: **Ctrl + Shift + Espacio**;
+- hotkey global: **Ctrl + Alt + N**;
+- contexto: **Ctrl + Alt + Shift + N**;
 - push-to-talk: **F9**;
 - STT local con faster-whisper;
 - TTS local;
@@ -126,13 +141,13 @@ Las claves solo se leen desde variables de entorno; nunca deben guardarse en Ski
 
 MemoryStore, Workspace Intelligence, Semantic Memory y Continuity son locales. Semantic Memory usa Ollama para embeddings y mantiene búsqueda léxica como fallback. Desde 0.9.2 el contexto automático usa recuperación semántica de forma adaptativa para no pagar el coste de embeddings en preguntas simples.
 
-La UI 0.9 evita comprobar activamente Ollama durante el arranque solo para mostrar el estado de Semantic Memory; Nova Doctor conserva la comprobación explícita.
+Desde 0.9.4 la UI puede precargar explícitamente el LLM principal mediante Warm Manager; esta operación es independiente de Semantic Memory y no ejecuta una consulta de usuario.
 
 ## Privacidad
 
 No deben subirse: `config.json` real, `data/`, bases SQLite, perfil del navegador, screenshots, logs personales, `.venv/`, tokens ni API keys.
 
-Perception no captura teclado/portapapeles/screenshots periódicamente. Event-driven Vision no conserva imágenes por defecto. Confidence, Expert Escalation, Learn from Expert y Skill Reliability guardan metadatos limitados y no el contenido completo que evalúan. LLM Performance Intelligence guarda únicamente métricas técnicas, conteos y muestras puntuales de recursos; nunca persiste el texto del prompt o de la respuesta.
+Perception no captura teclado/portapapeles/screenshots periódicamente. Event-driven Vision no conserva imágenes por defecto. Confidence, Expert Escalation, Learn from Expert y Skill Reliability guardan metadatos limitados y no el contenido completo que evalúan. LLM Performance Intelligence guarda únicamente métricas técnicas, conteos y muestras puntuales de recursos; nunca persiste el texto del prompt o de la respuesta. Instant Wake usa una petición local con `messages: []` y no transmite contenido a servicios externos.
 
 ## Estructura 0.9
 
@@ -140,10 +155,15 @@ Perception no captura teclado/portapapeles/screenshots periódicamente. Event-dr
 nova/assistant/
 ├─ agent.py                 # core GitHub-managed + instrumentación Ollama
 ├─ agent_fast_routing.py    # rutas deterministas de baja latencia
+├─ agent_instant_wake.py    # keep_alive + comandos Warm Manager
 ├─ llm_performance.py       # métricas locales detalladas de inferencia
 ├─ llm_benchmark.py         # benchmark explícito y acotado
+├─ llm_warm.py              # precarga/descarga/estado de Ollama
+├─ hotkeys.py               # normalización y validación de atajos
+├─ config_instant_wake.py   # defaults/migración 0.9.4
 ├─ tools.py                 # core GitHub-managed
 ├─ ui.py                    # core GitHub-managed
+├─ ui_instant_wake.py       # estado LLM + editor de hotkeys
 ├─ task_engine.py           # core GitHub-managed
 ├─ core_runtime.py          # bootstrap único
 ├─ tools_desktop.py         # Browser Agent + UIA/input administrados
