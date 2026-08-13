@@ -3,8 +3,27 @@ from __future__ import annotations
 import threading
 
 from .doctor import NovaDoctor
+from .llm_performance import get_llm_performance
 from .profiler import get_profiler
 from .self_repair import SelfRepairManager
+
+
+def _format_llm_windows(windows):
+    labels = (("session", "Sesión actual"), ("15m", "Últimos 15 min"), ("1h", "Última hora"), ("24h", "Últimas 24 h"))
+    lines = ["LLM por ventana"]
+    for key, label in labels:
+        report = (windows or {}).get(key) or {}
+        if not report.get("calls"):
+            lines.append(f"- {label}: sin llamadas")
+            continue
+        line = (
+            f"- {label}: {report.get('calls')} llamadas · {report.get('avg_wall_ms')} ms prom. · "
+            f"{report.get('avg_eval_tps')} tok/s"
+        )
+        if report.get("failures"):
+            line += f" · {report.get('failures')} fallos"
+        lines.append(line)
+    return "\n".join(lines)
 
 
 def install_ui_v066():
@@ -40,9 +59,22 @@ def install_ui_v066():
             return
 
         text = NovaDoctor.format_text(report)
-        perf = report.get("performance") if isinstance(report.get("performance"), dict) else {}
-        if perf:
-            text += "\n\n" + get_profiler(self.config).format_summary(perf)
+        profiler = get_profiler(self.config)
+        perf_windows = report.get("performance_windows") if isinstance(report.get("performance_windows"), dict) else {}
+        if perf_windows:
+            text += "\n\n" + profiler.format_windows(perf_windows)
+        else:
+            perf = report.get("performance") if isinstance(report.get("performance"), dict) else {}
+            if perf:
+                text += "\n\n" + profiler.format_summary(perf)
+
+        llm_monitor = get_llm_performance(self.config)
+        llm_windows = report.get("llm_performance_windows") if isinstance(report.get("llm_performance_windows"), dict) else {}
+        if llm_windows:
+            text += "\n\n" + _format_llm_windows(llm_windows)
+            session = llm_windows.get("session") or {}
+            text += "\n\n" + llm_monitor.format_summary(session, title="Detalle LLM · sesión actual")
+
         widget = self.doctor_text
         if widget is not None:
             widget.configure(state="normal")
@@ -135,8 +167,8 @@ def install_ui_v066():
         win = tk.Toplevel(self.root)
         self.doctor_window = win
         win.title("Nova Doctor · Reparación y rendimiento")
-        win.geometry("820x650")
-        win.minsize(650, 480)
+        win.geometry("860x700")
+        win.minsize(680, 500)
 
         head = tk.Frame(win, padx=12, pady=10)
         head.pack(fill="x")
