@@ -37,14 +37,25 @@ class CoreConsolidationTests(unittest.TestCase):
             self.assertFalse(hasattr(MemoryStore, "_nova_v063_patched"))
             self.assertFalse(hasattr(MemoryStore, "_nova_v065_patched"))
 
-    def test_architecture_contract_has_no_versioned_runtime_chain(self):
+    def test_core_files_are_repository_managed(self):
+        assistant_dir = Path(__file__).resolve().parents[1] / "nova" / "assistant"
+        for filename in ("agent.py", "tools.py", "ui.py", "task_engine.py"):
+            path = assistant_dir / filename
+            self.assertTrue(path.is_file(), filename)
+            self.assertGreater(path.stat().st_size, 500, filename)
+
+    def test_architecture_contract_has_managed_core_and_no_local_contract(self):
         status = architecture_status()
         self.assertEqual(status["bootstrap"], "assistant.core_runtime")
         self.assertFalse(status["versioned_runtime_chain"])
-        self.assertIn("memory", status["github_managed_native"])
-        self.assertIn("perception", status["github_managed_native"])
-        self.assertIn("skills", status["github_managed_native"])
-        self.assertIn("agent", status["compatibility_adapters"])
+        self.assertEqual(status.get("legacy_local_contract"), {})
+        self.assertEqual(status.get("unmanaged_core_files"), [])
+        managed = status.get("github_managed_core") or {}
+        self.assertEqual(set(managed), {"agent", "tools", "ui", "task_engine"})
+        self.assertTrue(all(managed.values()))
+        for name in ("memory", "perception", "skills", "agent", "tools", "ui", "task_engine"):
+            self.assertIn(name, status["github_managed_native"])
+        self.assertIn("agent_domain", status["compatibility_adapters"])
 
 
 if __name__ == "__main__":
