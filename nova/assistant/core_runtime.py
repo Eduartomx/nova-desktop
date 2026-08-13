@@ -2,15 +2,10 @@ from __future__ import annotations
 
 """Bootstrap consolidado de Nova.
 
-Desde v0.6.7 Memory/Workspace/Semantic Memory/Continuity y Nova Doctor son
-módulos nativos administrados por GitHub. En v0.7 Perception Engine, Context
-Intelligence, Workspace Auto-Detection, Anomaly Detection y Event-driven Vision
-se suman como dominios nativos. En v0.8 Skills Engine añade playbooks locales,
-Confidence Engine evalúa respaldo, Expert Escalation aporta segunda opinión,
-Learn from Expert convierte soluciones verificadas en conocimiento reutilizable
-y Experience & Reliability vigila si esas Skills siguen funcionando con el tiempo.
-Agent/Tools/UI/TaskEngine todavía usan la base histórica local v0.5, por lo que
-aquí se instalan únicamente adaptadores por dominio.
+Desde v0.9.0 Agent, LocalTools, AssistantUI y TaskEngine también viven en
+GitHub. Las capas `agent_*`, `tools_*` y `ui_*` se conservan temporalmente como
+adaptadores por dominio mientras 0.9.x absorbe su comportamiento al núcleo.
+Ya no existe un contrato de archivos core locales/no administrados.
 """
 
 _INSTALLED = False
@@ -21,18 +16,13 @@ def install_core_runtime():
     if _INSTALLED:
         return
 
-    # Expert Resilience modifica defaults/migración y parchea el transporte antes
-    # de que Tools/Agent/UI creen el singleton de Expert Escalation.
     from .expert_resilience import install_expert_resilience
     install_expert_resilience()
 
-    # Reliability enlaza SkillRegistry antes de crear instancias. Los hooks solo
-    # observan metadatos de ejecución/versionado; no persisten contenido.
     from .experience_reliability import install_skill_reliability_hooks
     install_skill_reliability_hooks()
 
-    # Herramientas por dominio. Learning/Reliability se registran antes de
-    # Confidence para que sus llamadas también queden observables normalmente.
+    # Herramientas por dominio sobre LocalTools nativo.
     from .tools_workspace import install_tools_v060
     from .tools_workspace_index import install_tools_v061
     from .tools_semantic import install_tools_v063
@@ -64,9 +54,7 @@ def install_core_runtime():
     install_tools_learning()
     install_tools_confidence()
 
-    # Confidence observa la petición normal completa; Expert reacciona al
-    # assessment, Learning captura la opinión y Reliability queda al exterior para
-    # exponer alertas/estado sin interferir con la ejecución de la Skill.
+    # Capas del Agent sobre LocalAgent nativo.
     from .agent_workspace import install_agent_v060
     from .agent_semantic import install_agent_v063
     from .agent_continuity import install_agent_v065
@@ -92,7 +80,7 @@ def install_core_runtime():
     install_agent_learning()
     install_agent_reliability()
 
-    # UI y hooks del profiler al final.
+    # Capas visuales sobre AssistantUI nativa.
     from .ui_workspace import install_ui_v060
     from .ui_semantic import install_ui_v063
     from .ui_continuity import install_ui_v065
@@ -124,24 +112,29 @@ def install_core_runtime():
 def architecture_status() -> dict:
     import importlib.util
 
-    required_local = {
+    core_modules = {
         "agent": "assistant.agent",
         "tools": "assistant.tools",
         "ui": "assistant.ui",
         "task_engine": "assistant.task_engine",
     }
-    local = {name: importlib.util.find_spec(module) is not None for name, module in required_local.items()}
+    managed_core = {name: importlib.util.find_spec(module) is not None for name, module in core_modules.items()}
+    native_domains = [
+        "memory", "workspace", "workspace_index", "semantic_memory",
+        "continuity", "doctor", "profiler", "self_repair", "perception",
+        "context_intelligence", "workspace_autodetect", "anomaly_detection",
+        "event_driven_vision", "skills", "confidence", "expert_escalation",
+        "expert_resilience", "learn_from_expert", "experience_reliability",
+        "agent", "tools", "ui", "task_engine",
+    ]
     return {
-        "ok": all(local.values()),
+        "ok": all(managed_core.values()),
         "bootstrap": "assistant.core_runtime",
-        "legacy_local_contract": local,
-        "github_managed_native": [
-            "memory", "workspace", "workspace_index", "semantic_memory",
-            "continuity", "doctor", "profiler", "self_repair", "perception",
-            "context_intelligence", "workspace_autodetect", "anomaly_detection",
-            "event_driven_vision", "skills", "confidence", "expert_escalation",
-            "expert_resilience", "learn_from_expert", "experience_reliability",
-        ],
-        "compatibility_adapters": ["agent", "tools", "ui", "task_engine"],
+        "github_managed_core": managed_core,
+        # Campo conservado para consumidores antiguos; en 0.9 ya no hay contrato local.
+        "legacy_local_contract": {},
+        "github_managed_native": native_domains,
+        "compatibility_adapters": ["agent_domain", "tools_domain", "ui_domain"],
+        "unmanaged_core_files": [],
         "versioned_runtime_chain": False,
     }
