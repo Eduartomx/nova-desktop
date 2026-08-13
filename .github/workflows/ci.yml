@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   test:
-    name: Ubuntu tests
+    name: Ubuntu full suite
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -23,13 +23,13 @@ jobs:
         run: python -m pip install --disable-pip-version-check psutil pillow requests beautifulsoup4
       - name: Compile source
         run: python -m compileall -q nova
-      - name: Nova test suite
+      - name: Nova full test suite
         env:
           PYTHONPATH: nova
         run: python -m unittest discover -s tests -v
 
   windows-smoke:
-    name: Windows / Python 3.11
+    name: Windows reliability smoke / Python 3.11
     runs-on: windows-latest
     timeout-minutes: 15
     steps:
@@ -41,9 +41,29 @@ jobs:
           python-version: "3.11"
       - name: Install test runtime dependencies
         run: python -m pip install --disable-pip-version-check psutil pillow requests beautifulsoup4
-      - name: Compile source on Windows
+      - name: Compile all Nova source on Windows
         run: python -m compileall -q nova
-      - name: Nova test suite on Windows
+      - name: Gaming Awareness regression suite
         env:
           PYTHONPATH: nova
-        run: python -m unittest discover -s tests -v
+        run: python -m unittest discover -s tests -p "test_gaming*.py" -v
+      - name: Instant Wake and hotkey compatibility
+        env:
+          PYTHONPATH: nova
+        run: python -m unittest discover -s tests -p "test_instant_wake_hotkeys.py" -v
+      - name: Updater compatibility
+        env:
+          PYTHONPATH: nova
+        run: python -m unittest discover -s tests -p "test_update_runner.py" -v
+      - name: Core bootstrap compatibility
+        env:
+          PYTHONPATH: nova
+        run: python -m unittest discover -s tests -p "test_core_consolidation.py" -v
+      - name: Native core compatibility
+        env:
+          PYTHONPATH: nova
+        run: python -m unittest discover -s tests -p "test_native_core.py" -v
+      - name: Tkinter padding safety
+        env:
+          PYTHONPATH: nova
+        run: python -m unittest discover -s tests -p "test_ui_padding_safety.py" -v
