@@ -157,14 +157,22 @@ class ExpertEscalationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             service = self.make_service(td)
             service.remember_candidate("problema original", "respuesta local", self.assessment())
+            service._clipboard_write = lambda text: (True, "")
+            with patch("assistant.expert_escalation.webbrowser.open", return_value=True):
+                prepared = service.prepare_chatgpt(trigger="test")
+            self.assertTrue(prepared["ok"])
+
             imported = service.import_chatgpt_response("CHATGPT_PRIVATE_RESPONSE con una comprobación concreta.")
             self.assertTrue(imported["ok"])
             context = service.imported_context()
             self.assertIn("CHATGPT_PRIVATE_RESPONSE", context)
-            self.assertIn("NO CONFIABLE", context)
+            self.assertIn("NO CONFIABLE", context.upper())
+            self.assertIn("problema original", context)
+            self.assertIn("respuesta local", context)
             raw = Path(td, "expert.db").read_bytes()
             self.assertNotIn(b"CHATGPT_PRIVATE_RESPONSE", raw)
             self.assertNotIn(b"problema original", raw)
+            self.assertNotIn(b"respuesta local", raw)
 
     def test_direct_routing(self):
         self.assertEqual(expert_direct_intent("Nova, estado del experto"), "status")
