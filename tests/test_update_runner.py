@@ -219,21 +219,39 @@ class UpdateRunnerTests(unittest.TestCase):
         self.assertEqual(shared.holder, "competitor")
         self.assertEqual(mailbox.calls, [("shutdown_for_update", "a" * 32)])
 
-    def test_legacy_metadata_without_creation_time_is_safe_when_lock_free(self):
+    def test_legacy_metadata_without_creation_time_is_recovered_only_when_pid_is_dead(self):
         shared = _SharedLock(holder=None)
         shared.owner.pop("process_creation_time")
-        called = []
+        process = _Process(shared, already_terminated=True, creation_time=999)
         result = coordinate_runtime_shutdown(
             Path(tempfile.gettempdir()),
             timeout=0.1,
             lock_factory=self.lock_factory(shared),
             mailbox=_Mailbox(),
-            process_factory=lambda pid: called.append(pid),
+            process_factory=lambda pid: process,
         )
         self.assertTrue(result.ok)
-        self.assertEqual(called, [], "legacy PID must not be waited without a creation identity")
+        self.assertEqual(process.wait_calls, 0)
         self.assertTrue(result.lock_acquired)
         result.release_guard()
+
+    def test_legacy_metadata_with_free_lock_and_live_pid_fails_closed_without_waiting(self):
+        shared = _SharedLock(holder=None)
+        shared.owner.pop("process_creation_time")
+        mailbox = _Mailbox()
+        process = _Process(shared, terminates=True, creation_time=999)
+        result = coordinate_runtime_shutdown(
+            Path(tempfile.gettempdir()),
+            timeout=0.1,
+            lock_factory=self.lock_factory(shared),
+            mailbox=mailbox,
+            process_factory=lambda pid: process,
+        )
+        self.assertFalse(result.ok)
+        self.assertEqual(result.error, "runtime_owner_identity_unavailable")
+        self.assertEqual(process.wait_calls, 0)
+        self.assertEqual(mailbox.calls, [])
+        self.assertIsNone(shared.holder, "unverifiable live legacy PID must release updater guard")
 
     def test_legacy_metadata_without_creation_time_fails_closed_when_lock_occupied(self):
         shared = _SharedLock(holder="runtime")
