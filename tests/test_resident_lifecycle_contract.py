@@ -69,4 +69,34 @@ class ResidentLifecycleContractTests(unittest.TestCase):
         self.assertEqual(instance.release_calls, 0); self.assertTrue(instance.acquired)
         self.assertEqual(ui.llm_warm_manager.unload_calls, 1); self.assertEqual(tray.stop_calls, 1); self.assertEqual(root.destroy_calls, 1)
 
+    def test_broken_tk_scheduler_cannot_suppress_synchronous_runtime_cleanup(self):
+        import app
+
+        temp = tempfile.TemporaryDirectory(); self.addCleanup(temp.cleanup)
+        root, ui, tray, instance = Root(), UI(), Tray(), Instance()
+
+        def broken_scheduler(_callback):
+            raise RuntimeError("Tk after is unavailable")
+
+        manager = RuntimeLifecycleManager(
+            root,
+            {"resident_mode": {"enabled": True, "close_to_tray": True}},
+            ui=ui,
+            scheduler=broken_scheduler,
+            data_root=Path(temp.name),
+        )
+        manager.attach_tray(tray); manager.attach_instance(instance); manager.mark_running()
+        ui.runtime_lifecycle = manager
+
+        app._cleanup_runtime_error(ui)
+        self.assertEqual(manager.state, "stopped")
+        self.assertEqual(root.destroy_calls, 1)
+        self.assertEqual(ui.gaming_awareness.stop_calls, 1)
+        self.assertEqual(ui.perception.stop_calls, 1)
+        self.assertEqual(ui.llm_warm_manager.unload_calls, 1)
+        self.assertEqual(tray.stop_calls, 1)
+        self.assertEqual(instance.release_calls, 0, "app-level finally remains the only lock release")
+        app._cleanup_runtime_error(ui)
+        self.assertEqual(root.destroy_calls, 1, "synchronous cleanup must remain idempotent")
+
 if __name__ == "__main__": unittest.main()
