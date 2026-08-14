@@ -4,8 +4,9 @@ from __future__ import annotations
 
 The validated coordinator implementation lives in ``recovery_bootstrap_legacy``.
 This façade preserves its public contract while persisting the explicit
-``waiting_for_processes`` state and re-establishing quarantine if the final
-post-recovery launch fails.
+``waiting_for_processes`` state during startup/recovery and re-establishing
+quarantine if the final post-recovery launch fails. A new update request only
+observes an existing quarantine; it never mutates that journal while blocked.
 """
 
 import argparse
@@ -96,9 +97,11 @@ def recover_pending(
     launcher=None,
     launch_after_success: bool = True,
     lock_factories=None,
+    persist_waiting_state: bool = True,
 ) -> RecoveryResult:
     root = Path(root)
-    _persist_waiting_state(root, backup_root=backup_root, inspector=inspector)
+    if persist_waiting_state:
+        _persist_waiting_state(root, backup_root=backup_root, inspector=inspector)
 
     wrapped_launcher = launcher
     launch_failure: list[str] = []
@@ -157,6 +160,7 @@ def startup_recovery_gate(
         launcher=launcher,
         launch_after_success=True,
         lock_factories=lock_factories,
+        persist_waiting_state=True,
     )
     if not result.continue_startup and not (result.recovered and result.launched) and show_notice:
         _legacy._minimal_notice(Path(root), result)
@@ -172,6 +176,9 @@ def updater_recovery_gate(
     launcher=None,
     lock_factories=None,
 ) -> RecoveryResult:
+    # A new update is read-only with respect to an existing quarantine. It may
+    # perform recovery once all identities are safe, but while blocked it must
+    # not rewrite the owner's journal or backup.
     result = recover_pending(
         root,
         supervisor_already_held=supervisor_already_held,
@@ -180,6 +187,7 @@ def updater_recovery_gate(
         launcher=launcher,
         launch_after_success=True,
         lock_factories=lock_factories,
+        persist_waiting_state=False,
     )
     if not result.pending and not result.recovered and result.continue_startup:
         return RecoveryResult(False, 0, "", "no recovery pending", continue_startup=True)
