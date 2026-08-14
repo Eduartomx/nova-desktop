@@ -9,7 +9,7 @@ from unittest import mock
 from updater import nova_updater, resident_update_engine, update_runner
 from updater.recovery_bootstrap import recover_pending, updater_recovery_gate
 from updater.recovery_state import RECOVERY_REQUIRED_EXIT_CODE, RecoveryResult, journal_path, load_journal
-from tests.test_recovery_bootstrap import RecoveryFixture, _TestLock, _ExclusiveState
+from tests.test_recovery_bootstrap import RecoveryFixture
 
 
 class PublicUpdaterGateTests(unittest.TestCase):
@@ -146,15 +146,16 @@ class SupervisorRecoveryGateTests(unittest.TestCase):
 
 
 class RecoveryStateTransitionTests(unittest.TestCase):
-    def test_live_identity_persists_waiting_for_processes_once(self):
+    def test_startup_recovery_persists_waiting_for_processes_once(self):
         with tempfile.TemporaryDirectory() as td:
             fx = RecoveryFixture(Path(td))
             fx.quarantine([{"pid": 88, "creation_time": 1001, "role": "pip_root_or_descendant"}])
             before = load_journal(fx.root, backup_root=fx.backup_root)
-            result = updater_recovery_gate(
+            result = recover_pending(
                 fx.root,
                 backup_root=fx.backup_root,
                 inspector=lambda row: ("alive", ""),
+                launch_after_success=False,
             )
             after = load_journal(fx.root, backup_root=fx.backup_root)
         self.assertTrue(result.pending)
@@ -174,13 +175,14 @@ class RecoveryStateTransitionTests(unittest.TestCase):
                 launch_after_success=True,
             )
             journal = load_journal(fx.root, backup_root=fx.backup_root)
+            backup_exists = fx.backup.exists()
         self.assertTrue(result.pending)
         self.assertTrue(result.recovered)
         self.assertFalse(result.launched)
         self.assertEqual(result.exit_code, RECOVERY_REQUIRED_EXIT_CODE)
         self.assertEqual(journal["state"], "validation_completed")
         self.assertTrue(journal["recovery_required"])
-        self.assertTrue(fx.backup.exists())
+        self.assertTrue(backup_exists)
 
     def test_retry_from_validation_completed_skips_rollback_and_launches_once(self):
         with tempfile.TemporaryDirectory() as td:
