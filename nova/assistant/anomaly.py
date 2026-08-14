@@ -6,6 +6,7 @@ Observa únicamente métricas locales de sistema/proceso. Aprende líneas base p
 actividad y proceso, exige desviaciones sostenidas y no ejecuta remediación.
 """
 
+from contextlib import contextmanager
 import json
 import math
 import sqlite3
@@ -110,11 +111,21 @@ class AnomalyDetector:
         self.memory = memory
         return self
 
+    @contextmanager
     def _connect(self):
+        """Yield one SQLite connection and always close its OS handle.
+
+        sqlite3.Connection's native context manager commits/rolls back but does
+        not close the connection.  Most AnomalyDetector operations are short
+        lived, so retaining those handles leaks temporary DB files on Windows.
+        """
         conn = sqlite3.connect(self.db_path, timeout=5.0)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA busy_timeout=5000")
-        return conn
+        try:
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA busy_timeout=5000")
+            yield conn
+        finally:
+            conn.close()
 
     def _init_db(self):
         with self._connect() as conn:
@@ -323,19 +334,18 @@ class AnomalyDetector:
     def _emit(self, event_type: str, severity: str, context_key: str, process_name: str = "", score: float = 0.0, metadata: dict[str, Any] | None = None):
         signature = f"{event_type}:{context_key}:{_norm(process_name)}"
         now = time.monotonic()
-        last = self._last_emit_at.get(signature)
-        cooldown = max(10.0, _f(self.config.get("event_cooldown_seconds"), 300))
-        if last is not None and now - last < cooldown:
+        last = self._last_emit_at.get(signature, 0.0)
+        cooldown = max(0.0, _f(self.config.get("event_cooldown_seconds"), 300))
+        if now - last < cooldown:
             return None
-        self._last_emit_at[signature] = now
-        safe: dict[str, Any] = {}
-        for key, value in (metadata or {}).items():
-            if isinstance(value, (str, int, float, bool)) or value is None:
-                safe[str(key)[:64]] = value if not isinstance(value, str) else value[:160]
+        safe = {}
+        for key in ("cpu_percent", "memory_percent", "limit", "baseline_mean", "new_process", "repeated_15m"):
+            if key in (metadata or {}):
+                safe[key] = (metadata or {})[key]
         with self._lock, self._connect() as conn:
             cur = conn.execute(
                 "INSERT INTO anomaly_events(event_type,severity,context_key,process_name,score,metadata_json) VALUES (?,?,?,?,?,?)",
-                (event_type[:80], severity[:16], context_key[:80], _norm(process_name)[:120], float(score), json.dumps(safe, ensure_ascii=False, separators=(",", ":"))),
+                (str(event_type)[:80], str(severity)[:20], str(context_key)[:80], _norm(process_name)[:120], float(score), json.dumps(safe, ensure_ascii=False, separators=(",", ":"))),
             )
             max_events = max(100, int(self.config.get("max_events", 800)))
             conn.execute("DELETE FROM anomaly_events WHERE id <= (SELECT MAX(id)-? FROM anomaly_events)", (max_events,))
