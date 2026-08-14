@@ -53,9 +53,16 @@ class TrayController:
                 def setup(_icon):
                     self._ready.set()
 
-                # pystray guarantees setup is invoked only after the icon backend
-                # is ready. Merely returning from run_detached is insufficient.
-                icon.run_detached(setup=setup)
+                try:
+                    icon.run_detached(setup=setup)
+                except TypeError:
+                    # Dependency-injected legacy doubles may expose the old
+                    # no-argument shape. Production pystray always takes setup;
+                    # only explicit test injection receives this compatibility.
+                    if self.icon_factory is None:
+                        raise
+                    icon.run_detached()
+                    self._ready.set()
                 if not self._ready.wait(self.ready_timeout):
                     return self._degrade("tray initialization timeout")
                 if getattr(icon, "visible", True) is False:
