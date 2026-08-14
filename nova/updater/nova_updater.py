@@ -16,6 +16,11 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
+try:
+    from .pip_safety import PipTerminationResult, pip_popen_kwargs, terminate_pip_tree
+except ImportError:  # direct script execution from nova/updater
+    from pip_safety import PipTerminationResult, pip_popen_kwargs, terminate_pip_tree
+
 APP_NAME = "Nova"
 UPDATER_VERSION = "2.2-resident-transactional"
 USER_AGENT = f"Nova-Updater/{UPDATER_VERSION}"
@@ -23,6 +28,13 @@ TRANSACTION_CATEGORIES = ("modified_existing", "deleted_existing", "created_new"
 PIP_INSTALL_TIMEOUT_SECONDS = 15 * 60.0
 PIP_INSTALL_TIMEOUT_MAX_SECONDS = 60 * 60.0
 PIP_TERMINATE_GRACE_SECONDS = 10.0
+PIP_TERMINATION_UNCONFIRMED_EXIT_CODE = 6
+
+
+class PipTerminationUnconfirmedError(RuntimeError):
+    def __init__(self, message: str, result: PipTerminationResult):
+        super().__init__(message)
+        self.result = result
 
 
 def find_nova_root() -> Path:
@@ -383,9 +395,14 @@ def _write_rollback_status(
             message += " Detalle de la actualización: " + clean_detail
     else:
         message = "Los archivos administrados fueron restaurados correctamente."
+    status_name = "rollback_incomplete" if not files_rollback_ok else (
+        "rollback_completed_dependency_recovery" if dependencies_may_have_changed else "rollback_completed"
+    )
     payload = {
         "ok": bool(files_rollback_ok),
+        "status": status_name,
         "files_rollback_ok": bool(files_rollback_ok),
+        "files_rollback_attempted": True,
         "dependencies_may_have_changed": bool(dependencies_may_have_changed),
         "recovery_required": bool(recovery_required),
         "errors": list(errors or []),
@@ -413,6 +430,40 @@ def _write_rollback_status(
             recovery_path.unlink(missing_ok=True)
         except OSError:
             pass
+    return payload
+
+
+def _write_pip_termination_unconfirmed_status(
+    backup: Path,
+    result: PipTerminationResult,
+    *,
+    recovery_detail: str,
+) -> dict:
+    remaining = sorted({int(pid) for pid in result.remaining_pids if int(pid) > 0})[:64]
+    errors = [_clean_recovery_detail(value) for value in result.termination_errors if value][:64]
+    message = (
+        "pip excedió el timeout y Nova no pudo confirmar la terminación completa de su proceso/descendientes. "
+        "El rollback de archivos no se inició para evitar escribir sobre una instalación que aún puede estar mutando. "
+        "Nova no debe relanzarse automáticamente desde esta .venv hasta resolver la recuperación."
+    )
+    if remaining:
+        message += " PID restantes: " + ", ".join(str(pid) for pid in remaining) + "."
+    payload = {
+        "ok": False,
+        "status": "pip_termination_unconfirmed",
+        "files_rollback_ok": None,
+        "files_rollback_attempted": False,
+        "dependencies_may_have_changed": True,
+        "recovery_required": True,
+        "remaining_pids": remaining,
+        "termination_errors": errors,
+        "backup": str(backup),
+        "message": message,
+        "recovery_detail": _clean_recovery_detail(recovery_detail),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    _atomic_write_json(backup / "rollback_status.json", payload)
+    _atomic_write_json(_recovery_status_path(), payload)
     return payload
 
 
@@ -489,7 +540,9 @@ def restore_backup(
         raise RuntimeError("rollback incompleto: " + " | ".join(errors))
     return status or {
         "ok": True,
+        "status": "rollback_completed",
         "files_rollback_ok": True,
+        "files_rollback_attempted": True,
         "dependencies_may_have_changed": bool(dependencies_may_have_changed),
         "recovery_required": bool(dependencies_may_have_changed),
         "errors": [],
@@ -527,29 +580,8 @@ def _normalize_pip_timeout(timeout_seconds=None) -> float:
     return min(value, float(PIP_INSTALL_TIMEOUT_MAX_SECONDS))
 
 
-def _terminate_timed_out_pip(proc) -> str:
-    notes = []
-    try:
-        proc.terminate()
-    except Exception as exc:
-        notes.append(f"terminate:{type(exc).__name__}:{exc}")
-    try:
-        proc.wait(timeout=PIP_TERMINATE_GRACE_SECONDS)
-        return " | ".join(notes)
-    except subprocess.TimeoutExpired:
-        notes.append("terminate_timeout")
-    except Exception as exc:
-        notes.append(f"wait_after_terminate:{type(exc).__name__}:{exc}")
-
-    try:
-        proc.kill()
-    except Exception as exc:
-        notes.append(f"kill:{type(exc).__name__}:{exc}")
-    try:
-        proc.wait(timeout=PIP_TERMINATE_GRACE_SECONDS)
-    except Exception as exc:
-        notes.append(f"wait_after_kill:{type(exc).__name__}:{exc}")
-    return " | ".join(notes)
+def _terminate_timed_out_pip(proc) -> PipTerminationResult:
+    return terminate_pip_tree(proc, PIP_TERMINATE_GRACE_SECONDS)
 
 
 def _install_requirements(timeout_seconds=None) -> None:
@@ -559,19 +591,27 @@ def _install_requirements(timeout_seconds=None) -> None:
     timeout = _normalize_pip_timeout(timeout_seconds)
     cmd = [sys.executable, "-m", "pip", "install", "-r", str(req)]
     print(f"Actualizando dependencias Python (timeout {timeout:g}s)...")
-    proc = subprocess.Popen(cmd)
+    proc = subprocess.Popen(cmd, **pip_popen_kwargs())
     try:
         return_code = int(proc.wait(timeout=timeout))
     except subprocess.TimeoutExpired as exc:
-        termination_detail = _terminate_timed_out_pip(proc)
+        termination = _terminate_timed_out_pip(proc)
+        if termination.terminated_confirmed:
+            message = (
+                f"pip install -r requirements.txt excedió el timeout de {timeout:g} segundos; "
+                "pip y sus descendientes fueron detenidos y esperados de forma verificable. "
+                "El entorno Python puede haber cambiado; se requiere recuperación antes de reintentar."
+            )
+            if termination.termination_errors:
+                message += " Detalle de terminación: " + " | ".join(termination.termination_errors)
+            raise RuntimeError(message) from exc
         message = (
             f"pip install -r requirements.txt excedió el timeout de {timeout:g} segundos; "
-            "el proceso directo de pip fue detenido y esperado. El entorno Python puede haber cambiado; "
-            "se requiere recuperación antes de reintentar."
+            "la terminación completa de pip y sus descendientes no pudo confirmarse. "
+            + termination.detail
+            + ". Se detiene la actualización en modo fail-closed sin iniciar rollback concurrente ni relanzar Nova."
         )
-        if termination_detail:
-            message += " Detalle de terminación: " + termination_detail
-        raise RuntimeError(message) from exc
+        raise PipTerminationUnconfirmedError(message, termination) from exc
     if return_code != 0:
         raise RuntimeError("pip install -r requirements.txt falló")
 
@@ -611,6 +651,17 @@ def execute_transaction(
         print(detail)
         write_managed(new_files, tag)
         return backup, manifest
+    except PipTerminationUnconfirmedError as update_error:
+        print("La terminación de pip no pudo confirmarse; se conserva el backup y no se inicia rollback concurrente.")
+        try:
+            _write_pip_termination_unconfirmed_status(
+                backup,
+                update_error.result,
+                recovery_detail=str(update_error),
+            )
+        except Exception as status_error:
+            print(f"[WARN] No pude persistir por completo el estado fail-closed: {type(status_error).__name__}: {status_error}")
+        raise
     except Exception as update_error:
         print("La actualización falló; restaurando transacción...")
         try:
@@ -721,6 +772,9 @@ def main():
         print(f"NOVA {latest} INSTALADA DESDE GITHUB")
         print("=" * 58)
         return 0
+    except PipTerminationUnconfirmedError as e:
+        print(f"[ERROR] {e}")
+        return PIP_TERMINATION_UNCONFIRMED_EXIT_CODE
     except Exception as e:
         print(f"[ERROR] {e}")
         return 2
