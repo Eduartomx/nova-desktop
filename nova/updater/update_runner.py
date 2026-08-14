@@ -198,9 +198,16 @@ def _runtime_components(root: Path, *, lock_factory=None, guard_factory=None, ma
 
 def _try_guard(guard_factory):
     guard = guard_factory()
-    if guard.acquire():
-        return guard
-    return None
+    try:
+        if guard.acquire():
+            return guard
+        return None
+    except Exception:
+        try:
+            guard.release()
+        except Exception:
+            pass
+        raise
 
 
 def _owner_values(owner: dict | None) -> tuple[int, str, str, int]:
@@ -211,6 +218,13 @@ def _owner_values(owner: dict | None) -> tuple[int, str, str, int]:
         str(owner.get("role") or "runtime"),
         int(owner.get("process_creation_time") or 0),
     )
+
+
+def _owner_values_best_effort(owner: dict | None) -> tuple[int, str, str, int]:
+    try:
+        return _owner_values(owner)
+    except Exception:
+        return 0, "", "runtime", 0
 
 
 def _owner_unchanged(observer, *, pid: int, owner_id: str, creation_time: int, role: str) -> bool:
@@ -230,6 +244,14 @@ def _publish_updater_guard(guard) -> tuple[bool, str]:
         return False, f"updater_guard_metadata_failed:{type(exc).__name__}"
 
 
+def _release_failed_guard(guard) -> tuple[Any, str]:
+    try:
+        guard.release()
+        return None, ""
+    except Exception as exc:
+        return guard, f":guard_release_failed:{type(exc).__name__}"
+
+
 def _guarded_previous_owner_result(
     guard,
     owner_snapshot: dict | None,
@@ -247,30 +269,32 @@ def _guarded_previous_owner_result(
         try:
             captured = process_factory(target_pid)
         except Exception as exc:
-            guard.release()
+            retained, release_error = _release_failed_guard(guard)
             return ShutdownCoordination(
                 False,
-                f"owner_process_capture_failed:{type(exc).__name__}",
+                f"owner_process_capture_failed:{type(exc).__name__}{release_error}",
                 owner_pid=target_pid,
                 owner_id=owner_id,
                 owner_role=owner_role,
                 owner_process_creation_time=target_creation,
                 lock_acquired=True,
+                guard=retained,
             )
         try:
             if getattr(captured, "already_terminated", False):
                 process_terminated = True
             elif target_creation <= 0:
-                guard.release()
+                retained, release_error = _release_failed_guard(guard)
                 return ShutdownCoordination(
                     False,
-                    "runtime_owner_identity_unavailable",
+                    "runtime_owner_identity_unavailable" + release_error,
                     owner_pid=target_pid,
                     owner_id=owner_id,
                     owner_role=owner_role,
                     owner_process_creation_time=0,
                     process_terminated=False,
                     lock_acquired=True,
+                    guard=retained,
                 )
             elif not captured.matches_creation_time(target_creation):
                 process_terminated = True
@@ -279,26 +303,28 @@ def _guarded_previous_owner_result(
                 try:
                     process_terminated = bool(captured.wait(remaining))
                 except Exception as exc:
-                    guard.release()
+                    retained, release_error = _release_failed_guard(guard)
                     return ShutdownCoordination(
                         False,
-                        f"owner_process_wait_failed:{type(exc).__name__}",
+                        f"owner_process_wait_failed:{type(exc).__name__}{release_error}",
                         owner_pid=target_pid,
                         owner_id=owner_id,
                         owner_role=owner_role,
                         owner_process_creation_time=target_creation,
                         lock_acquired=True,
+                        guard=retained,
                     )
                 if not process_terminated:
-                    guard.release()
+                    retained, release_error = _release_failed_guard(guard)
                     return ShutdownCoordination(
                         False,
-                        "owner_process_timeout",
+                        "owner_process_timeout" + release_error,
                         owner_pid=target_pid,
                         owner_id=owner_id,
                         owner_role=owner_role,
                         owner_process_creation_time=target_creation,
                         lock_acquired=True,
+                        guard=retained,
                     )
         finally:
             try:
@@ -308,16 +334,17 @@ def _guarded_previous_owner_result(
 
     published, publish_error = _publish_updater_guard(guard)
     if not published:
-        guard.release()
+        retained, release_error = _release_failed_guard(guard)
         return ShutdownCoordination(
             False,
-            publish_error,
+            publish_error + release_error,
             owner_pid=target_pid or owner_pid,
             owner_id=owner_id,
             owner_role=owner_role if owner_snapshot else "none",
             owner_process_creation_time=target_creation,
             process_terminated=process_terminated,
             lock_acquired=True,
+            guard=retained,
         )
     return ShutdownCoordination(
         True,
@@ -332,22 +359,50 @@ def _guarded_previous_owner_result(
 
 
 def _acquire_verified_guard(observer, guard_factory, deadline: float, process_factory):
+    """Acquire updater guard after the captured runtime already terminated.
+
+    Every ordinary failure from this point is explicitly marked with
+    ``process_terminated=True`` so the supervisor can relaunch recovery without
+    ever authorizing file mutation without a guard.
+    """
     event = threading.Event()
     last = None
     while time.monotonic() <= deadline:
-        snapshot = observer.read_owner()
-        guard = _try_guard(guard_factory)
-        if guard is not None:
-            return _guarded_previous_owner_result(
-                guard,
-                snapshot,
-                expected_pid=0,
-                process_factory=process_factory,
-                deadline=deadline,
+        guard = None
+        try:
+            snapshot = observer.read_owner()
+            guard = _try_guard(guard_factory)
+        except Exception as exc:
+            return ShutdownCoordination(
+                False,
+                f"runtime_guard_acquire_failed:{type(exc).__name__}",
+                process_terminated=True,
+                lock_acquired=guard is not None,
+                guard=guard,
             )
+        if guard is not None:
+            try:
+                result = _guarded_previous_owner_result(
+                    guard,
+                    snapshot,
+                    expected_pid=0,
+                    process_factory=process_factory,
+                    deadline=deadline,
+                )
+            except Exception as exc:
+                return ShutdownCoordination(
+                    False,
+                    f"runtime_guard_validation_failed:{type(exc).__name__}",
+                    process_terminated=True,
+                    lock_acquired=True,
+                    guard=guard,
+                )
+            if not result.ok:
+                result.process_terminated = True
+            return result
         last = snapshot
         event.wait(min(0.05, max(0.0, deadline - time.monotonic())))
-    pid, owner_id, role, creation = _owner_values(last)
+    pid, owner_id, role, creation = _owner_values_best_effort(last)
     return ShutdownCoordination(
         False,
         "runtime_lock_timeout_after_process_exit",
@@ -359,7 +414,7 @@ def _acquire_verified_guard(observer, guard_factory, deadline: float, process_fa
     )
 
 
-def coordinate_runtime_shutdown(
+def _coordinate_runtime_shutdown_impl(
     root: Path,
     timeout: float = 20.0,
     *,
@@ -369,7 +424,6 @@ def coordinate_runtime_shutdown(
     mailbox=None,
     process_factory=None,
 ) -> ShutdownCoordination:
-    """Return only with the previous process dead and an updater guard held."""
     injected_lock_factory = lock_factory
     if injected_lock_factory is not None and guard_factory is None:
         guard_factory = injected_lock_factory
@@ -384,16 +438,40 @@ def coordinate_runtime_shutdown(
     observer = observer_factory()
     owner_snapshot = observer.read_owner()
 
-    guard = _try_guard(guard_factory)
-    if guard is not None:
-        stable_snapshot = observer.read_owner() or owner_snapshot
-        return _guarded_previous_owner_result(
-            guard,
-            stable_snapshot,
-            expected_pid=int(expected_pid or 0),
-            process_factory=process_factory,
-            deadline=deadline,
+    try:
+        guard = _try_guard(guard_factory)
+    except Exception as exc:
+        owner_pid, owner_id, owner_role, owner_creation = _owner_values_best_effort(owner_snapshot)
+        return ShutdownCoordination(
+            False,
+            f"runtime_guard_open_failed:{type(exc).__name__}",
+            owner_pid=owner_pid,
+            owner_id=owner_id,
+            owner_role=owner_role,
+            owner_process_creation_time=owner_creation,
         )
+    if guard is not None:
+        try:
+            stable_snapshot = observer.read_owner() or owner_snapshot
+            return _guarded_previous_owner_result(
+                guard,
+                stable_snapshot,
+                expected_pid=int(expected_pid or 0),
+                process_factory=process_factory,
+                deadline=deadline,
+            )
+        except Exception as exc:
+            owner_pid, owner_id, owner_role, owner_creation = _owner_values_best_effort(owner_snapshot)
+            return ShutdownCoordination(
+                False,
+                f"runtime_guard_validation_failed:{type(exc).__name__}",
+                owner_pid=owner_pid,
+                owner_id=owner_id,
+                owner_role=owner_role,
+                owner_process_creation_time=owner_creation,
+                lock_acquired=True,
+                guard=guard,
+            )
 
     event = threading.Event()
     last_identity_error = "runtime_owner_metadata_unavailable"
@@ -441,7 +519,17 @@ def coordinate_runtime_shutdown(
                 else:
                     command_sent = False
                     if owner_role == "runtime":
-                        command_sent = bool(mailbox.send("shutdown_for_update", target_owner_id=owner_id))
+                        try:
+                            command_sent = bool(mailbox.send("shutdown_for_update", target_owner_id=owner_id))
+                        except Exception as exc:
+                            return ShutdownCoordination(
+                                False,
+                                f"shutdown_command_delivery_exception:{type(exc).__name__}",
+                                owner_pid=owner_pid,
+                                owner_id=owner_id,
+                                owner_role=owner_role,
+                                owner_process_creation_time=owner_creation,
+                            )
                         if not command_sent:
                             return ShutdownCoordination(
                                 False,
@@ -482,6 +570,7 @@ def coordinate_runtime_shutdown(
                             guarded.owner_id = owner_id
                             guarded.owner_role = owner_role
                             guarded.owner_process_creation_time = owner_creation
+                        guarded.process_terminated = True
                         return guarded
                     guarded.command_sent = command_sent
                     guarded.owner_pid = owner_pid
@@ -497,15 +586,37 @@ def coordinate_runtime_shutdown(
                     pass
 
         snapshot = owner
-        guard = _try_guard(guard_factory)
-        if guard is not None:
-            return _guarded_previous_owner_result(
-                guard,
-                snapshot,
-                expected_pid=int(expected_pid or 0),
-                process_factory=process_factory,
-                deadline=deadline,
+        try:
+            guard = _try_guard(guard_factory)
+        except Exception as exc:
+            return ShutdownCoordination(
+                False,
+                f"runtime_guard_open_failed:{type(exc).__name__}",
+                owner_pid=owner_pid,
+                owner_id=owner_id,
+                owner_role=owner_role,
+                owner_process_creation_time=owner_creation,
             )
+        if guard is not None:
+            try:
+                return _guarded_previous_owner_result(
+                    guard,
+                    snapshot,
+                    expected_pid=int(expected_pid or 0),
+                    process_factory=process_factory,
+                    deadline=deadline,
+                )
+            except Exception as exc:
+                return ShutdownCoordination(
+                    False,
+                    f"runtime_guard_validation_failed:{type(exc).__name__}",
+                    owner_pid=owner_pid,
+                    owner_id=owner_id,
+                    owner_role=owner_role,
+                    owner_process_creation_time=owner_creation,
+                    lock_acquired=True,
+                    guard=guard,
+                )
         event.wait(min(0.05, max(0.0, deadline - time.monotonic())))
 
     return ShutdownCoordination(
@@ -516,6 +627,31 @@ def coordinate_runtime_shutdown(
         owner_role=owner_role,
         owner_process_creation_time=owner_creation,
     )
+
+
+def coordinate_runtime_shutdown(
+    root: Path,
+    timeout: float = 20.0,
+    *,
+    expected_pid: int = 0,
+    lock_factory=None,
+    guard_factory=None,
+    mailbox=None,
+    process_factory=None,
+) -> ShutdownCoordination:
+    """Return a structured result; ordinary coordination failures never escape."""
+    try:
+        return _coordinate_runtime_shutdown_impl(
+            root,
+            timeout,
+            expected_pid=expected_pid,
+            lock_factory=lock_factory,
+            guard_factory=guard_factory,
+            mailbox=mailbox,
+            process_factory=process_factory,
+        )
+    except Exception as exc:
+        return ShutdownCoordination(False, f"coordination_exception:{type(exc).__name__}")
 
 
 def request_runtime_shutdown(root: Path, timeout: float = 20.0, *, lock_factory=None, guard_factory=None, mailbox=None, process_factory=None) -> bool:
@@ -617,6 +753,23 @@ def _read_version_best_effort(root: Path, fallback: str, log: Path, label: str) 
         return fallback
 
 
+def _release_coordination_guard_best_effort(coordination: ShutdownCoordination, log: Path) -> None:
+    try:
+        coordination.release_guard()
+    except Exception as exc:
+        _append_log_best_effort(log, f"\n[WARN GUARD] {type(exc).__name__}: {exc}\n")
+
+
+def _launch_recovery_once(root: Path, log: Path) -> tuple[bool, str]:
+    try:
+        launched, detail = launch_nova(root)
+    except Exception as exc:
+        launched, detail = False, f"{type(exc).__name__}: {exc}"
+    if not launched:
+        _append_log_best_effort(log, "\n[ERROR REINICIO] " + str(detail or "fallo desconocido") + "\n")
+    return bool(launched), str(detail or "")
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="Supervisa una actualización de Nova y relanza la aplicación.")
     parser.add_argument("--parent-pid", type=int, default=0)
@@ -631,14 +784,27 @@ def main(argv=None) -> int:
         pass
 
     before = _read_version_best_effort(root, "0.0.0", log, "ANTES")
-    coordination = coordinate_runtime_shutdown(root, args.wait_seconds, expected_pid=args.parent_pid)
+    try:
+        coordination = coordinate_runtime_shutdown(root, args.wait_seconds, expected_pid=args.parent_pid)
+    except Exception as exc:
+        # Defensive boundary for injected/custom coordinators.  The production
+        # coordinator already converts ordinary failures to structured results.
+        coordination = ShutdownCoordination(False, f"coordination_exception:{type(exc).__name__}")
+
     if not coordination.ok:
-        error = "Nova no terminó de forma verificable; no se modificaron archivos. " + coordination.error
+        if coordination.process_terminated:
+            error = "Nova terminó, pero la coordinación no obtuvo un guard verificable; no se modificaron archivos. " + coordination.error
+        else:
+            error = "Nova no terminó de forma verificable; no se modificaron archivos. " + coordination.error
         _write_status_best_effort(root, ok=False, before=before, after=before, log=log, error=error)
-        try:
-            _show_surviving_runtime(root, coordination)
-        except Exception as exc:
-            _append_log_best_effort(log, f"\n[WARN SHOW] {type(exc).__name__}: {exc}\n")
+        _release_coordination_guard_best_effort(coordination, log)
+        if coordination.process_terminated:
+            _launch_recovery_once(root, log)
+        else:
+            try:
+                _show_surviving_runtime(root, coordination)
+            except Exception as exc:
+                _append_log_best_effort(log, f"\n[WARN SHOW] {type(exc).__name__}: {exc}\n")
         return 4
 
     rc = 2
@@ -665,18 +831,8 @@ def main(argv=None) -> int:
         after = _read_version_best_effort(root, before, log, "DESPUÉS")
         _write_status_best_effort(root, ok=ok, before=before, after=after, log=log, error=error)
     finally:
-        try:
-            coordination.release_guard()
-        except Exception as exc:
-            _append_log_best_effort(log, f"\n[WARN GUARD] {type(exc).__name__}: {exc}\n")
-
-        try:
-            launched, launch_detail = launch_nova(root)
-        except Exception as exc:
-            launched = False
-            launch_detail = f"{type(exc).__name__}: {exc}"
-        if not launched:
-            _append_log_best_effort(log, "\n[ERROR REINICIO] " + str(launch_detail or "fallo desconocido") + "\n")
+        _release_coordination_guard_best_effort(coordination, log)
+        launched, launch_detail = _launch_recovery_once(root, log)
 
     if ok:
         return 0 if launched else 3
