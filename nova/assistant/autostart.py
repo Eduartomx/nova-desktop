@@ -17,6 +17,7 @@ class AutostartManager:
         self.root = Path(nova_root) if nova_root is not None else Path(__file__).resolve().parent.parent
         self.backend = backend
         self.last_error = ""
+        self.last_result: dict[str, Any] = {"ok": True, "action": "none"}
 
     def command(self) -> str:
         pyw = self.root / ".venv" / "Scripts" / "pythonw.exe"
@@ -64,22 +65,72 @@ class AutostartManager:
         try:
             actual = self._read()
             desired = self.command()
-            return {"enabled": bool(actual == desired), "present": actual is not None, "matches_installation": bool(actual == desired)}
+            present = actual is not None
+            matches = bool(actual == desired)
+            conflict = bool(present and not matches)
+            return {
+                "enabled": matches,
+                "present": present,
+                "matches_installation": matches,
+                "conflict": conflict,
+                "conflict_reason": "entry_belongs_to_other_installation" if conflict else "",
+                "last_result": dict(self.last_result),
+            }
         except Exception as exc:
             self.last_error = f"{type(exc).__name__}: {exc}"[:240]
-            return {"enabled": False, "present": False, "matches_installation": False, "error": self.last_error}
+            return {
+                "enabled": False,
+                "present": False,
+                "matches_installation": False,
+                "conflict": False,
+                "error": self.last_error,
+                "last_result": dict(self.last_result),
+            }
 
     def is_enabled(self) -> bool:
         return bool(self.status().get("enabled"))
 
-    def set_enabled(self, enabled: bool) -> bool:
+    def configure(self, enabled: bool) -> dict[str, Any]:
         try:
+            desired = self.command()
+            actual = self._read()
             if enabled:
-                self._write(self.command())
+                if actual == desired:
+                    result = {"ok": True, "enabled": True, "action": "unchanged"}
+                elif actual is not None and actual != desired:
+                    result = {
+                        "ok": False,
+                        "enabled": False,
+                        "action": "conflict",
+                        "conflict": True,
+                        "error": "entry_belongs_to_other_installation",
+                    }
+                else:
+                    self._write(desired)
+                    result = {"ok": True, "enabled": True, "action": "created"}
             else:
-                self._delete()
+                if actual is None:
+                    result = {"ok": True, "enabled": False, "action": "unchanged"}
+                elif actual != desired:
+                    result = {
+                        "ok": False,
+                        "enabled": False,
+                        "action": "conflict",
+                        "conflict": True,
+                        "error": "entry_belongs_to_other_installation",
+                    }
+                else:
+                    self._delete()
+                    result = {"ok": True, "enabled": False, "action": "removed"}
             self.last_error = ""
-            return self.is_enabled() if enabled else not bool(self.status().get("present"))
+            self.last_result = result
+            return dict(result)
         except Exception as exc:
             self.last_error = f"{type(exc).__name__}: {exc}"[:240]
-            return False
+            result = {"ok": False, "enabled": False, "action": "error", "error": self.last_error}
+            self.last_result = result
+            return dict(result)
+
+    def set_enabled(self, enabled: bool) -> bool:
+        """Compatibility wrapper; detailed callers should use ``configure``."""
+        return bool(self.configure(bool(enabled)).get("ok"))
