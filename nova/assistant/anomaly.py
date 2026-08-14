@@ -113,17 +113,13 @@ class AnomalyDetector:
 
     @contextmanager
     def _connect(self):
-        """Yield one SQLite connection and always close its OS handle.
-
-        sqlite3.Connection's native context manager commits/rolls back but does
-        not close the connection.  Most AnomalyDetector operations are short
-        lived, so retaining those handles leaks temporary DB files on Windows.
-        """
+        """Preserve sqlite transaction semantics and always close the handle."""
         conn = sqlite3.connect(self.db_path, timeout=5.0)
         try:
             conn.row_factory = sqlite3.Row
             conn.execute("PRAGMA busy_timeout=5000")
-            yield conn
+            with conn:
+                yield conn
         finally:
             conn.close()
 
