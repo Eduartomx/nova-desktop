@@ -65,6 +65,19 @@ def _strong_remaining_pids(root: Path) -> list[int]:
         return []
 
 
+def _recovery_state_exists(root: Path) -> bool:
+    """Code 7 is fail-closed only when a durable journal actually exists.
+
+    This preserves compatibility with older/custom updater return codes while
+    the hardened engine always persists update_recovery.json before returning 7.
+    A corrupt journal also counts as recovery state and therefore blocks launch.
+    """
+    try:
+        return (Path(root) / "data" / "update_recovery.json").is_file()
+    except Exception:
+        return True
+
+
 def _append_log_best_effort(log: Path, text: str) -> None:
     try:
         log.parent.mkdir(parents=True, exist_ok=True)
@@ -181,14 +194,17 @@ def main(argv=None, *, supervisor_lock_factory=None) -> int:
                 rc = 2
                 runner_error = f"run_update inesperado: {type(exc).__name__}: {exc}"
 
-            no_launch = rc in (PIP_TERMINATION_UNCONFIRMED_CODE, RECOVERY_REQUIRED_CODE)
+            durable_recovery = _recovery_state_exists(root)
+            no_launch = rc == PIP_TERMINATION_UNCONFIRMED_CODE or (
+                rc == RECOVERY_REQUIRED_CODE and durable_recovery
+            )
             ok = rc == 0
             state = "completed" if ok else "update_failed"
             if rc == PIP_TERMINATION_UNCONFIRMED_CODE:
                 state = "pip_termination_unconfirmed"
                 remaining_pids = _strong_remaining_pids(root)
                 error = "La terminación de pip no pudo confirmarse; cuarentena persistente activa."
-            elif rc == RECOVERY_REQUIRED_CODE:
+            elif rc == RECOVERY_REQUIRED_CODE and durable_recovery:
                 state = "recovery_required_or_in_progress"
                 remaining_pids = _strong_remaining_pids(root)
                 error = "La instalación requiere recuperación antes de iniciar Nova o aplicar otra actualización."
