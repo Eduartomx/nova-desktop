@@ -32,13 +32,14 @@ Antes de cargar Agent/Tk/servicios, Nova adquiere un lock del kernel. En Windows
 ```text
 %LOCALAPPDATA%\Nova\runtime\scope-<scope_id>\
   runtime.lock
+  update_supervisor.lock
   owner.json
   commands\
 ```
 
-`owner.json` registra PID, tiempo real de creación del proceso, `owner_id`/generación aleatoria, rol (`runtime` o `updater`), scope, hash de usuario, Session ID y timestamp. El lock del kernel, no el PID, es la fuente de exclusión.
+`runtime.lock` protege la instancia residente. `update_supervisor.lock` es un mutex independiente para garantizar **un solo supervisor de actualización por usuario/sesión**. En ambos casos el lock del kernel es la autoridad; PID o metadata no sustituyen la exclusión.
 
-Una segunda ejecución no construye Agent/Tk/servicios: envía `show` al `owner_id` actual y solo devuelve éxito si pudo entregar la orden.
+`owner.json` registra PID, tiempo real de creación del proceso, `owner_id`/generación aleatoria, rol (`runtime` o `updater`), scope, hash de usuario, Session ID y timestamp. Una segunda ejecución normal no construye Agent/Tk/servicios: envía `show` al `owner_id` actual y solo devuelve éxito si pudo entregar la orden.
 
 ## IPC residente
 
@@ -56,23 +57,36 @@ Está desactivado por defecto y usa `HKCU\Software\Microsoft\Windows\CurrentVers
 
 ## Updater seguro
 
-La actualización requiere simultáneamente confirmar que el proceso propietario terminó realmente y adquirir el lock de la sesión como guard del updater. `update_runner.py` captura el proceso antes de pedir `shutdown_for_update`; en Windows conserva un HANDLE y espera su terminación con APIs Win32 tipadas.
+`update_runner.py` adquiere primero `update_supervisor.lock`, antes de leer el runtime o enviar `shutdown_for_update`. El orden obligatorio es:
 
-La UI no inicia un cierre local al pulsar **Actualizar**. Únicamente valida `update_runner.py`, inicia el supervisor con `--parent-pid` y permanece activa. El supervisor es la única autoridad que envía `shutdown_for_update`; ese comando sigue llegando a `RuntimeLifecycleManager`, que lo traduce a `request_shutdown("update")`. Si `Popen()` falla, Nova permanece abierta y muestra el error.
+```text
+supervisor mutex
+→ coordinación/guard del runtime
+→ update o rollback
+→ liberación del guard del runtime
+→ intento de launch
+→ liberación del supervisor mutex
+```
 
-La coordinación del supervisor es exception-safe para errores operacionales. Si falla antes de confirmar la terminación del runtime, no se ejecuta el updater, no se lanza otra instancia y se intenta restaurar/mostrar la existente. Si el runtime ya terminó de forma verificable pero falla la adquisición/publicación del guard, tampoco se ejecuta el updater: se libera cualquier guard retenido como best-effort y se intenta exactamente un relanzamiento visible de recuperación con código `4`.
+El orden inverso no se usa. Si UI, `ACTUALIZAR_NOVA.cmd` o ejecución directa intentan iniciar simultáneamente otro supervisor, solo uno puede poseer el mutex. El segundo no envía `shutdown_for_update`, no ejecuta el updater, no modifica `update_last.json`, no relanza Nova y termina con código **5 — actualización ya en curso**.
 
-Después de una coordinación correcta adquiere el lock como rol `updater` y mantiene ese guard durante staging, reemplazo, dependencias, validación y rollback. Si no puede confirmar proceso + guard dentro del timeout, no modifica archivos.
+La UI tampoco inicia un cierre local al pulsar **Actualizar**. Guarda la referencia al supervisor, marca `_update_supervisor_active`, deshabilita el botón y rechaza dobles pulsaciones mientras ese proceso siga vivo. El seguimiento usa `poll()` mediante `root.after()`; nunca bloquea Tk con `wait()`. Si el supervisor termina mientras el runtime original sigue abierto, la UI vuelve a consultar el resultado, lo muestra en la misma sesión y rehabilita el botón. Un `Popen()` fallido restaura inmediatamente el estado y Nova permanece abierta.
 
-Una vez que la coordinación devuelve `ok=True`, el supervisor garantiza un único intento visible de relanzamiento con `--post-update`. El orden es: actualización/rollback → liberación del guard → `launch_nova()`. Lecturas de versión, escritura de estado, logging e incluso un error al liberar el guard se tratan como best-effort y no pueden saltarse ese intento de recuperación.
+El supervisor sigue siendo la única autoridad que envía `shutdown_for_update`; ese comando llega a `RuntimeLifecycleManager`, que lo traduce a `request_shutdown("update")`. La coordinación es exception-safe para errores operacionales. Si falla antes de confirmar la terminación del runtime, no se ejecuta el updater ni se lanza otra instancia. Si el runtime ya terminó de forma verificable pero falla el guard, tampoco se actualiza: se libera cualquier guard retenido best-effort y se intenta exactamente un relanzamiento visible de recuperación con código `4`.
 
-El rollback transaccional cubre **archivos administrados**: restaura archivos modificados/eliminados, elimina solo archivos creados por la actualización, conserva los unchanged y restaura `managed_files.json`. Sin embargo, si `requirements.txt` cambió y `pip` llegó a iniciarse, no existe una garantía equivalente para el estado exacto de `.venv`.
+Después de una coordinación correcta el guard del runtime permanece adquirido durante staging, reemplazo, dependencias, validación y cualquier rollback. En rutas normales, incluso ante fallo del updater, el orden sigue siendo update/rollback → release guard → un solo `launch_nova(--post-update)`.
 
-`pip install -r requirements.txt` tiene un timeout explícito de **15 minutos** por defecto; el valor es inyectable para pruebas, los valores no positivos se rechazan y los excesivos se limitan a una hora. Si expira, Nova termina y espera el proceso directo de pip, activa el rollback de archivos y marca `dependencies_may_have_changed=true` y `recovery_required=true`. Un timeout de pip no se implementa matando externamente todo `nova_updater.py`, por lo que la transacción conserva la oportunidad de recuperar archivos antes de que el supervisor libere el guard y relance Nova.
+### Timeout y árbol de pip
 
-Si una actualización falla después de iniciar pip, Nova restaura los archivos cuando es posible y conserva el backup, pero persiste un estado de recuperación con `files_rollback_ok`, `dependencies_may_have_changed` y `recovery_required`. El detalle del timeout/error queda en `data/update_recovery.json`. No se afirma que volver a ejecutar `pip install -r requirements.txt` elimine paquetes adicionales ni reconstruya exactamente el entorno anterior.
+`pip install -r requirements.txt` tiene timeout explícito de **15 minutos** por defecto; es inyectable para pruebas, rechaza valores no positivos/no finitos y limita valores excesivos a una hora. No usa `shell=True` ni existe un timeout externo que mate todo `nova_updater.py` en mitad de la transacción.
 
-UI, `ACTUALIZAR_NOVA.cmd` y ejecución interactiva directa usan el mismo supervisor.
+Pip se inicia en una unidad identificable: nueva sesión/grupo en Unix y nuevo process group en Windows. Nova usa `psutil` de forma recursiva en Windows y grupo de procesos en Unix para descubrir descendientes. Al vencer el timeout intenta terminación limpia, espera un periodo de gracia acotado, vuelve a inspeccionar el árbol, fuerza los procesos restantes, espera/reapea el proceso directo y verifica nuevamente. El mensaje **“detenidos y esperados de forma verificable”** solo se usa cuando esa comprobación termina sin procesos conocidos vivos y con inspección completa.
+
+Si la terminación queda **confirmada**, pip se considera iniciado: Nova ejecuta rollback de archivos administrados, conserva el backup y persiste `dependencies_may_have_changed=true` y `recovery_required=true`. El rollback restaura modificados/eliminados, elimina únicamente archivos creados por la actualización y restaura `managed_files.json`, pero **no reconstruye exactamente `.venv`**.
+
+Si la terminación de pip o sus descendientes **no puede confirmarse** después de la escalada normal y forzada, Nova entra en fail-closed: no inicia rollback concurrente, no declara `files_rollback_ok=true`, conserva backup/manifiesto, persiste `status=pip_termination_unconfirmed` y los PID restantes necesarios, y el supervisor **no relanza Nova desde esa `.venv`**. El updater usa código **6** para esta rama excepcional. El guard del runtime se mantiene mientras se agota la escalada y se libera después de que el updater ya decidió fail-closed; no se ejecuta Nova sobre un entorno que todavía pueda estar mutando.
+
+`data/update_recovery.json` diferencia rollback completado, rollback incompleto e incertidumbre por terminación de pip. No guarda argumentos completos de procesos, tokens, contenido de archivos ni rutas externas sensibles.
 
 ## Atajos
 
@@ -92,7 +106,7 @@ Defaults actuales: **Ctrl + Alt + N**, **Ctrl + Alt + Shift + N** y **F9**. Resi
 
 ## Nova Doctor
 
-Doctor informa lifecycle, ventana visible/oculta, bandeja lista/degradada, instancia única y scope, autostart real/conflicto, último motivo de salida y errores recientes sin contenido sensible.
+Doctor informa lifecycle, ventana visible/oculta, bandeja lista/degradada, instancia única/scope, autostart real/conflicto y estado del updater residente. El chequeo del updater indica supervisor activo/inactivo mediante el mutex del kernel, último resultado disponible, recuperación pendiente y `pip_termination_unconfirmed`; los PID restantes solo aparecen cuando esa recuperación los necesita.
 
 ## Privacidad
 
@@ -100,10 +114,10 @@ Resident Mode no añade screenshots periódicos, captura de teclado, lectura de 
 
 ## Pruebas
 
-Ubuntu ejecuta `compileall` y la suite completa. Windows ejecuta explícitamente lifecycle, owner/IPC, una integración con procesos separados reales para lock/comandos/terminación, updater, rollback transaccional, session shutdown, Gaming Awareness, Instant Wake/hotkeys y core.
+Ubuntu ejecuta `compileall` y la suite completa. Windows ejecuta explícitamente lifecycle, owner/IPC, una integración con procesos separados reales para lock/comandos/terminación, el mutex del supervisor con dos procesos simultáneos y recuperación tras muerte del propietario, updater, rollback transaccional, session shutdown, Gaming Awareness, Instant Wake/hotkeys y core. Las pruebas de pip simulan timeout/terminate/kill/verificación sin sleeps reales.
 
 La documentación técnica completa está en [`docs/v0.9.9-resident-runtime.md`](docs/v0.9.9-resident-runtime.md).
 
 ## Validación manual pendiente
 
-Antes de publicar v0.9.9 deben comprobarse en Windows 11: X→bandeja, restauración por hotkey/bandeja, wake/F9 oculto, Gaming Mode + Qwen oculto, segunda ejecución, autostart real, conflicto de otra instalación, actualización real, fallo al iniciar el supervisor sin cerrar Nova, timeout/recuperación de dependencias en un entorno controlado, salida completa y ausencia de servicios duplicados tras reiniciar.
+Antes de publicar v0.9.9 deben comprobarse en Windows 11: X→bandeja, restauración por hotkey/bandeja, wake/F9 oculto, Gaming Mode + Qwen oculto, segunda ejecución, autostart real, conflicto de otra instalación, doble clic/arranques simultáneos de actualización, actualización real, fallo al iniciar el supervisor sin cerrar Nova, timeout recuperable de dependencias y una recuperación fail-closed controlada, salida completa y ausencia de servicios duplicados tras reiniciar.
