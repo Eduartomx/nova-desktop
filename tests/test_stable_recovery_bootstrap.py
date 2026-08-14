@@ -70,8 +70,12 @@ class StableRecoveryBootstrapTests(unittest.TestCase):
                 allowed, code = app._startup_recovery_gate([])
             self.assertFalse(allowed)
             self.assertEqual(code, 7)
-            load_stable.assert_called_once_with(root)
-            stable.startup_recovery_gate.assert_called_once_with(root)
+            self.assertEqual(load_stable.call_count, 1)
+            stable_root = Path(load_stable.call_args.args[0])
+            self.assertEqual(stable_root.resolve(), root.resolve())
+            self.assertEqual(stable.startup_recovery_gate.call_count, 1)
+            startup_root = Path(stable.startup_recovery_gate.call_args.args[0])
+            self.assertEqual(startup_root.resolve(), root.resolve())
             notice.assert_not_called()
 
     def test_both_bootstraps_broken_use_native_notice_and_code_seven(self):
