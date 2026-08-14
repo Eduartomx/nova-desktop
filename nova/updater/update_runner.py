@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import ctypes
 from ctypes import wintypes
 import json
@@ -12,6 +12,7 @@ import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 
 def nova_root() -> Path:
@@ -70,7 +71,7 @@ class ProcessCapture:
         handle = kernel32.OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
         if not handle:
             error = ctypes.get_last_error()
-            if error == 87:  # ERROR_INVALID_PARAMETER: process no longer exists.
+            if error == 87:
                 return cls(pid, already_terminated=True)
             raise ctypes.WinError(error)
         capture = cls(pid, handle)
@@ -126,12 +127,20 @@ class ShutdownCoordination:
     error: str = ""
     owner_pid: int = 0
     owner_id: str = ""
+    owner_role: str = "runtime"
     command_sent: bool = False
     process_terminated: bool = False
     lock_acquired: bool = False
+    guard: Any = field(default=None, repr=False, compare=False)
+
+    def release_guard(self) -> None:
+        guard = self.guard
+        self.guard = None
+        if guard is not None:
+            guard.release()
 
 
-def _runtime_components(root: Path, *, lock_factory=None, mailbox=None):
+def _runtime_components(root: Path, *, lock_factory=None, guard_factory=None, mailbox=None):
     if str(root) not in sys.path:
         sys.path.insert(0, str(root))
     from assistant.instance_lock import InstanceLock, runtime_paths
@@ -139,10 +148,15 @@ def _runtime_components(root: Path, *, lock_factory=None, mailbox=None):
 
     paths = runtime_paths()
     if lock_factory is None:
-        lock_factory = lambda: InstanceLock(path=paths.lock, owner_path=paths.owner)
+        lock_factory = lambda: InstanceLock(path=paths.lock, owner_path=paths.owner, publish_owner=False, role="observer")
+    if guard_factory is None:
+        if lock_factory is not None and getattr(lock_factory, "_nova_injected", False):
+            guard_factory = lock_factory
+        else:
+            guard_factory = lambda: InstanceLock(path=paths.lock, owner_path=paths.owner, publish_owner=True, role="updater")
     if mailbox is None:
         mailbox = InstanceCommandMailbox(paths.commands)
-    return lock_factory, mailbox
+    return lock_factory, guard_factory, mailbox
 
 
 def _probe_lock(lock_factory) -> bool:
@@ -153,93 +167,109 @@ def _probe_lock(lock_factory) -> bool:
     return True
 
 
+def _take_guard(guard_factory, deadline: float):
+    event = threading.Event()
+    while time.monotonic() <= deadline:
+        guard = guard_factory()
+        if guard.acquire():
+            return guard
+        event.wait(min(0.05, max(0.0, deadline - time.monotonic())))
+    return None
+
+
 def coordinate_runtime_shutdown(
     root: Path,
     timeout: float = 20.0,
     *,
     expected_pid: int = 0,
     lock_factory=None,
+    guard_factory=None,
     mailbox=None,
     process_factory=None,
 ) -> ShutdownCoordination:
-    """Authorize file writes only after owner death AND lock reacquisition."""
-    lock_factory, mailbox = _runtime_components(root, lock_factory=lock_factory, mailbox=mailbox)
+    """Return only with the old process dead and an updater guard held."""
+    injected_lock_factory = lock_factory
+    if injected_lock_factory is not None and guard_factory is None:
+        guard_factory = injected_lock_factory
+    observer_factory, guard_factory, mailbox = _runtime_components(
+        root,
+        lock_factory=lock_factory,
+        guard_factory=guard_factory,
+        mailbox=mailbox,
+    )
     process_factory = process_factory or ProcessCapture.open
     deadline = time.monotonic() + max(0.0, float(timeout))
 
-    lock_free_at_capture = _probe_lock(lock_factory)
-    observer = lock_factory()
+    lock_free_at_capture = _probe_lock(observer_factory)
+    observer = observer_factory()
     owner = observer.read_owner()
     if not owner:
-        if lock_free_at_capture:
-            return ShutdownCoordination(True, process_terminated=True, lock_acquired=True)
-        return ShutdownCoordination(False, "runtime_owner_metadata_unavailable")
+        if not lock_free_at_capture:
+            return ShutdownCoordination(False, "runtime_owner_metadata_unavailable")
+        guard = _take_guard(guard_factory, deadline)
+        if guard is None:
+            return ShutdownCoordination(False, "runtime_guard_timeout")
+        return ShutdownCoordination(True, process_terminated=True, lock_acquired=True, guard=guard, owner_role="none")
 
     owner_pid = int(owner.get("pid") or 0)
     owner_id = str(owner.get("owner_id") or "")
+    owner_role = str(owner.get("role") or "runtime")
+    if owner_role == "updater":
+        return ShutdownCoordination(False, "update_already_in_progress", owner_pid=owner_pid, owner_id=owner_id, owner_role=owner_role)
     if expected_pid and owner_pid != int(expected_pid):
-        return ShutdownCoordination(False, "runtime_owner_pid_mismatch", owner_pid=owner_pid, owner_id=owner_id)
+        return ShutdownCoordination(False, "runtime_owner_pid_mismatch", owner_pid=owner_pid, owner_id=owner_id, owner_role=owner_role)
 
     try:
         captured = process_factory(owner_pid)
     except Exception as exc:
-        # If the lock is free but stale metadata points at a PID we cannot open,
-        # fail safe rather than guessing that the previous runtime is gone.
-        return ShutdownCoordination(False, f"owner_process_capture_failed:{type(exc).__name__}", owner_pid=owner_pid, owner_id=owner_id, lock_acquired=lock_free_at_capture)
+        return ShutdownCoordination(False, f"owner_process_capture_failed:{type(exc).__name__}", owner_pid=owner_pid, owner_id=owner_id, owner_role=owner_role, lock_acquired=lock_free_at_capture)
 
     command_sent = False
     try:
         verify = observer.read_owner()
         if verify:
             if int(verify.get("pid") or 0) != owner_pid or str(verify.get("owner_id") or "") != owner_id:
-                return ShutdownCoordination(False, "runtime_owner_changed_during_capture", owner_pid=owner_pid, owner_id=owner_id)
+                return ShutdownCoordination(False, "runtime_owner_changed_during_capture", owner_pid=owner_pid, owner_id=owner_id, owner_role=owner_role)
 
-        # If the lock was already free, this may be the final-unlock window:
-        # never send shutdown to a process that no longer owns the lock, but do
-        # still wait for the captured PID before authorizing file replacement.
         if not lock_free_at_capture and not getattr(captured, "already_terminated", False):
             command_sent = bool(mailbox.send("shutdown_for_update", target_owner_id=owner_id))
             if not command_sent:
-                return ShutdownCoordination(False, "shutdown_command_delivery_failed", owner_pid=owner_pid, owner_id=owner_id)
+                return ShutdownCoordination(False, "shutdown_command_delivery_failed", owner_pid=owner_pid, owner_id=owner_id, owner_role=owner_role)
 
         remaining = max(0.0, deadline - time.monotonic())
         try:
             process_terminated = bool(captured.wait(remaining))
         except Exception as exc:
-            return ShutdownCoordination(False, f"owner_process_wait_failed:{type(exc).__name__}", owner_pid=owner_pid, owner_id=owner_id, command_sent=command_sent)
+            return ShutdownCoordination(False, f"owner_process_wait_failed:{type(exc).__name__}", owner_pid=owner_pid, owner_id=owner_id, owner_role=owner_role, command_sent=command_sent)
         if not process_terminated:
-            return ShutdownCoordination(False, "owner_process_timeout", owner_pid=owner_pid, owner_id=owner_id, command_sent=command_sent, lock_acquired=lock_free_at_capture)
+            return ShutdownCoordination(False, "owner_process_timeout", owner_pid=owner_pid, owner_id=owner_id, owner_role=owner_role, command_sent=command_sent, lock_acquired=lock_free_at_capture)
     finally:
         try:
             captured.close()
         except Exception:
             pass
 
-    event = threading.Event()
-    while time.monotonic() <= deadline:
-        if _probe_lock(lock_factory):
-            return ShutdownCoordination(
-                True,
-                owner_pid=owner_pid,
-                owner_id=owner_id,
-                command_sent=command_sent,
-                process_terminated=True,
-                lock_acquired=True,
-            )
-        event.wait(min(0.05, max(0.0, deadline - time.monotonic())))
+    guard = _take_guard(guard_factory, deadline)
+    if guard is None:
+        return ShutdownCoordination(False, "runtime_lock_timeout_after_process_exit", owner_pid=owner_pid, owner_id=owner_id, owner_role=owner_role, command_sent=command_sent, process_terminated=True)
     return ShutdownCoordination(
-        False,
-        "runtime_lock_timeout_after_process_exit",
+        True,
         owner_pid=owner_pid,
         owner_id=owner_id,
+        owner_role=owner_role,
         command_sent=command_sent,
         process_terminated=True,
-        lock_acquired=False,
+        lock_acquired=True,
+        guard=guard,
     )
 
 
-def request_runtime_shutdown(root: Path, timeout: float = 20.0, *, lock_factory=None, mailbox=None, process_factory=None) -> bool:
-    return bool(coordinate_runtime_shutdown(root, timeout, lock_factory=lock_factory, mailbox=mailbox, process_factory=process_factory).ok)
+def request_runtime_shutdown(root: Path, timeout: float = 20.0, *, lock_factory=None, guard_factory=None, mailbox=None, process_factory=None) -> bool:
+    result = coordinate_runtime_shutdown(root, timeout, lock_factory=lock_factory, guard_factory=guard_factory, mailbox=mailbox, process_factory=process_factory)
+    try:
+        return bool(result.ok)
+    finally:
+        result.release_guard()
 
 
 def status_path(root: Path) -> Path:
@@ -270,10 +300,10 @@ def launch_nova(root: Path) -> tuple[bool, str]:
 
 
 def _show_surviving_runtime(root: Path, result: ShutdownCoordination) -> bool:
-    if not result.owner_id:
+    if not result.owner_id or result.owner_role != "runtime":
         return False
     try:
-        _lock_factory, mailbox = _runtime_components(root)
+        _observer, _guard, mailbox = _runtime_components(root)
         return bool(mailbox.send("show", target_owner_id=result.owner_id))
     except Exception:
         return False
@@ -314,11 +344,17 @@ def main(argv=None) -> int:
         _show_surviving_runtime(root, coordination)
         return 4
 
-    rc, runner_error = run_update(root, log)
-    after = read_version(root)
-    ok = rc == 0
-    error = runner_error or ("" if ok else f"El updater terminó con código {rc}. Revisa {log}.")
-    write_status(root, ok=ok, before=before, after=after, log=log, error=error)
+    try:
+        rc, runner_error = run_update(root, log)
+        after = read_version(root)
+        ok = rc == 0
+        error = runner_error or ("" if ok else f"El updater terminó con código {rc}. Revisa {log}.")
+        write_status(root, ok=ok, before=before, after=after, log=log, error=error)
+    finally:
+        # Keep the updater guard for the entire file replacement/validation
+        # transaction. Release it only immediately before starting the one
+        # visible post-update runtime.
+        coordination.release_guard()
 
     launched, launch_detail = launch_nova(root)
     if not launched:
