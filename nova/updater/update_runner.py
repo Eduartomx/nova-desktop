@@ -190,8 +190,6 @@ def _runtime_components(root: Path, *, lock_factory=None, guard_factory=None, ma
         if lock_factory is not None and getattr(lock_factory, "_nova_injected", False):
             guard_factory = lock_factory
         else:
-            # Preserve previous owner.json until the kernel lock has been taken
-            # and the previous process identity has been validated under it.
             guard_factory = lambda: InstanceLock(path=paths.lock, owner_path=paths.owner, publish_owner=False, role="updater")
     if mailbox is None:
         mailbox = InstanceCommandMailbox(paths.commands)
@@ -240,12 +238,6 @@ def _guarded_previous_owner_result(
     process_factory,
     deadline: float,
 ) -> ShutdownCoordination:
-    """Validate the process represented by metadata while *guard* is held.
-
-    ``guard`` is deliberately not published yet, so ``owner_snapshot`` remains
-    the previous generation evidence. A live process without a creation marker
-    is never waited on or assumed to be the old Nova process.
-    """
     owner_pid, owner_id, owner_role, owner_creation = _owner_values(owner_snapshot)
     target_pid = int(expected_pid or owner_pid or 0)
     target_creation = owner_creation if target_pid > 0 and target_pid == owner_pid else 0
@@ -269,8 +261,6 @@ def _guarded_previous_owner_result(
             if getattr(captured, "already_terminated", False):
                 process_terminated = True
             elif target_creation <= 0:
-                # Legacy/no metadata cannot distinguish the old process from PID
-                # reuse. Fail closed rather than waiting on an unrelated process.
                 guard.release()
                 return ShutdownCoordination(
                     False,
@@ -283,8 +273,6 @@ def _guarded_previous_owner_result(
                     lock_acquired=True,
                 )
             elif not captured.matches_creation_time(target_creation):
-                # Same PID, different process creation time: the previous owner
-                # is gone and this PID belongs to an unrelated process.
                 process_terminated = True
             else:
                 remaining = max(0.0, deadline - time.monotonic())
@@ -347,9 +335,6 @@ def _acquire_verified_guard(observer, guard_factory, deadline: float, process_fa
     event = threading.Event()
     last = None
     while time.monotonic() <= deadline:
-        # Snapshot before acquiring. Once the guard succeeds, no later owner can
-        # acquire the kernel lock and this snapshot is stable evidence of the
-        # generation that most recently released it.
         snapshot = observer.read_owner()
         guard = _try_guard(guard_factory)
         if guard is not None:
@@ -399,9 +384,6 @@ def coordinate_runtime_shutdown(
     observer = observer_factory()
     owner_snapshot = observer.read_owner()
 
-    # Acquire the real guard directly; never probe and release before updating.
-    # Because the default guard is initially unpublished, previous owner.json is
-    # still available for validation under exclusive lock.
     guard = _try_guard(guard_factory)
     if guard is not None:
         stable_snapshot = observer.read_owner() or owner_snapshot
@@ -413,8 +395,6 @@ def coordinate_runtime_shutdown(
             deadline=deadline,
         )
 
-    # Lock is occupied. Strong metadata is mandatory before sending a command or
-    # waiting on a process identity.
     event = threading.Event()
     last_identity_error = "runtime_owner_metadata_unavailable"
     owner_pid = 0
@@ -496,8 +476,6 @@ def coordinate_runtime_shutdown(
                         )
                     guarded = _acquire_verified_guard(observer, guard_factory, deadline, process_factory)
                     if not guarded.ok:
-                        # Keep the identity/command that initiated this shutdown in
-                        # the diagnostic result even if a competing owner won.
                         guarded.command_sent = command_sent
                         if not guarded.owner_pid:
                             guarded.owner_pid = owner_pid
@@ -518,8 +496,6 @@ def coordinate_runtime_shutdown(
                 except Exception:
                     pass
 
-        # Metadata can lag a crashed owner. If the kernel lock becomes free,
-        # acquire it without overwriting evidence, then validate that evidence.
         snapshot = owner
         guard = _try_guard(guard_factory)
         if guard is not None:
@@ -617,6 +593,30 @@ def run_update(root: Path, log: Path) -> tuple[int, str]:
         return 2, str(exc)
 
 
+def _append_log_best_effort(log: Path, text: str) -> None:
+    try:
+        log.parent.mkdir(parents=True, exist_ok=True)
+        with open(log, "a", encoding="utf-8", errors="replace") as stream:
+            stream.write(str(text))
+    except Exception:
+        return
+
+
+def _write_status_best_effort(root: Path, *, ok: bool, before: str, after: str, log: Path, error: str) -> None:
+    try:
+        write_status(root, ok=ok, before=before, after=after, log=log, error=error)
+    except Exception as exc:
+        _append_log_best_effort(log, f"\n[WARN ESTADO] {type(exc).__name__}: {exc}\n")
+
+
+def _read_version_best_effort(root: Path, fallback: str, log: Path, label: str) -> str:
+    try:
+        return read_version(root)
+    except Exception as exc:
+        _append_log_best_effort(log, f"\n[WARN VERSION {label}] {type(exc).__name__}: {exc}\n")
+        return fallback
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="Supervisa una actualización de Nova y relanza la aplicación.")
     parser.add_argument("--parent-pid", type=int, default=0)
@@ -624,34 +624,63 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
     root = nova_root()
     logs = root / "data" / "updater_logs"
-    logs.mkdir(parents=True, exist_ok=True)
     log = logs / ("update_" + time.strftime("%Y%m%d_%H%M%S") + ".log")
-    before = read_version(root)
+    try:
+        logs.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
 
+    before = _read_version_best_effort(root, "0.0.0", log, "ANTES")
     coordination = coordinate_runtime_shutdown(root, args.wait_seconds, expected_pid=args.parent_pid)
     if not coordination.ok:
         error = "Nova no terminó de forma verificable; no se modificaron archivos. " + coordination.error
-        write_status(root, ok=False, before=before, after=before, log=log, error=error)
-        _show_surviving_runtime(root, coordination)
+        _write_status_best_effort(root, ok=False, before=before, after=before, log=log, error=error)
+        try:
+            _show_surviving_runtime(root, coordination)
+        except Exception as exc:
+            _append_log_best_effort(log, f"\n[WARN SHOW] {type(exc).__name__}: {exc}\n")
         return 4
 
-    try:
-        rc, runner_error = run_update(root, log)
-        after = read_version(root)
-        ok = rc == 0
-        error = runner_error or ("" if ok else f"El updater terminó con código {rc}. Revisa {log}.")
-        write_status(root, ok=ok, before=before, after=after, log=log, error=error)
-    finally:
-        # The updater guard covers the complete update/rollback transaction and
-        # is released only immediately before the one visible post-update launch.
-        coordination.release_guard()
+    rc = 2
+    ok = False
+    after = before
+    error = ""
+    runner_error = ""
+    launched = False
+    launch_detail = ""
 
-    launched, launch_detail = launch_nova(root)
-    if not launched:
-        with open(log, "a", encoding="utf-8", errors="replace") as stream:
-            stream.write("\n[ERROR REINICIO] " + launch_detail + "\n")
-        return 3 if ok else rc or 2
-    return 0 if ok else rc or 2
+    try:
+        try:
+            rc, runner_error = run_update(root, log)
+            rc = int(rc)
+        except Exception as exc:
+            rc = 2
+            runner_error = f"run_update inesperado: {type(exc).__name__}: {exc}"
+        ok = rc == 0
+        if runner_error:
+            error = str(runner_error)
+        elif not ok:
+            error = f"El updater terminó con código {rc}. Revisa {log}."
+
+        after = _read_version_best_effort(root, before, log, "DESPUÉS")
+        _write_status_best_effort(root, ok=ok, before=before, after=after, log=log, error=error)
+    finally:
+        try:
+            coordination.release_guard()
+        except Exception as exc:
+            _append_log_best_effort(log, f"\n[WARN GUARD] {type(exc).__name__}: {exc}\n")
+
+        try:
+            launched, launch_detail = launch_nova(root)
+        except Exception as exc:
+            launched = False
+            launch_detail = f"{type(exc).__name__}: {exc}"
+        if not launched:
+            _append_log_best_effort(log, "\n[ERROR REINICIO] " + str(launch_detail or "fallo desconocido") + "\n")
+
+    if ok:
+        return 0 if launched else 3
+    return rc or 2
 
 
 if __name__ == "__main__":
