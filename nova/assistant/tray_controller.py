@@ -3,7 +3,9 @@ from __future__ import annotations
 """Pystray adapter for Nova Resident Mode.
 
 The tray thread never manipulates Tk directly. ``available`` is only set after
-pystray's setup callback confirms that the backend/icon is actually ready.
+pystray's setup callback makes the icon visible and confirms that visibility.
+Each start attempt owns a generation/event so late callbacks cannot validate a
+newer attempt.
 """
 
 import threading
@@ -25,54 +27,117 @@ class TrayController:
         self._notify_last: dict[str, float] = {}
         self._notify_lock = threading.Lock()
         self._start_lock = threading.Lock()
+        self._state_lock = threading.RLock()
+        self._generation = 0
+        self._active_generation = 0
 
-    def _degrade(self, detail: str) -> bool:
-        self.available = False
-        self.degraded = True
-        self.last_error = str(detail or "tray unavailable")[:240]
-        icon = self.icon
-        self.icon = None
-        if icon is not None:
+    def _attempt_current(self, generation: int, icon) -> bool:
+        with self._state_lock:
+            return self._active_generation == int(generation) and self.icon is icon
+
+    def _restore_hidden_window(self) -> None:
+        try:
+            hidden = bool(getattr(self.lifecycle, "window_hidden", False)) or str(getattr(self.lifecycle, "state", "")) == "hidden"
+            if hidden:
+                # RuntimeLifecycleManager.show_window() schedules _show_now on Tk.
+                # Never touch Tk widgets from the pystray/backend thread here.
+                self.lifecycle.show_window()
+        except Exception:
+            pass
+
+    def _degrade(self, detail: str, *, generation: int | None = None, icon=None) -> bool:
+        with self._state_lock:
+            if generation is not None:
+                if self._active_generation != int(generation):
+                    return False
+                if icon is not None and self.icon is not icon:
+                    return False
+            current_icon = icon if icon is not None else self.icon
+            if icon is None or self.icon is current_icon:
+                self.icon = None
+            self.available = False
+            self.degraded = True
+            self.last_error = str(detail or "tray unavailable")[:240]
+            if generation is None or self._active_generation == int(generation):
+                self._active_generation = 0
+            ready = self._ready
+            ready.clear()
+        if current_icon is not None:
             try:
-                icon.stop()
+                current_icon.stop()
             except Exception:
                 pass
+        self._restore_hidden_window()
         return False
 
     def start(self) -> bool:
         with self._start_lock:
-            if self.available:
-                return True
-            self._ready.clear()
-            self.degraded = False
-            self.last_error = ""
+            with self._state_lock:
+                if self.available:
+                    return True
+                self._generation += 1
+                generation = self._generation
+                ready = threading.Event()
+                self._ready = ready
+                self._active_generation = generation
+                self.degraded = False
+                self.last_error = ""
+
+            icon = None
+            outcome = {"ok": False, "error": ""}
             try:
                 icon = self.icon_factory(self) if self.icon_factory else self._default_icon()
-                self.icon = icon
+                with self._state_lock:
+                    if self._active_generation != generation:
+                        return False
+                    self.icon = icon
 
-                def setup(_icon):
-                    self._ready.set()
+                def setup(callback_icon):
+                    # A callback belonging to an expired attempt is inert. In
+                    # particular it must not set visible=True after timeout.
+                    if callback_icon is not icon or not self._attempt_current(generation, icon):
+                        return
+                    try:
+                        callback_icon.visible = True
+                        if not bool(getattr(callback_icon, "visible", False)):
+                            raise RuntimeError("tray icon did not become visible")
+                    except Exception as exc:
+                        with self._state_lock:
+                            if self._active_generation == generation and self.icon is icon:
+                                outcome["error"] = f"{type(exc).__name__}: {exc}"
+                                ready.set()
+                        return
+                    with self._state_lock:
+                        if self._active_generation == generation and self.icon is icon:
+                            outcome["ok"] = True
+                            ready.set()
 
                 try:
                     icon.run_detached(setup=setup)
                 except TypeError:
-                    # Dependency-injected legacy doubles may expose the old
-                    # no-argument shape. Production pystray always takes setup;
-                    # only explicit test injection receives this compatibility.
+                    # Compatibility only for explicitly injected legacy doubles.
+                    # Production pystray receives the setup callback above.
                     if self.icon_factory is None:
                         raise
                     icon.run_detached()
-                    self._ready.set()
-                if not self._ready.wait(self.ready_timeout):
-                    return self._degrade("tray initialization timeout")
-                if getattr(icon, "visible", True) is False:
-                    return self._degrade("tray backend did not make icon visible")
-                self.available = True
-                self.degraded = False
-                self.last_error = ""
+                    setup(icon)
+
+                if not ready.wait(self.ready_timeout):
+                    return self._degrade("tray initialization timeout", generation=generation, icon=icon)
+                if outcome["error"]:
+                    return self._degrade(outcome["error"], generation=generation, icon=icon)
+                if not outcome["ok"] or not bool(getattr(icon, "visible", False)):
+                    return self._degrade("tray backend did not make icon visible", generation=generation, icon=icon)
+
+                with self._state_lock:
+                    if self._active_generation != generation or self.icon is not icon:
+                        return False
+                    self.available = True
+                    self.degraded = False
+                    self.last_error = ""
                 return True
             except Exception as exc:
-                return self._degrade(f"{type(exc).__name__}: {exc}")
+                return self._degrade(f"{type(exc).__name__}: {exc}", generation=generation, icon=icon)
 
     def _default_icon(self):
         import pystray
@@ -134,7 +199,7 @@ class TrayController:
             if self.icon is not None and self.available:
                 self.icon.update_menu()
         except Exception as exc:
-            self._degrade(f"menu refresh failed: {type(exc).__name__}")
+            self._degrade(f"menu refresh failed: {type(exc).__name__}: {exc}")
 
     def _run_worker(self, callback: Callable[[], Any]) -> None:
         threading.Thread(target=self._worker, args=(callback,), daemon=True, name="nova-tray-action").start()
@@ -198,17 +263,27 @@ class TrayController:
             return False
 
     def stop(self) -> None:
-        icon = self.icon
-        self.icon = None
-        self.available = False
-        self._ready.clear()
+        with self._state_lock:
+            self._generation += 1
+            self._active_generation = 0
+            icon = self.icon
+            self.icon = None
+            self.available = False
+            self._ready.clear()
         if icon is not None:
-            icon.stop()
+            try:
+                icon.stop()
+            except Exception:
+                pass
 
     def status(self) -> dict[str, Any]:
+        with self._state_lock:
+            ready = bool(self._ready.is_set() and self.available and self._active_generation)
+            generation = int(self._active_generation)
         return {
             "available": self.available,
-            "ready": bool(self._ready.is_set() and self.available),
+            "ready": ready,
             "degraded": self.degraded,
             "last_error": self.last_error,
+            "generation": generation,
         }
