@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+import subprocess
 import tempfile
 import unittest
 from unittest import mock
@@ -77,6 +78,11 @@ class UpdaterTransactionTests(unittest.TestCase):
             self.assertEqual(after.get(rel), digest, rel)
         self.assertEqual(set(after) - set(before), {"data/update_recovery.json"})
 
+    def timed_out_process(self, timeout):
+        proc = mock.Mock()
+        proc.wait.side_effect = [subprocess.TimeoutExpired(["pip"], timeout), 0]
+        return proc
+
     def test_validation_failure_restores_tree_byte_for_byte_without_dependency_uncertainty(self):
         _base, root, stage, backups, managed, original, new = self.fixture()
         before = snapshot_tree(root)
@@ -138,6 +144,31 @@ class UpdaterTransactionTests(unittest.TestCase):
             nova_updater.restore_backup(backup)
         self.assertEqual(managed.read_bytes(), managed_before)
 
+    def test_pip_finishes_before_timeout_normally_without_shell(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "requirements.txt").write_text("example==1\n", encoding="utf-8")
+            proc = mock.Mock()
+            proc.wait.return_value = 0
+            with mock.patch.object(nova_updater, "ROOT", root), \
+                 mock.patch("updater.nova_updater.subprocess.Popen", return_value=proc) as popen:
+                nova_updater._install_requirements(timeout_seconds=12.5)
+        popen.assert_called_once()
+        self.assertNotIn("shell", popen.call_args.kwargs)
+        proc.wait.assert_called_once_with(timeout=12.5)
+        proc.terminate.assert_not_called()
+        proc.kill.assert_not_called()
+
+    def test_pip_timeout_validation_rejects_nonpositive_and_caps_absurd_values(self):
+        with self.assertRaises(ValueError):
+            nova_updater._normalize_pip_timeout(0)
+        with self.assertRaises(ValueError):
+            nova_updater._normalize_pip_timeout(-1)
+        self.assertEqual(
+            nova_updater._normalize_pip_timeout(nova_updater.PIP_INSTALL_TIMEOUT_MAX_SECONDS * 100),
+            nova_updater.PIP_INSTALL_TIMEOUT_MAX_SECONDS,
+        )
+
     def test_pip_failure_after_start_restores_files_but_marks_dependency_recovery_required(self):
         _base, root, stage, backups, managed, original, new = self.fixture()
         write_file(stage, "requirements.txt", b"package-new==2\n")
@@ -159,6 +190,92 @@ class UpdaterTransactionTests(unittest.TestCase):
         recovery = json.loads((root / "data" / "update_recovery.json").read_text(encoding="utf-8"))
         self.assertTrue(recovery["recovery_required"])
         self.assertTrue(backup.is_dir())
+
+    def test_pip_timeout_restores_sha_removes_created_restores_managed_and_preserves_backup(self):
+        _base, root, stage, backups, managed, original, new = self.fixture()
+        write_file(stage, "requirements.txt", b"package-new==2\n")
+        before = snapshot_tree(root)
+        managed_before = managed.read_bytes()
+        timeout = 0.25
+        proc = self.timed_out_process(timeout)
+        with self.patch_install(root, managed), \
+             mock.patch("updater.nova_updater.subprocess.Popen", return_value=proc) as popen, \
+             mock.patch.object(nova_updater, "validate_install") as validate:
+            with self.assertRaisesRegex(RuntimeError, "timeout"):
+                nova_updater.execute_transaction(
+                    stage,
+                    list(new),
+                    set(original),
+                    "v-new",
+                    "old",
+                    "new",
+                    backup_root=backups,
+                    pip_timeout_seconds=timeout,
+                )
+        validate.assert_not_called()
+        popen.assert_called_once()
+        self.assertNotIn("shell", popen.call_args.kwargs)
+        proc.terminate.assert_called_once()
+        self.assertEqual(proc.wait.call_count, 2)
+        self.assert_previous_tree_preserved_with_recovery_marker(root, before)
+        self.assertFalse((root / "assistant" / "created.py").exists())
+        self.assertEqual(managed.read_bytes(), managed_before)
+        backup = self.latest_backup(backups)
+        self.assertTrue(backup.is_dir())
+        status = json.loads((backup / "rollback_status.json").read_text(encoding="utf-8"))
+        self.assertTrue(status["files_rollback_ok"])
+        self.assertTrue(status["dependencies_may_have_changed"])
+        self.assertTrue(status["recovery_required"])
+        self.assertIn("timeout", status["recovery_detail"])
+        recovery_path = root / "data" / "update_recovery.json"
+        self.assertTrue(recovery_path.is_file())
+        recovery = json.loads(recovery_path.read_text(encoding="utf-8"))
+        self.assertTrue(recovery["files_rollback_ok"])
+        self.assertTrue(recovery["dependencies_may_have_changed"])
+        self.assertTrue(recovery["recovery_required"])
+        self.assertIn("timeout", recovery["message"])
+
+    def test_pip_timeout_with_partial_rollback_marks_both_failures_and_preserves_backup(self):
+        _base, root, stage, backups, managed, original, new = self.fixture()
+        write_file(stage, "requirements.txt", b"package-new==2\n")
+        timeout = 0.25
+        proc = self.timed_out_process(timeout)
+        real_replace = nova_updater._atomic_replace_from
+
+        def fail_one_restore(src, dst):
+            src = Path(src)
+            dst = Path(dst)
+            if backups in src.parents and dst == root / "assistant" / "modified.py":
+                raise RuntimeError("injected restore failure")
+            return real_replace(src, dst)
+
+        with self.patch_install(root, managed), \
+             mock.patch("updater.nova_updater.subprocess.Popen", return_value=proc), \
+             mock.patch.object(nova_updater, "_atomic_replace_from", side_effect=fail_one_restore):
+            with self.assertRaisesRegex(RuntimeError, "rollback incompleto"):
+                nova_updater.execute_transaction(
+                    stage,
+                    list(new),
+                    set(original),
+                    "v-new",
+                    "old",
+                    "new",
+                    backup_root=backups,
+                    pip_timeout_seconds=timeout,
+                )
+        backup = self.latest_backup(backups)
+        self.assertTrue(backup.is_dir())
+        status = json.loads((backup / "rollback_status.json").read_text(encoding="utf-8"))
+        self.assertFalse(status["files_rollback_ok"])
+        self.assertTrue(status["dependencies_may_have_changed"])
+        self.assertTrue(status["recovery_required"])
+        self.assertTrue(status["errors"])
+        self.assertIn("timeout", status["recovery_detail"])
+        recovery = json.loads((root / "data" / "update_recovery.json").read_text(encoding="utf-8"))
+        self.assertFalse(recovery["files_rollback_ok"])
+        self.assertTrue(recovery["dependencies_may_have_changed"])
+        self.assertTrue(recovery["recovery_required"])
+        self.assertIn("rollback de archivos quedó incompleto", recovery["message"])
 
     def test_successful_pip_then_validation_failure_marks_dependency_uncertainty(self):
         _base, root, stage, backups, managed, original, new = self.fixture()
@@ -188,6 +305,7 @@ class UpdaterTransactionTests(unittest.TestCase):
         self.assertTrue(status["files_rollback_ok"])
         self.assertFalse(status["dependencies_may_have_changed"])
         self.assertFalse(status["recovery_required"])
+        self.assertFalse((root / "data" / "update_recovery.json").exists())
 
     def test_restore_failure_is_explicit_and_backup_is_preserved(self):
         _base, root, stage, backups, managed, original, new = self.fixture()
