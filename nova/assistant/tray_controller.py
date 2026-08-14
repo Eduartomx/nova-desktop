@@ -2,8 +2,8 @@ from __future__ import annotations
 
 """Pystray adapter for Nova Resident Mode.
 
-The tray thread never manipulates Tk directly. Window operations are delegated
-to RuntimeLifecycleManager and slow Qwen/update actions run on worker threads.
+The tray thread never manipulates Tk directly. ``available`` is only set after
+pystray's setup callback confirms that the backend/icon is actually ready.
 """
 
 import threading
@@ -12,7 +12,7 @@ from typing import Any, Callable
 
 
 class TrayController:
-    def __init__(self, ui, lifecycle, icon_factory=None):
+    def __init__(self, ui, lifecycle, icon_factory=None, *, ready_timeout: float = 3.0):
         self.ui = ui
         self.lifecycle = lifecycle
         self.icon_factory = icon_factory
@@ -20,25 +20,52 @@ class TrayController:
         self.available = False
         self.degraded = False
         self.last_error = ""
+        self.ready_timeout = max(0.1, float(ready_timeout))
+        self._ready = threading.Event()
         self._notify_last: dict[str, float] = {}
         self._notify_lock = threading.Lock()
+        self._start_lock = threading.Lock()
+
+    def _degrade(self, detail: str) -> bool:
+        self.available = False
+        self.degraded = True
+        self.last_error = str(detail or "tray unavailable")[:240]
+        icon = self.icon
+        self.icon = None
+        if icon is not None:
+            try:
+                icon.stop()
+            except Exception:
+                pass
+        return False
 
     def start(self) -> bool:
-        if self.available:
-            return True
-        try:
-            self.icon = self.icon_factory(self) if self.icon_factory else self._default_icon()
-            self.icon.run_detached()
-            self.available = True
+        with self._start_lock:
+            if self.available:
+                return True
+            self._ready.clear()
             self.degraded = False
             self.last_error = ""
-            return True
-        except Exception as exc:
-            self.icon = None
-            self.available = False
-            self.degraded = True
-            self.last_error = f"{type(exc).__name__}: {exc}"[:240]
-            return False
+            try:
+                icon = self.icon_factory(self) if self.icon_factory else self._default_icon()
+                self.icon = icon
+
+                def setup(_icon):
+                    self._ready.set()
+
+                # pystray guarantees setup is invoked only after the icon backend
+                # is ready. Merely returning from run_detached is insufficient.
+                icon.run_detached(setup=setup)
+                if not self._ready.wait(self.ready_timeout):
+                    return self._degrade("tray initialization timeout")
+                if getattr(icon, "visible", True) is False:
+                    return self._degrade("tray backend did not make icon visible")
+                self.available = True
+                self.degraded = False
+                self.last_error = ""
+                return True
+            except Exception as exc:
+                return self._degrade(f"{type(exc).__name__}: {exc}")
 
     def _default_icon(self):
         import pystray
@@ -97,10 +124,10 @@ class TrayController:
 
     def refresh_menu(self) -> None:
         try:
-            if self.icon is not None:
+            if self.icon is not None and self.available:
                 self.icon.update_menu()
-        except Exception:
-            return
+        except Exception as exc:
+            self._degrade(f"menu refresh failed: {type(exc).__name__}")
 
     def _run_worker(self, callback: Callable[[], Any]) -> None:
         threading.Thread(target=self._worker, args=(callback,), daemon=True, name="nova-tray-action").start()
@@ -136,17 +163,15 @@ class TrayController:
     def _toggle_autostart(self) -> None:
         manager = self.ui.autostart_manager
         enabled = not manager.is_enabled()
-        if not manager.set_enabled(enabled):
-            raise RuntimeError("No se pudo modificar el inicio con Windows")
+        result = manager.configure(enabled)
+        if not result.get("ok"):
+            raise RuntimeError(str(result.get("error") or "No se pudo modificar el inicio con Windows"))
         resident = self.ui.config.setdefault("resident_mode", {})
         resident["start_with_windows"] = enabled
         from .config import save_config
         save_config(self.ui.config)
 
     def notify(self, key: str, title: str, message: str) -> bool:
-        # Base UI historically reports every inference as a completed result.
-        # Resident Mode intentionally ignores that generic signal; only the
-        # TaskEngine emits the dedicated long_task_completed notification.
         if str(key) == "task_completed":
             return False
         resident = self.ui.config.get("resident_mode", {}) if isinstance(self.ui.config, dict) else {}
@@ -159,8 +184,6 @@ class TrayController:
                 return False
             self._notify_last[str(key)] = now
         try:
-            # Mensajes de bandeja son deliberadamente genéricos: nunca incluyen
-            # prompts, títulos de ventanas ni contenido de pantalla.
             self.icon.notify(str(message)[:220], str(title)[:80])
             return True
         except Exception as exc:
@@ -171,8 +194,14 @@ class TrayController:
         icon = self.icon
         self.icon = None
         self.available = False
+        self._ready.clear()
         if icon is not None:
             icon.stop()
 
     def status(self) -> dict[str, Any]:
-        return {"available": self.available, "degraded": self.degraded, "last_error": self.last_error}
+        return {
+            "available": self.available,
+            "ready": bool(self._ready.is_set() and self.available),
+            "degraded": self.degraded,
+            "last_error": self.last_error,
+        }
