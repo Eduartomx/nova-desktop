@@ -37,6 +37,16 @@ def _update_status_token(path: Path) -> str:
         return ''
 
 
+def _mark_update_status_displayed(path: Path, data: dict) -> None:
+    """Preserve the last result for Doctor while preventing repeated UI display."""
+    payload = dict(data)
+    payload['displayed'] = True
+    try:
+        Path(path).write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8')
+    except Exception:
+        pass
+
+
 def _schedule_update_poll(ui, *, root: Path, consume_status=None) -> None:
     tk_root = getattr(ui, 'root', None)
     if tk_root is None:
@@ -230,12 +240,14 @@ def install_ui_v060():
             if not isinstance(data, dict):
                 return False
             token = _update_status_token(path)
+            if bool(data.get('displayed')):
+                return False
             if only_if_new and token and token == str(getattr(self, '_update_status_before_supervisor', '') or ''):
                 return False
             if token and token == str(getattr(self, '_last_update_status_token', '') or ''):
                 return False
             self._last_update_status_token = token
-            path.unlink(missing_ok=True)
+            _mark_update_status_displayed(path, data)
             before = str(data.get('before') or '?')
             after = str(data.get('after') or '?')
             log = str(data.get('log') or '')
