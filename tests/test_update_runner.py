@@ -537,6 +537,7 @@ class UpdateRunnerTests(unittest.TestCase):
                  patch("updater.update_runner.write_status") as status, \
                  patch("updater.update_runner.launch_nova") as launch:
                 rc = update_runner.main([], supervisor_lock_factory=lambda: supervisor)
+            sentinel_after = existing_status.read_text(encoding="utf-8")
         self.assertEqual(rc, SUPERVISOR_ALREADY_RUNNING_CODE)
         self.assertEqual(events, ["acquire_supervisor"])
         read_version_mock.assert_not_called()
@@ -544,7 +545,7 @@ class UpdateRunnerTests(unittest.TestCase):
         run_update_mock.assert_not_called()
         status.assert_not_called()
         launch.assert_not_called()
-        self.assertEqual(existing_status.read_text(encoding="utf-8"), '{"sentinel":"active-owner"}')
+        self.assertEqual(sentinel_after, '{"sentinel":"active-owner"}')
 
     def test_lock_order_never_acquires_runtime_coordination_before_supervisor(self):
         from updater import update_runner
