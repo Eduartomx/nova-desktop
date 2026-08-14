@@ -18,27 +18,33 @@ from updater.update_runner import (
 
 
 class _SharedLock:
-    def __init__(self):
-        self.owner_locked = True
-        self.owner = {"pid": 4242, "owner_id": "a" * 32}
+    def __init__(self, *, holder="runtime", role="runtime", creation_time=111):
+        self.holder = holder
+        self.owner = {
+            "pid": 4242,
+            "owner_id": "a" * 32,
+            "role": role,
+            "process_creation_time": creation_time,
+        }
 
 
 class _Lock:
-    def __init__(self, shared):
+    def __init__(self, shared, name="guard"):
         self.shared = shared
+        self.name = name
         self.owned = False
     def acquire(self):
-        if self.shared.owner_locked:
+        if self.shared.holder is not None:
             return False
-        self.shared.owner_locked = True
+        self.shared.holder = self.name
         self.owned = True
         return True
     def release(self):
-        if self.owned:
-            self.shared.owner_locked = False
+        if self.owned and self.shared.holder == self.name:
+            self.shared.holder = None
             self.owned = False
     def read_owner(self):
-        return dict(self.shared.owner)
+        return dict(self.shared.owner) if self.shared.owner is not None else None
 
 
 class _Mailbox:
@@ -51,14 +57,23 @@ class _Mailbox:
 
 
 class _Process:
-    def __init__(self, shared, terminates=True):
+    def __init__(self, shared, *, terminates=True, creation_time=111, already_terminated=False, next_holder=None):
         self.shared = shared
         self.terminates = terminates
-        self.already_terminated = False
+        self.creation_time = creation_time
+        self.already_terminated = already_terminated
+        self.next_holder = next_holder
         self.closed = False
+        self.wait_calls = 0
+    def matches_creation_time(self, expected):
+        return bool(expected) and int(expected) == int(self.creation_time)
     def wait(self, _timeout):
+        self.wait_calls += 1
+        if self.already_terminated:
+            return True
         if self.terminates:
-            self.shared.owner_locked = False
+            if self.shared.holder in {"runtime", "updater"}:
+                self.shared.holder = self.next_holder
             return True
         return False
     def close(self):
@@ -66,6 +81,9 @@ class _Process:
 
 
 class UpdateRunnerTests(unittest.TestCase):
+    def lock_factory(self, shared):
+        return lambda: _Lock(shared, "guard")
+
     def test_version_and_status_roundtrip(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -84,14 +102,14 @@ class UpdateRunnerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             self.assertTrue(str(console_python(Path(td))))
 
-    def test_update_requires_process_exit_and_lock_reacquisition(self):
-        shared = _SharedLock()
+    def test_runtime_real_with_occupied_lock_requires_process_exit_then_guard(self):
+        shared = _SharedLock(holder="runtime")
         mailbox = _Mailbox()
         process = _Process(shared, terminates=True)
         result = coordinate_runtime_shutdown(
             Path(tempfile.gettempdir()),
             timeout=0.5,
-            lock_factory=lambda: _Lock(shared),
+            lock_factory=self.lock_factory(shared),
             mailbox=mailbox,
             process_factory=lambda pid: process,
         )
@@ -100,29 +118,144 @@ class UpdateRunnerTests(unittest.TestCase):
         self.assertTrue(result.lock_acquired)
         self.assertEqual(mailbox.calls, [("shutdown_for_update", "a" * 32)])
         self.assertTrue(process.closed)
+        self.assertEqual(shared.holder, "guard")
+        result.release_guard()
+        self.assertIsNone(shared.holder)
 
-    def test_free_lock_does_not_authorize_update_while_recorded_owner_pid_is_alive(self):
-        shared = _SharedLock()
-        shared.owner_locked = False
+    def test_free_lock_keeps_guard_while_matching_recorded_process_is_still_alive(self):
+        shared = _SharedLock(holder=None)
         mailbox = _Mailbox()
         process = _Process(shared, terminates=False)
         result = coordinate_runtime_shutdown(
             Path(tempfile.gettempdir()),
             timeout=0.01,
-            lock_factory=lambda: _Lock(shared),
+            lock_factory=self.lock_factory(shared),
             mailbox=mailbox,
             process_factory=lambda pid: process,
         )
         self.assertFalse(result.ok)
         self.assertEqual(result.error, "owner_process_timeout")
         self.assertEqual(mailbox.calls, [])
+        self.assertIsNone(shared.holder, "failed coordination must release its guard")
 
-    def test_failed_shutdown_delivery_never_authorizes_update(self):
-        shared = _SharedLock()
+    def test_same_pid_different_creation_time_is_treated_as_stale_without_wait_or_command(self):
+        shared = _SharedLock(holder=None, creation_time=111)
+        mailbox = _Mailbox()
+        process = _Process(shared, terminates=False, creation_time=222)
         result = coordinate_runtime_shutdown(
             Path(tempfile.gettempdir()),
             timeout=0.1,
-            lock_factory=lambda: _Lock(shared),
+            lock_factory=self.lock_factory(shared),
+            mailbox=mailbox,
+            process_factory=lambda pid: process,
+        )
+        self.assertTrue(result.ok)
+        self.assertEqual(process.wait_calls, 0)
+        self.assertEqual(mailbox.calls, [])
+        self.assertTrue(result.lock_acquired)
+        result.release_guard()
+
+    def test_stale_runtime_metadata_with_free_lock_is_recovered(self):
+        shared = _SharedLock(holder=None, role="runtime")
+        process = _Process(shared, already_terminated=True)
+        result = coordinate_runtime_shutdown(
+            Path(tempfile.gettempdir()),
+            timeout=0.1,
+            lock_factory=self.lock_factory(shared),
+            mailbox=_Mailbox(),
+            process_factory=lambda pid: process,
+        )
+        self.assertTrue(result.ok)
+        self.assertEqual(result.owner_role, "runtime")
+        self.assertTrue(result.lock_acquired)
+        result.release_guard()
+
+    def test_stale_updater_metadata_after_crash_is_recovered(self):
+        shared = _SharedLock(holder=None, role="updater")
+        process = _Process(shared, already_terminated=True)
+        mailbox = _Mailbox()
+        result = coordinate_runtime_shutdown(
+            Path(tempfile.gettempdir()),
+            timeout=0.1,
+            lock_factory=self.lock_factory(shared),
+            mailbox=mailbox,
+            process_factory=lambda pid: process,
+        )
+        self.assertTrue(result.ok)
+        self.assertEqual(mailbox.calls, [])
+        self.assertEqual(shared.holder, "guard")
+        result.release_guard()
+
+    def test_real_updater_still_active_is_waited_without_shutdown_command(self):
+        shared = _SharedLock(holder="updater", role="updater")
+        mailbox = _Mailbox()
+        process = _Process(shared, terminates=True)
+        result = coordinate_runtime_shutdown(
+            Path(tempfile.gettempdir()),
+            timeout=0.5,
+            lock_factory=self.lock_factory(shared),
+            mailbox=mailbox,
+            process_factory=lambda pid: process,
+        )
+        self.assertTrue(result.ok)
+        self.assertGreaterEqual(process.wait_calls, 1)
+        self.assertEqual(mailbox.calls, [])
+        self.assertEqual(shared.holder, "guard")
+        result.release_guard()
+
+    def test_other_runtime_wins_guard_race_after_old_process_exit_and_update_fails_safe(self):
+        shared = _SharedLock(holder="runtime")
+        mailbox = _Mailbox()
+        process = _Process(shared, terminates=True, next_holder="competitor")
+        result = coordinate_runtime_shutdown(
+            Path(tempfile.gettempdir()),
+            timeout=0.05,
+            lock_factory=self.lock_factory(shared),
+            mailbox=mailbox,
+            process_factory=lambda pid: process,
+        )
+        self.assertFalse(result.ok)
+        self.assertEqual(result.error, "runtime_lock_timeout_after_process_exit")
+        self.assertEqual(shared.holder, "competitor")
+        self.assertEqual(mailbox.calls, [("shutdown_for_update", "a" * 32)])
+
+    def test_legacy_metadata_without_creation_time_is_safe_when_lock_free(self):
+        shared = _SharedLock(holder=None)
+        shared.owner.pop("process_creation_time")
+        called = []
+        result = coordinate_runtime_shutdown(
+            Path(tempfile.gettempdir()),
+            timeout=0.1,
+            lock_factory=self.lock_factory(shared),
+            mailbox=_Mailbox(),
+            process_factory=lambda pid: called.append(pid),
+        )
+        self.assertTrue(result.ok)
+        self.assertEqual(called, [], "legacy PID must not be waited without a creation identity")
+        self.assertTrue(result.lock_acquired)
+        result.release_guard()
+
+    def test_legacy_metadata_without_creation_time_fails_closed_when_lock_occupied(self):
+        shared = _SharedLock(holder="runtime")
+        shared.owner.pop("process_creation_time")
+        mailbox = _Mailbox()
+        result = coordinate_runtime_shutdown(
+            Path(tempfile.gettempdir()),
+            timeout=0.02,
+            lock_factory=self.lock_factory(shared),
+            mailbox=mailbox,
+            process_factory=lambda pid: self.fail("legacy occupied PID must not be captured"),
+        )
+        self.assertFalse(result.ok)
+        self.assertEqual(result.error, "runtime_owner_identity_unavailable")
+        self.assertEqual(mailbox.calls, [])
+
+    def test_failed_shutdown_delivery_never_authorizes_update(self):
+        shared = _SharedLock(holder="runtime")
+        result = coordinate_runtime_shutdown(
+            Path(tempfile.gettempdir()),
+            timeout=0.1,
+            lock_factory=self.lock_factory(shared),
             mailbox=_Mailbox(ok=False),
             process_factory=lambda pid: _Process(shared),
         )
