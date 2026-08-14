@@ -12,12 +12,8 @@ if exist "%ROOT%\.venv\Scripts\python.exe" (
 
 if not exist "%ROOT%\updater\update_runner.py" (
     echo [ERROR] Falta updater\update_runner.py
-    echo Ejecutando updater directo como fallback...
-    "%PY%" "%ROOT%\updater\nova_updater.py"
-    set "RC=%ERRORLEVEL%"
-    echo.
     pause
-    exit /b %RC%
+    exit /b 4
 )
 
 echo Nova se actualizara desde GitHub y se reiniciara automaticamente.
@@ -29,7 +25,6 @@ set "RC=%ERRORLEVEL%"
 if not "%RC%"=="0" (
     echo.
     echo El supervisor termino con codigo %RC%.
-    echo Nova deberia haberse reiniciado igualmente para mostrar el error.
     pause
 )
 exit /b %RC%
