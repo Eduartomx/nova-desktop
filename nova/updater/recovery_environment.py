@@ -213,12 +213,7 @@ def validate_restored_install(
 
 
 def prepare_stable_recovery_runtime(root: Path) -> dict[str, Any]:
-    """Publish a validated, immutable stdlib-only recovery bundle under data/.
-
-    A new generation is written completely and hashed before the small active
-    pointer is replaced, so the previously known-good generation is never
-    overwritten in place.
-    """
+    """Publish a validated, immutable stdlib-only recovery bundle under data/."""
     root = Path(root)
     source_dir = root / "updater"
     runtime = recovery_runtime_root(root)
@@ -228,7 +223,11 @@ def prepare_stable_recovery_runtime(root: Path) -> dict[str, Any]:
     target = generations / generation
     target.mkdir(parents=False, exist_ok=False)
     files: dict[str, str] = {}
-    for name in ("recovery_journal.py", "recovery_attempts.py", "recovery_files.py", "recovery_environment.py", "recovery_state.py", "recovery_bootstrap.py"):
+    for name in (
+        "recovery_journal.py", "recovery_attempts.py", "recovery_files.py",
+        "recovery_environment.py", "recovery_state.py", "recovery_locking.py",
+        "recovery_bootstrap.py",
+    ):
         src = source_dir / name
         if not src.is_file() or src.is_symlink():
             raise RecoveryJournalError(f"stable_bootstrap_source_invalid:{name}")
@@ -243,7 +242,6 @@ def prepare_stable_recovery_runtime(root: Path) -> dict[str, Any]:
         "files": files,
     }
     _atomic_json(target / "manifest.json", manifest)
-    # Re-read and verify before publishing the pointer.
     for name, expected in files.items():
         if hashlib.sha256((target / name).read_bytes()).hexdigest() != expected:
             raise RecoveryJournalError(f"stable_bootstrap_verify_failed:{name}")
