@@ -1,25 +1,23 @@
 from __future__ import annotations
 
-"""Compatibility wrapper for the resident updater supervisor.
+"""Resident updater supervisor.
 
-The previously validated coordination primitives remain in
-``update_runner_legacy``. This module only adds the persistent recovery gate,
-codes 6/7 semantics, and routes the actual update through the hardened resident
-transaction engine.
+The validated lifecycle/instance primitives remain in ``update_runner_legacy``.
+The update engine itself now runs in this process so there is no CLI capability
+that can bypass the supervisor mutex or runtime guard.
 """
 
+import argparse
+from contextlib import redirect_stderr, redirect_stdout
 import json
-import subprocess
-import time
 from pathlib import Path
+import time
 
 try:
     from . import update_runner_legacy as _legacy
-except ImportError:  # direct script execution from nova/updater
+except ImportError:
     import update_runner_legacy as _legacy
 
-# Preserve every existing helper (including private names) so tests and callers
-# keep the same module contract while main() below uses the hardened flow.
 for _name in dir(_legacy):
     if _name.startswith("__"):
         continue
@@ -32,20 +30,21 @@ RECOVERY_REQUIRED_CODE = 7
 
 
 def run_update(root: Path, log: Path) -> tuple[int, str]:
-    py = console_python(root)
-    updater = root / "updater" / "resident_update_engine.py"
-    if not updater.exists():
-        return 2, f"No existe {updater}"
-    cmd = [str(py), str(updater), "--yes"]
+    """Execute the internal engine in the already-guarded supervisor process."""
     try:
+        try:
+            from . import resident_update_engine
+        except ImportError:
+            import resident_update_engine
         with open(log, "w", encoding="utf-8", errors="replace") as stream:
-            stream.write("Nova Update Runner · recovery hardened\n")
-            stream.write("Motor interno: resident_update_engine.py\n\n")
+            stream.write("Nova Update Runner · crash-durable recovery hardened\n")
+            stream.write("Motor interno: import updater.resident_update_engine (same process)\n\n")
             stream.flush()
-            proc = subprocess.run(cmd, cwd=str(root), stdout=stream, stderr=subprocess.STDOUT, text=True)
-        return int(proc.returncode), ""
+            with redirect_stdout(stream), redirect_stderr(stream):
+                rc = resident_update_engine.run_supervised_update(root)
+        return int(rc), ""
     except Exception as exc:
-        return 2, str(exc)
+        return 2, f"internal_engine_exception:{type(exc).__name__}:{exc}"
 
 
 def _recovery_gate(root: Path):
@@ -65,17 +64,24 @@ def _strong_remaining_pids(root: Path) -> list[int]:
         return []
 
 
-def _recovery_state_exists(root: Path) -> bool:
-    """Code 7 is fail-closed only when a durable journal actually exists.
-
-    This preserves compatibility with older/custom updater return codes while
-    the hardened engine always persists update_recovery.json before returning 7.
-    A corrupt journal also counts as recovery state and therefore blocks launch.
-    """
+def _journal_after_engine(root: Path) -> tuple[bool, str, str]:
+    """Return (must_block_launch, state, detail) from durable state, not rc."""
+    path = Path(root) / "data" / "update_recovery.json"
+    if not path.exists():
+        return False, "", "no_journal"
     try:
-        return (Path(root) / "data" / "update_recovery.json").is_file()
-    except Exception:
-        return True
+        try:
+            from .recovery_state import load_journal
+        except ImportError:
+            from recovery_state import load_journal
+        journal = load_journal(root)
+    except Exception as exc:
+        return True, "corrupt", f"journal_unverifiable:{type(exc).__name__}"
+    if journal is None:
+        return False, "", "no_journal"
+    state = str(journal.get("state") or "unknown")
+    active = bool(journal.get("recovery_required")) and state != "cleared"
+    return active, state, "active_recovery" if active else "cleared"
 
 
 def _append_log_best_effort(log: Path, text: str) -> None:
@@ -121,9 +127,6 @@ def main(argv=None, *, supervisor_lock_factory=None) -> int:
     args = parser.parse_args(argv)
     root = nova_root()
 
-    # Strict order for both normal update and recovery:
-    # supervisor mutex -> recovery/runtime guard -> update/rollback/validation
-    # -> release runtime guard -> launch (only when safe) -> supervisor release.
     try:
         supervisor_mutex = _acquire_supervisor_mutex(root, supervisor_lock_factory)
     except Exception as exc:
@@ -135,9 +138,6 @@ def main(argv=None, *, supervisor_lock_factory=None) -> int:
 
     log: Path | None = None
     try:
-        # Quarantine is checked while the unique supervisor mutex is already
-        # held and before reading/coordinating the running Nova. A recovery is
-        # performed/delegated instead of continuing this update request.
         try:
             recovery = _recovery_gate(root)
         except Exception as exc:
@@ -177,6 +177,7 @@ def main(argv=None, *, supervisor_lock_factory=None) -> int:
             return 4
 
         rc = 2
+        final_rc = 2
         ok = False
         after = before
         error = ""
@@ -194,24 +195,29 @@ def main(argv=None, *, supervisor_lock_factory=None) -> int:
                 rc = 2
                 runner_error = f"run_update inesperado: {type(exc).__name__}: {exc}"
 
-            durable_recovery = _recovery_state_exists(root)
-            no_launch = rc == PIP_TERMINATION_UNCONFIRMED_CODE or (
-                rc == RECOVERY_REQUIRED_CODE and durable_recovery
-            )
-            ok = rc == 0
-            state = "completed" if ok else "update_failed"
+            must_block, journal_state, journal_detail = _journal_after_engine(root)
+            no_launch = bool(must_block or rc == PIP_TERMINATION_UNCONFIRMED_CODE)
             if rc == PIP_TERMINATION_UNCONFIRMED_CODE:
+                final_rc = PIP_TERMINATION_UNCONFIRMED_CODE
+            elif must_block:
+                final_rc = RECOVERY_REQUIRED_CODE
+            else:
+                final_rc = rc
+
+            ok = final_rc == 0
+            state = "completed" if ok else "update_failed"
+            if final_rc == PIP_TERMINATION_UNCONFIRMED_CODE:
                 state = "pip_termination_unconfirmed"
                 remaining_pids = _strong_remaining_pids(root)
                 error = "La terminación de pip no pudo confirmarse; cuarentena persistente activa."
-            elif rc == RECOVERY_REQUIRED_CODE and durable_recovery:
-                state = "recovery_required_or_in_progress"
+            elif no_launch:
+                state = journal_state or "recovery_required_or_in_progress"
                 remaining_pids = _strong_remaining_pids(root)
-                error = "La instalación requiere recuperación antes de iniciar Nova o aplicar otra actualización."
+                error = f"La instalación conserva recuperación activa ({state}); Nova no será relanzada. {journal_detail}"
             elif runner_error:
                 error = str(runner_error)
             elif not ok:
-                error = f"El updater terminó con código {rc}. Revisa {log}."
+                error = f"El updater terminó con código {final_rc}. Revisa {log}."
 
             after = _read_version_best_effort(root, before, log, "DESPUÉS")
             _write_status_best_effort(
@@ -225,14 +231,14 @@ def main(argv=None, *, supervisor_lock_factory=None) -> int:
             else:
                 _append_log_best_effort(
                     log,
-                    f"\n[FAIL-CLOSED] {state}: runtime guard liberado después de persistir recuperación; Nova no fue relanzada.\n",
+                    f"\n[FAIL-CLOSED] {state}: journal activo/corrupto tras motor; Nova no fue relanzada.\n",
                 )
 
         if no_launch:
-            return rc
+            return final_rc
         if ok:
             return 0 if launched else 3
-        return rc or 2
+        return final_rc or 2
     finally:
         _release_supervisor_mutex_best_effort(supervisor_mutex, log)
 
