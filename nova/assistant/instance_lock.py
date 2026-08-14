@@ -5,7 +5,7 @@ from __future__ import annotations
 The kernel lock is authoritative. ``owner.json`` identifies the last published
 owner generation. Runtime owners publish metadata; updater probes may acquire
 the same kernel lock without overwriting that metadata, and an updater guard
-publishes an explicit ``updater`` role only after the runtime process is gone.
+publishes an explicit ``updater`` role only after it owns the kernel lock.
 Raw Windows SIDs are never persisted.
 """
 
@@ -28,6 +28,63 @@ def _utc_now() -> str:
 
 def _hash_text(value: str, length: int = 24) -> str:
     return hashlib.sha256(str(value).encode("utf-8", errors="ignore")).hexdigest()[:length]
+
+
+class _FILETIME(ctypes.Structure):
+    _fields_ = [("dwLowDateTime", wintypes.DWORD), ("dwHighDateTime", wintypes.DWORD)]
+
+
+def _filetime_value(value: _FILETIME) -> int:
+    return (int(value.dwHighDateTime) << 32) | int(value.dwLowDateTime)
+
+
+def process_creation_time(pid: int | None = None) -> int | None:
+    """Return a stable creation marker for *pid*.
+
+    On Windows this is the native process creation FILETIME in 100 ns units.
+    It is suitable for distinguishing PID reuse and contains no user data.
+    """
+    target = int(pid or os.getpid())
+    if target <= 0:
+        return None
+    if os.name == "nt":
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.GetProcessTimes.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(_FILETIME),
+            ctypes.POINTER(_FILETIME),
+            ctypes.POINTER(_FILETIME),
+            ctypes.POINTER(_FILETIME),
+        ]
+        kernel32.GetProcessTimes.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, target)
+        if not handle:
+            error = ctypes.get_last_error()
+            if error == 87:  # ERROR_INVALID_PARAMETER: process no longer exists.
+                return None
+            raise ctypes.WinError(error)
+        try:
+            created = _FILETIME()
+            exited = _FILETIME()
+            kernel = _FILETIME()
+            user = _FILETIME()
+            if not kernel32.GetProcessTimes(handle, ctypes.byref(created), ctypes.byref(exited), ctypes.byref(kernel), ctypes.byref(user)):
+                raise ctypes.WinError(ctypes.get_last_error())
+            marker = _filetime_value(created)
+            return marker if marker > 0 else None
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
+        import psutil
+        marker = int(float(psutil.Process(target).create_time()) * 1_000_000)
+        return marker if marker > 0 else None
+    except Exception:
+        return None
 
 
 def _windows_identity() -> tuple[str, int]:
@@ -166,6 +223,7 @@ class InstanceLock:
         self.publish_owner = bool(publish_owner)
         self.role = str(role or "runtime")[:32]
         self.identity = runtime_identity()
+        self.process_creation_time = 0
 
     def _lock_stream(self, stream) -> bool:
         if self._locker is not None:
@@ -215,17 +273,22 @@ class InstanceLock:
             return True
 
         self.owner_id = uuid.uuid4().hex
-        metadata = {
-            "pid": int(os.getpid()),
-            "owner_id": self.owner_id,
-            "generation": self.owner_id,
-            "role": self.role,
-            "scope_id": str(self.identity["scope_id"]),
-            "user_hash": str(self.identity["user_hash"]),
-            "session_id": int(self.identity["session_id"]),
-            "created_at": _utc_now(),
-        }
         try:
+            marker = process_creation_time(os.getpid())
+            if not marker:
+                raise RuntimeError("could not determine owner process creation time")
+            self.process_creation_time = int(marker)
+            metadata = {
+                "pid": int(os.getpid()),
+                "process_creation_time": self.process_creation_time,
+                "owner_id": self.owner_id,
+                "generation": self.owner_id,
+                "role": self.role,
+                "scope_id": str(self.identity["scope_id"]),
+                "user_hash": str(self.identity["user_hash"]),
+                "session_id": int(self.identity["session_id"]),
+                "created_at": _utc_now(),
+            }
             _atomic_json(self.owner_path, metadata)
         except Exception:
             try:
@@ -235,6 +298,7 @@ class InstanceLock:
                 self._file = None
                 self.acquired = False
                 self.owner_id = ""
+                self.process_creation_time = 0
             raise
         return True
 
@@ -252,7 +316,11 @@ class InstanceLock:
             owner_id = str(data.get("owner_id") or "")
             if pid <= 0 or len(owner_id) < 16:
                 return None
+            creation = int(data.get("process_creation_time") or 0)
+            if creation < 0:
+                return None
             data["pid"] = pid
+            data["process_creation_time"] = creation
             data["session_id"] = int(data.get("session_id") or 0)
             data["role"] = str(data.get("role") or "runtime")
             return data
@@ -266,6 +334,7 @@ class InstanceLock:
             "release_requested": bool(self.release_requested),
             "owner_id": self.owner_id if self.acquired and self.publish_owner else str(owner.get("owner_id") or ""),
             "pid": int(owner.get("pid") or (os.getpid() if self.acquired else 0)),
+            "process_creation_time": int(self.process_creation_time or owner.get("process_creation_time") or 0),
             "role": self.role if self.acquired and self.publish_owner else str(owner.get("role") or ""),
             "ownership": "kernel_file_lock",
             "scope": "windows_user_session" if os.name == "nt" else "user_session",
@@ -291,4 +360,5 @@ class InstanceLock:
             self._file = None
             self.acquired = False
             self.owner_id = ""
+            self.process_creation_time = 0
             self.release_requested = False
