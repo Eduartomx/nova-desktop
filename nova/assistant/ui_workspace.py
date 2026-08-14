@@ -10,6 +10,55 @@ from pathlib import Path
 from .doctor import NovaDoctor
 
 
+def _start_update_supervisor(ui, *, root: Path | None = None, popen=None, show_error=None) -> bool:
+    """Start the resident-aware updater without initiating local shutdown.
+
+    The supervisor is the only component allowed to request
+    ``shutdown_for_update``.  This helper deliberately leaves the current UI and
+    runtime alive until that command reaches ``RuntimeLifecycleManager``.
+    """
+    root = Path(root) if root is not None else Path(__file__).resolve().parent.parent
+    runner = root / 'updater' / 'update_runner.py'
+    py = root / '.venv' / 'Scripts' / 'python.exe'
+    if not py.exists():
+        current = Path(sys.executable)
+        py = current.with_name('python.exe') if current.name.casefold() == 'pythonw.exe' and current.with_name('python.exe').exists() else current
+
+    def report_error(message: str):
+        try:
+            ui.status_var.set('No pude iniciar el supervisor; Nova continúa abierta.')
+        except Exception:
+            pass
+        if callable(show_error):
+            show_error('Nova · Actualizador', str(message))
+
+    if not runner.exists():
+        report_error(f'Falta el supervisor de actualización:\n{runner}')
+        return False
+
+    try:
+        ui.status_var.set('Iniciando supervisor de actualización…')
+    except Exception:
+        pass
+
+    try:
+        launcher = popen or subprocess.Popen
+        launcher(
+            [str(py), str(runner), '--parent-pid', str(os.getpid())],
+            cwd=str(root),
+            creationflags=getattr(subprocess, 'CREATE_NEW_CONSOLE', 0),
+        )
+    except Exception as exc:
+        report_error(str(exc))
+        return False
+
+    try:
+        ui.status_var.set('Actualización iniciada. Nova permanecerá activa hasta que el supervisor solicite el cierre.')
+    except Exception:
+        pass
+    return True
+
+
 def install_ui_v060():
     from . import ui as mod
     UI = mod.AssistantUI
@@ -131,25 +180,10 @@ def install_ui_v060():
         threading.Thread(target=worker, daemon=True).start()
 
     def quick_update(self):
-        root = Path(__file__).resolve().parent.parent
-        runner = root / 'updater' / 'update_runner.py'
-        py = root / '.venv' / 'Scripts' / 'python.exe'
-        if not py.exists():
-            current = Path(sys.executable)
-            py = current.with_name('python.exe') if current.name.casefold() == 'pythonw.exe' and current.with_name('python.exe').exists() else current
-        if not runner.exists():
-            messagebox.showerror('Nova · Actualizador', f'Falta el supervisor de actualización:\n{runner}', parent=self.root)
-            return
-        try:
-            subprocess.Popen(
-                [str(py), str(runner), '--parent-pid', str(os.getpid())],
-                cwd=str(root),
-                creationflags=getattr(subprocess, 'CREATE_NEW_CONSOLE', 0),
-            )
-            self.status_var.set('Actualizando desde GitHub… Nova se cerrará y volverá a abrirse automáticamente.')
-            self.request_shutdown('update')
-        except Exception as exc:
-            messagebox.showerror('Nova · Actualizador', str(exc), parent=self.root)
+        return _start_update_supervisor(
+            self,
+            show_error=lambda title, message: messagebox.showerror(title, message, parent=self.root),
+        )
 
     UI._build = build; UI.__init__ = init; UI._refresh_workspace_label = refresh_label; UI._refresh_workspace_manager = refresh_manager
     UI.show_workspace_manager = show_manager; UI._selected_workspace = selected; UI._workspace_add_folder = add_folder; UI._workspace_activate_selected = activate; UI._workspace_open_selected = open_selected
