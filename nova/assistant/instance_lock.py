@@ -2,9 +2,9 @@ from __future__ import annotations
 
 """Kernel-backed single-instance ownership for one Nova runtime per user session.
 
-The lock itself is authoritative. ``owner.json`` is only metadata used to target
-local commands and to let the updater capture the owning process before asking
-it to terminate. Metadata never contains a raw Windows SID.
+The lock itself is authoritative. ``owner.json`` is durable generation metadata
+used to target local commands and to let the updater capture the owning process
+before asking it to terminate. Metadata never contains a raw Windows SID.
 """
 
 from dataclasses import dataclass
@@ -72,7 +72,6 @@ def _windows_identity() -> tuple[str, int]:
         buffer = ctypes.create_string_buffer(needed.value)
         if not advapi32.GetTokenInformation(token, TokenUser, buffer, needed, ctypes.byref(needed)):
             raise ctypes.WinError(ctypes.get_last_error())
-        # TOKEN_USER starts with SID_AND_ATTRIBUTES; the first field is PSID.
         sid_ptr = ctypes.cast(buffer, ctypes.POINTER(wintypes.LPVOID)).contents.value
         sid_text = wintypes.LPWSTR()
         if not advapi32.ConvertSidToStringSidW(sid_ptr, ctypes.byref(sid_text)):
@@ -92,7 +91,6 @@ def runtime_identity() -> dict[str, Any]:
     try:
         user_hash, session_id = _windows_identity()
     except Exception:
-        # Safe deterministic fallback: still scoped to the current profile/session.
         user_raw = "|".join((os.environ.get("USERDOMAIN", ""), os.environ.get("USERNAME", ""), str(Path.home())))
         session_raw = os.environ.get("SESSIONNAME") or os.environ.get("XDG_SESSION_ID") or "default"
         user_hash = _hash_text(user_raw)
@@ -262,14 +260,11 @@ class InstanceLock:
         if not self.acquired or self._file is None:
             return
         stream = self._file
-        owner_id = self.owner_id
         try:
-            current = self.read_owner()
-            if current and str(current.get("owner_id")) == owner_id:
-                try:
-                    self.owner_path.unlink(missing_ok=True)
-                except OSError:
-                    pass
+            # Keep owner.json after unlock. It is the last known generation and
+            # lets the updater wait for the owning PID even if it starts during
+            # the tiny window between final unlock and process termination.
+            # The next successful acquire overwrites this metadata atomically.
             self._unlock_stream(stream)
         finally:
             stream.close()
