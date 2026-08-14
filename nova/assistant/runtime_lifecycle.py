@@ -2,8 +2,10 @@ from __future__ import annotations
 
 """Native resident lifecycle for Nova.
 
-Window hiding and process shutdown are separate operations. The manager is
-idempotent and runs real shutdown on Tk's scheduler without using sleeps.
+Window hiding and process shutdown are separate operations. Real shutdown is
+idempotent, executes on Tk's scheduler, and deliberately does *not* release the
+single-instance lock: ownership remains held until ``app.py`` leaves Tk and
+reaches its process-finalization ``finally`` block.
 """
 
 from dataclasses import dataclass
@@ -45,6 +47,7 @@ class RuntimeLifecycleManager:
         self._accepting_commands = True
         self._last_shutdown_reason = ""
         self._errors: list[LifecycleError] = []
+        self._shutdown_order: list[str] = []
         self.tray = None
         self.instance = None
         self.autostart = None
@@ -98,12 +101,20 @@ class RuntimeLifecycleManager:
 
     def _can_hide_to_tray(self):
         cfg = self.config.get("resident_mode", {}) if isinstance(self.config, dict) else {}
-        return bool(cfg.get("enabled", True) and cfg.get("close_to_tray", True) and self.tray is not None and getattr(self.tray, "available", False))
+        return bool(
+            cfg.get("enabled", True)
+            and cfg.get("close_to_tray", True)
+            and self.tray is not None
+            and getattr(self.tray, "available", False)
+            and not getattr(self.tray, "degraded", False)
+        )
 
     def mark_running(self, *, start_hidden=False):
         if start_hidden and self._can_hide_to_tray():
             self._hide_now()
         else:
+            # Important safety property: --background with a broken/unready tray
+            # stays visible instead of leaving an unreachable resident process.
             self._set_state("running")
 
     def request_window_close(self):
@@ -173,7 +184,12 @@ class RuntimeLifecycleManager:
         self._scheduler(self._perform_shutdown)
         return True
 
+    def perform_shutdown_now(self):
+        """Best-effort synchronous fallback used only when Tk itself errors."""
+        self._perform_shutdown()
+
     def _run_step(self, component, callback):
+        self._shutdown_order.append(str(component))
         if not callable(callback):
             return
         try:
@@ -218,7 +234,10 @@ class RuntimeLifecycleManager:
             if ui is None:
                 return
             seen = set()
-            for name in ("gaming_awareness", "perception", "anomaly_detector", "anomaly_detection", "event_vision", "vision_engine", "workspace_autodetect", "workspace_autodetector"):
+            for name in (
+                "gaming_awareness", "perception", "anomaly_detector", "anomaly_detection",
+                "event_vision", "vision_engine", "workspace_autodetect", "workspace_autodetector",
+            ):
                 service = getattr(ui, name, None)
                 if service is None or id(service) in seen:
                     continue
@@ -259,7 +278,10 @@ class RuntimeLifecycleManager:
         self._run_step("llm_warm", final_qwen_policy)
         self._run_step("tray", getattr(self.tray, "stop", None))
         self._run_step("windows_session_hook", getattr(self.session_hook, "uninstall", None))
-        self._run_step("single_instance", getattr(self.instance, "release", None))
+
+        # Do NOT release self.instance here. The app-level finally block owns that
+        # final action, after Tk destruction/mainloop return. The updater requires
+        # both process termination and lock reacquisition before touching files.
         self._run_step("tk_destroy", getattr(self.root, "destroy", None))
         with self._lock:
             self._state = "stopped"
@@ -298,6 +320,7 @@ class RuntimeLifecycleManager:
             "last_shutdown_reason": self._last_shutdown_reason or str(self._previous.get("last_shutdown_reason") or ""),
             "recent_errors": [e.__dict__ for e in self._errors[-6:]],
             "accepting_commands": self.accepting_commands,
+            "shutdown_order": list(self._shutdown_order),
         }
 
     def _load_previous_status(self):
@@ -312,7 +335,12 @@ class RuntimeLifecycleManager:
     def _persist_status(self):
         try:
             self._status_path.parent.mkdir(parents=True, exist_ok=True)
-            payload = {"state": self.state, "last_shutdown_reason": self._last_shutdown_reason, "updated_at": _now(), "recent_errors": [e.__dict__ for e in self._errors[-6:]]}
+            payload = {
+                "state": self.state,
+                "last_shutdown_reason": self._last_shutdown_reason,
+                "updated_at": _now(),
+                "recent_errors": [e.__dict__ for e in self._errors[-6:]],
+            }
             self._status_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         except Exception:
             return
