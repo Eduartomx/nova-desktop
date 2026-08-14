@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -7,7 +8,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 from assistant.runtime_lifecycle import RuntimeLifecycleManager
-from assistant.ui_workspace import _poll_update_supervisor, _start_update_supervisor
+from assistant.ui_workspace import _mark_update_status_displayed, _poll_update_supervisor, _start_update_supervisor
 from updater import nova_updater
 
 
@@ -114,6 +115,7 @@ class ResidentUpdaterTests(unittest.TestCase):
         self.assertIn("--parent-pid", source)
         self.assertNotIn("self.request_shutdown('update')", source)
         self.assertNotIn('self.request_shutdown("update")', source)
+        self.assertNotIn("path.unlink(missing_ok=True)", source)
 
     def test_ui_successful_popen_tracks_process_disables_button_and_does_not_shutdown(self):
         with tempfile.TemporaryDirectory() as td:
@@ -215,6 +217,25 @@ class ResidentUpdaterTests(unittest.TestCase):
         self.assertEqual(calls, [{"only_if_new": True}])
         self.assertFalse(ui._update_supervisor_active)
         self.assertEqual(ui.update_button.state, "normal")
+
+    def test_displayed_update_state_is_preserved_for_doctor_instead_of_deleted(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "update_last.json"
+            original = {
+                "ok": False,
+                "timestamp": "2026-08-14T00:00:00+00:00",
+                "state": "coordination_failed",
+                "before": "0.9.8",
+                "after": "0.9.8",
+            }
+            path.write_text(json.dumps(original), encoding="utf-8")
+            _mark_update_status_displayed(path, original)
+            self.assertTrue(path.is_file())
+            saved = json.loads(path.read_text(encoding="utf-8"))
+        self.assertTrue(saved["displayed"])
+        self.assertEqual(saved["state"], "coordination_failed")
+        self.assertEqual(saved["before"], "0.9.8")
+        self.assertEqual(saved["after"], "0.9.8")
 
     def test_shutdown_for_update_mailbox_command_maps_to_update_lifecycle_reason(self):
         class Root:
