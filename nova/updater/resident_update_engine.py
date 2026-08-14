@@ -22,6 +22,7 @@ try:
         verify_normal_completion,
     )
     from .recovery_bootstrap import create_quarantine_journal, create_rollback_recovery_journal
+    from .recovery_state import RecoveryJournalError, load_journal
 except ImportError:  # direct script execution
     import nova_updater as base
     from pip_safety import (
@@ -32,6 +33,7 @@ except ImportError:  # direct script execution
         verify_normal_completion,
     )
     from recovery_bootstrap import create_quarantine_journal, create_rollback_recovery_journal
+    from recovery_state import RecoveryJournalError, load_journal
 
 PIP_TERMINATION_UNCONFIRMED_EXIT_CODE = 6
 RECOVERY_REQUIRED_EXIT_CODE = 7
@@ -52,6 +54,20 @@ class PipTerminationUnconfirmedError(DependencyInstallError):
 
 class RecoveryRequiredError(RuntimeError):
     pass
+
+
+def _ensure_no_recovery_pending() -> None:
+    """Second fail-closed gate before GitHub access, staging or file writes."""
+    try:
+        journal = load_journal(base.ROOT)
+    except RecoveryJournalError as exc:
+        raise RecoveryRequiredError(
+            f"journal de recuperación no verificable: {type(exc).__name__}"
+        ) from exc
+    if journal is not None and bool(journal.get("recovery_required")) and journal.get("state") != "cleared":
+        raise RecoveryRequiredError(
+            f"recuperación persistente activa: {journal.get('state') or 'unknown'}"
+        )
 
 
 def _install_requirements(timeout_seconds=None) -> bool:
@@ -148,6 +164,7 @@ def execute_transaction(
     backup_root: Path | None = None,
     pip_timeout_seconds=None,
 ):
+    _ensure_no_recovery_pending()
     manifest = base.build_transaction(stage, new_files, previous)
     touched = manifest["modified_existing"] + manifest["deleted_existing"] + manifest["created_new"]
     if not touched:
@@ -231,6 +248,7 @@ def main(argv=None) -> int:
         print("[ERROR] resident_update_engine es un camino interno del supervisor.")
         return 4
     try:
+        _ensure_no_recovery_pending()
         base.execute_transaction = execute_transaction
         cfg = base.load_config()
         current = base.version_text()
