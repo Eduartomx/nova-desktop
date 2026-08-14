@@ -14,20 +14,31 @@ def _arguments(argv=None):
 
 
 def _claim_instance():
-    # Esta comprobación ocurre antes de core_runtime/AssistantUI: una segunda
-    # ejecución no construye Agent, no registra hotkeys y no precarga Qwen.
-    from assistant.instance_commands import InstanceCommandMailbox
-    from assistant.instance_lock import InstanceLock, runtime_directory
+    """Claim the scoped runtime before importing the core or constructing Tk.
 
-    directory = runtime_directory()
-    lock = InstanceLock(path=directory / "nova.lock")
-    mailbox = InstanceCommandMailbox(directory / "nova.command")
-    if not lock.acquire():
-        mailbox.send("show")
-        return None, mailbox
-    # No se borra el buzón aquí: una segunda ejecución puede haber escrito
-    # `show` justo después de adquirir el lock. El buzón descarta mensajes viejos.
-    return lock, mailbox
+    Returns ``(lock, mailbox, exit_code)``. A secondary launch never creates
+    Agent/hotkeys/services; it only targets ``show`` to the exact owner
+    generation that currently holds the kernel lock.
+    """
+    from assistant.instance_commands import InstanceCommandMailbox
+    from assistant.instance_lock import InstanceLock, runtime_paths
+
+    paths = runtime_paths()
+    lock = InstanceLock(path=paths.lock, owner_path=paths.owner)
+    if lock.acquire():
+        mailbox = InstanceCommandMailbox(paths.commands, owner_id=lock.owner_id)
+        mailbox.purge_foreign(owner_id=lock.owner_id)
+        return lock, mailbox, 0
+
+    owner = lock.read_owner()
+    if not owner:
+        print("Nova: existe un lock ocupado, pero no pude identificar de forma segura a su propietario.", file=sys.stderr)
+        return None, None, 3
+    mailbox = InstanceCommandMailbox(paths.commands)
+    if not mailbox.send("show", target_owner_id=str(owner.get("owner_id") or "")):
+        print("Nova: la instancia existente no pudo recibir la orden local 'show'.", file=sys.stderr)
+        return None, None, 4
+    return None, mailbox, 0
 
 
 def main(argv=None):
@@ -36,11 +47,13 @@ def main(argv=None):
         return 1
 
     args = _arguments(argv)
-    instance_lock, command_mailbox = _claim_instance()
+    instance_lock, command_mailbox, secondary_code = _claim_instance()
     if instance_lock is None:
-        return 0
+        return int(secondary_code)
 
     root = None
+    ui = None
+    exit_code = 0
     try:
         from assistant.core_runtime import install_core_runtime
         install_core_runtime()
@@ -48,16 +61,31 @@ def main(argv=None):
         from assistant.ui import AssistantUI
 
         root = tk.Tk()
-        AssistantUI(
+        ui = AssistantUI(
             root,
             load_config(),
             instance_lock=instance_lock,
             command_mailbox=command_mailbox,
             start_hidden=bool(args.background and not args.post_update),
         )
-        root.mainloop()
-        return 0
+        try:
+            root.mainloop()
+        except BaseException:
+            # A Tk/runtime error is a real shutdown, never a hide-to-tray action.
+            try:
+                lifecycle = getattr(ui, "runtime_lifecycle", None)
+                if lifecycle is not None:
+                    lifecycle.request_shutdown("runtime_error")
+                    lifecycle.perform_shutdown_now()
+            except Exception:
+                pass
+            exit_code = 1
+            raise
+        return exit_code
     finally:
+        # The ownership lock deliberately outlives Tk destruction and every
+        # lifecycle cleanup step. The updater additionally waits for the owning
+        # process handle, so releasing here can never by itself authorize writes.
         try:
             instance_lock.release()
         except Exception:
