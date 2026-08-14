@@ -11,6 +11,7 @@ from .doctor import NovaDoctor
 
 SUPERVISOR_ALREADY_RUNNING_CODE = 5
 PIP_TERMINATION_UNCONFIRMED_CODE = 6
+RECOVERY_REQUIRED_CODE = 7
 UPDATE_POLL_MS = 300
 
 
@@ -118,6 +119,8 @@ def _poll_update_supervisor(ui, *, root: Path, consume_status=None) -> None:
             ui.status_var.set('No se pudo coordinar la actualización; Nova continúa abierta.')
         elif int(rc) == PIP_TERMINATION_UNCONFIRMED_CODE:
             ui.status_var.set('Actualización detenida por seguridad: terminación de pip no confirmada.')
+        elif int(rc) == RECOVERY_REQUIRED_CODE:
+            ui.status_var.set('Recuperación requerida o en curso; Nova normal permanece bloqueada.')
         elif int(rc) != 0:
             ui.status_var.set(f'El supervisor terminó con código {rc}; revisa el estado de actualización.')
         else:
@@ -272,6 +275,11 @@ def install_ui_v060():
                 self._append('system', f'Actualización detenida por seguridad: no se confirmó la terminación de pip. No se relanzó Nova automáticamente.\n{error}{pid_text}\nLog: {log}')
                 self.status_var.set('Recuperación pendiente · terminación de pip no confirmada')
                 messagebox.showwarning('Nova · Recuperación requerida', f'{error}{pid_text}\n\nLog:\n{log}', parent=self.root)
+                return True
+            if state == 'recovery_required_or_in_progress':
+                self._append('system', f'Nova quedó en cuarentena de recuperación. No se iniciará otra actualización ni el asistente normal hasta completar/validar la recuperación.\n{error}\nLog: {log}')
+                self.status_var.set('Recuperación requerida o en curso')
+                messagebox.showwarning('Nova · Recuperación requerida', f'{error}\n\nLog:\n{log}', parent=self.root)
                 return True
 
             self._append('system', f'La actualización no se pudo completar. Nova se reinició sin quedar cerrada.\n{error}\nLog: {log}')
