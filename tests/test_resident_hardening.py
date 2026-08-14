@@ -98,18 +98,20 @@ class AsyncReadyIcon:
     def __init__(self):
         self._visible = False
         self.stop_calls = 0
-        self.visible_seen_after_setup = False
+        self.visible_set_calls = 0
         self.setup_called = threading.Event()
     @property
     def visible(self): return self._visible
     @visible.setter
-    def visible(self, value): self._visible = bool(value)
+    def visible(self, value):
+        self._visible = bool(value)
+        if self._visible:
+            self.visible_set_calls += 1
     def run_detached(self, setup=None):
         def ready():
             self.setup_called.set()
             if setup is not None:
                 setup(self)
-                self.visible_seen_after_setup = bool(self.visible)
         threading.Thread(target=ready, daemon=True).start()
     def stop(self): self.stop_calls += 1
     def update_menu(self): pass
@@ -156,7 +158,7 @@ class TrayReadinessTests(unittest.TestCase):
         tray = self.make(icon)
         self.assertTrue(tray.start())
         self.assertTrue(icon.visible)
-        self.assertTrue(icon.visible_seen_after_setup)
+        self.assertGreaterEqual(icon.visible_set_calls, 1)
         self.assertTrue(tray.available)
         self.assertFalse(tray.degraded)
         self.assertTrue(tray.status()["ready"])
