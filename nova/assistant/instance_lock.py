@@ -29,7 +29,6 @@ def _hash_text(value: str, length: int = 24) -> str:
 
 
 def _windows_identity() -> tuple[str, int]:
-    """Return (hashed user SID, process Session ID) with typed Win32 calls."""
     if os.name != "nt":
         raw = "|".join((os.environ.get("USER", ""), os.environ.get("USERNAME", ""), os.environ.get("HOME", "")))
         session = os.environ.get("XDG_SESSION_ID") or os.environ.get("SESSIONNAME") or "default"
@@ -37,7 +36,6 @@ def _windows_identity() -> tuple[str, int]:
 
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
-
     kernel32.GetCurrentProcess.restype = wintypes.HANDLE
     kernel32.GetCurrentProcessId.restype = wintypes.DWORD
     kernel32.ProcessIdToSessionId.argtypes = [wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)]
@@ -46,7 +44,6 @@ def _windows_identity() -> tuple[str, int]:
     kernel32.CloseHandle.restype = wintypes.BOOL
     kernel32.LocalFree.argtypes = [wintypes.HLOCAL]
     kernel32.LocalFree.restype = wintypes.HLOCAL
-
     advapi32.OpenProcessToken.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)]
     advapi32.OpenProcessToken.restype = wintypes.BOOL
     advapi32.GetTokenInformation.argtypes = [wintypes.HANDLE, ctypes.c_uint, wintypes.LPVOID, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)]
@@ -55,10 +52,8 @@ def _windows_identity() -> tuple[str, int]:
     advapi32.ConvertSidToStringSidW.restype = wintypes.BOOL
 
     session_id = wintypes.DWORD(0)
-    pid = kernel32.GetCurrentProcessId()
-    if not kernel32.ProcessIdToSessionId(pid, ctypes.byref(session_id)):
+    if not kernel32.ProcessIdToSessionId(kernel32.GetCurrentProcessId(), ctypes.byref(session_id)):
         raise ctypes.WinError(ctypes.get_last_error())
-
     TOKEN_QUERY = 0x0008
     TokenUser = 1
     token = wintypes.HANDLE()
@@ -155,6 +150,7 @@ class InstanceLock:
         self._file = None
         self.acquired = False
         self.owner_id = ""
+        self.release_requested = False
         self.identity = runtime_identity()
 
     def _lock_stream(self, stream) -> bool:
@@ -197,9 +193,9 @@ class InstanceLock:
         except (OSError, BlockingIOError):
             stream.close()
             return False
-
         self._file = stream
         self.acquired = True
+        self.release_requested = False
         self.owner_id = uuid.uuid4().hex
         metadata = {
             "pid": int(os.getpid()),
@@ -216,29 +212,20 @@ class InstanceLock:
             try:
                 self._unlock_stream(stream)
             finally:
-                stream.close()
-                self._file = None
-                self.acquired = False
-                self.owner_id = ""
+                stream.close(); self._file = None; self.acquired = False; self.owner_id = ""
             raise
         return True
 
     def read_owner(self) -> dict[str, Any] | None:
         try:
             data = json.loads(self.owner_path.read_text(encoding="utf-8"))
-            if not isinstance(data, dict):
-                return None
+            if not isinstance(data, dict): return None
             required = {"pid", "owner_id", "scope_id", "user_hash", "session_id"}
-            if not required.issubset(data):
-                return None
-            if str(data.get("scope_id")) != str(self.identity["scope_id"]):
-                return None
-            pid = int(data.get("pid") or 0)
-            owner_id = str(data.get("owner_id") or "")
-            if pid <= 0 or len(owner_id) < 16:
-                return None
-            data["pid"] = pid
-            data["session_id"] = int(data.get("session_id") or 0)
+            if not required.issubset(data): return None
+            if str(data.get("scope_id")) != str(self.identity["scope_id"]): return None
+            pid = int(data.get("pid") or 0); owner_id = str(data.get("owner_id") or "")
+            if pid <= 0 or len(owner_id) < 16: return None
+            data["pid"] = pid; data["session_id"] = int(data.get("session_id") or 0)
             return data
         except (OSError, ValueError, TypeError, json.JSONDecodeError, UnicodeError):
             return None
@@ -247,6 +234,7 @@ class InstanceLock:
         owner = self.read_owner() or {}
         return {
             "acquired": bool(self.acquired),
+            "release_requested": bool(self.release_requested),
             "owner_id": self.owner_id if self.acquired else str(owner.get("owner_id") or ""),
             "pid": int(owner.get("pid") or (os.getpid() if self.acquired else 0)),
             "ownership": "kernel_file_lock",
@@ -256,18 +244,15 @@ class InstanceLock:
             "user_hash": str(self.identity["user_hash"]),
         }
 
+    def defer_release(self) -> None:
+        self.release_requested = True
+
     def release(self) -> None:
         if not self.acquired or self._file is None:
             return
         stream = self._file
         try:
-            # Keep owner.json after unlock. It is the last known generation and
-            # lets the updater wait for the owning PID even if it starts during
-            # the tiny window between final unlock and process termination.
-            # The next successful acquire overwrites this metadata atomically.
+            # owner.json deliberately survives unlock as last-generation metadata.
             self._unlock_stream(stream)
         finally:
-            stream.close()
-            self._file = None
-            self.acquired = False
-            self.owner_id = ""
+            stream.close(); self._file = None; self.acquired = False; self.owner_id = ""; self.release_requested = False
