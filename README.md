@@ -36,7 +36,7 @@ Antes de cargar Agent/Tk/servicios, Nova adquiere un lock del kernel. En Windows
   commands\
 ```
 
-`owner.json` registra PID, `owner_id`/generación aleatoria, rol (`runtime` o `updater`), scope, hash de usuario, Session ID y timestamp. El lock del kernel, no el PID, es la fuente de exclusión.
+`owner.json` registra PID, tiempo real de creación del proceso, `owner_id`/generación aleatoria, rol (`runtime` o `updater`), scope, hash de usuario, Session ID y timestamp. El lock del kernel, no el PID, es la fuente de exclusión.
 
 Una segunda ejecución no construye Agent/Tk/servicios: envía `show` al `owner_id` actual y solo devuelve éxito si pudo entregar la orden.
 
@@ -48,7 +48,7 @@ Mensajes malformados, vencidos o dirigidos a otra generación se eliminan sin ej
 
 ## Bandeja
 
-Nova usa `pystray`. `available=True` solo se establece después del callback de inicialización del backend. Excepción, icono no visible o timeout producen estado degradado.
+Nova usa `pystray`. `available=True` solo se establece después del callback de inicialización del backend, que hace visible el icono y confirma esa visibilidad. Excepción, icono no visible o timeout producen estado degradado.
 
 ## Inicio con Windows
 
@@ -60,7 +60,13 @@ La actualización requiere simultáneamente confirmar que el proceso propietario
 
 Después adquiere el lock como rol `updater` y mantiene ese guard durante staging, reemplazo, dependencias, validación y rollback. Si no puede confirmar proceso + guard dentro del timeout, no modifica archivos.
 
-UI, `ACTUALIZAR_NOVA.cmd` y ejecución interactiva directa usan el mismo supervisor. Tras éxito o error, se lanza exactamente una instancia visible con `--post-update`.
+Una vez que la coordinación devuelve `ok=True`, el supervisor garantiza un único intento visible de relanzamiento con `--post-update`. El orden es: actualización/rollback → liberación del guard → `launch_nova()`. Lecturas de versión, escritura de estado, logging e incluso un error al liberar el guard se tratan como best-effort y no pueden saltarse ese intento de recuperación.
+
+El rollback transaccional cubre **archivos administrados**: restaura archivos modificados/eliminados, elimina solo archivos creados por la actualización, conserva los unchanged y restaura `managed_files.json`. Sin embargo, si `requirements.txt` cambió y `pip` llegó a iniciarse, no existe una garantía equivalente para el estado exacto de `.venv`.
+
+Si una actualización falla después de iniciar pip, Nova restaura los archivos y conserva el backup, pero persiste un estado de recuperación con `files_rollback_ok`, `dependencies_may_have_changed` y `recovery_required`. No se afirma que volver a ejecutar `pip install -r requirements.txt` elimine paquetes adicionales ni reconstruya exactamente el entorno anterior.
+
+UI, `ACTUALIZAR_NOVA.cmd` y ejecución interactiva directa usan el mismo supervisor.
 
 ## Atajos
 
@@ -88,7 +94,7 @@ Resident Mode no añade screenshots periódicos, captura de teclado, lectura de 
 
 ## Pruebas
 
-Ubuntu ejecuta `compileall` y la suite completa. Windows ejecuta explícitamente lifecycle, owner/IPC, una integración con procesos separados reales para lock/comandos/terminación, updater, session shutdown, Gaming Awareness, Instant Wake/hotkeys y core.
+Ubuntu ejecuta `compileall` y la suite completa. Windows ejecuta explícitamente lifecycle, owner/IPC, una integración con procesos separados reales para lock/comandos/terminación, updater, rollback transaccional, session shutdown, Gaming Awareness, Instant Wake/hotkeys y core.
 
 La documentación técnica completa está en [`docs/v0.9.9-resident-runtime.md`](docs/v0.9.9-resident-runtime.md).
 
