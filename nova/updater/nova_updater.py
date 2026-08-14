@@ -331,16 +331,46 @@ def apply_transaction(stage: Path, manifest: dict[str, list[str]]) -> None:
             target.unlink()
 
 
-def _write_rollback_status(backup: Path, *, ok: bool, errors: list[str] | None = None) -> None:
+def _dependency_recovery_message(backup: Path) -> str:
+    return (
+        "Los archivos administrados fueron restaurados, pero pip llegó a iniciarse y el entorno Python puede haber cambiado. "
+        f"Conserva el backup en {backup} y revisa la instalación/.venv antes de reintentar. "
+        "Volver a ejecutar requirements.txt no garantiza eliminar paquetes adicionales ni restaurar exactamente el entorno anterior."
+    )
+
+
+def _recovery_status_path() -> Path:
+    return ROOT / "data" / "update_recovery.json"
+
+
+def _write_rollback_status(
+    backup: Path,
+    *,
+    files_rollback_ok: bool,
+    dependencies_may_have_changed: bool = False,
+    errors: list[str] | None = None,
+) -> dict:
+    recovery_required = (not bool(files_rollback_ok)) or bool(dependencies_may_have_changed)
+    if dependencies_may_have_changed:
+        message = _dependency_recovery_message(backup)
+    elif not files_rollback_ok:
+        message = f"El rollback de archivos quedó incompleto. Conserva el backup en {backup} para recuperación manual."
+    else:
+        message = "Los archivos administrados fueron restaurados correctamente."
     payload = {
-        "ok": bool(ok),
+        "ok": bool(files_rollback_ok),
+        "files_rollback_ok": bool(files_rollback_ok),
+        "dependencies_may_have_changed": bool(dependencies_may_have_changed),
+        "recovery_required": bool(recovery_required),
         "errors": list(errors or []),
         "backup": str(backup),
+        "message": message,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
     _atomic_write_json(backup / "rollback_status.json", payload)
+
     failure_path = ROOT / "data" / "update_rollback_failure.json"
-    if ok:
+    if files_rollback_ok:
         try:
             failure_path.unlink(missing_ok=True)
         except OSError:
@@ -348,8 +378,18 @@ def _write_rollback_status(backup: Path, *, ok: bool, errors: list[str] | None =
     else:
         _atomic_write_json(failure_path, payload)
 
+    recovery_path = _recovery_status_path()
+    if recovery_required:
+        _atomic_write_json(recovery_path, payload)
+    else:
+        try:
+            recovery_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+    return payload
 
-def restore_backup(backup: Path) -> None:
+
+def restore_backup(backup: Path, *, dependencies_may_have_changed: bool = False) -> dict:
     backup = Path(backup)
     meta_path = backup / "backup.json"
     if not meta_path.is_file():
@@ -380,8 +420,6 @@ def restore_backup(backup: Path) -> None:
         except Exception as exc:
             errors.append(f"remove_created:{rel}:{type(exc).__name__}:{exc}")
 
-    # Files classified as unchanged are deliberately never opened, replaced or
-    # removed during rollback.
     managed = meta.get("managed_files")
     if not isinstance(managed, dict):
         errors.append("managed_files:missing_state")
@@ -404,13 +442,26 @@ def restore_backup(backup: Path) -> None:
         except Exception as exc:
             errors.append(f"managed_files:{type(exc).__name__}:{exc}")
 
+    status = None
     try:
-        _write_rollback_status(backup, ok=not errors, errors=errors)
+        status = _write_rollback_status(
+            backup,
+            files_rollback_ok=not errors,
+            dependencies_may_have_changed=dependencies_may_have_changed,
+            errors=errors,
+        )
     except Exception as exc:
         errors.append(f"rollback_status:{type(exc).__name__}:{exc}")
     if errors:
-        # The backup is intentionally retained for manual recovery.
         raise RuntimeError("rollback incompleto: " + " | ".join(errors))
+    return status or {
+        "ok": True,
+        "files_rollback_ok": True,
+        "dependencies_may_have_changed": bool(dependencies_may_have_changed),
+        "recovery_required": bool(dependencies_may_have_changed),
+        "errors": [],
+        "backup": str(backup),
+    }
 
 
 def validate_install() -> tuple[bool, str]:
@@ -458,9 +509,12 @@ def execute_transaction(
 
     backup = create_backup(manifest, old_version, new_version, backup_root=backup_root)
     print(f"Backup: {backup}")
+    dependencies_started = False
+    requirements_changed = "requirements.txt" in set(manifest["modified_existing"] + manifest["created_new"])
     try:
         apply_transaction(stage, manifest)
-        if "requirements.txt" in set(manifest["modified_existing"] + manifest["created_new"]):
+        if requirements_changed:
+            dependencies_started = True
             _install_requirements()
         ok, detail = validate_install()
         if not ok:
@@ -471,11 +525,16 @@ def execute_transaction(
     except Exception as update_error:
         print("La actualización falló; restaurando transacción...")
         try:
-            restore_backup(backup)
+            restore_backup(backup, dependencies_may_have_changed=dependencies_started)
         except Exception as rollback_error:
             raise RuntimeError(
                 f"actualización falló ({update_error}); rollback incompleto ({rollback_error}); "
                 f"backup conservado en {backup}"
+            ) from update_error
+        if dependencies_started:
+            raise RuntimeError(
+                f"actualización falló ({update_error}); archivos administrados restaurados; "
+                + _dependency_recovery_message(backup)
             ) from update_error
         raise
 
