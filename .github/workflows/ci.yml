@@ -86,29 +86,18 @@ jobs:
         run: python -m pip install --disable-pip-version-check psutil pillow pystray requests beautifulsoup4
       - name: Compile all Nova source on Windows
         run: python -m compileall -q nova
-      - name: Windows full test suite
+      - name: Recovery bootstrap unit suite
         env:
           PYTHONPATH: nova
-        run: python -m unittest discover -s tests -v
-      - name: Resident lifecycle contract
+        run: python -m unittest -v tests.test_recovery_bootstrap
+      - name: Recovery and updater gate suite
         env:
           PYTHONPATH: nova
-        run: python -m unittest -v tests.test_resident_lifecycle_contract
-      - name: Tray and resident ownership hardening
+        run: python -m unittest -v tests.test_recovery_update_gate
+      - name: Windows Job Object suite
         env:
           PYTHONPATH: nova
-        run: python -m unittest -v tests.test_resident_hardening
-      - name: Updater transactional rollback
-        env:
-          PYTHONPATH: nova
-        run: python -m unittest -v tests.test_updater_transaction
-      - name: Recovery quarantine and update gates
-        env:
-          PYTHONPATH: nova
-        run: |
-          python -m unittest -v tests.test_recovery_bootstrap
-          python -m unittest -v tests.test_recovery_update_gate
-          python -m unittest -v tests.test_pip_job_object
+        run: python -m unittest -v tests.test_pip_job_object
       - name: Windows Job Object race repeat
         env:
           PYTHONPATH: nova
@@ -118,6 +107,24 @@ jobs:
             python -m unittest -v tests.test_pip_job_object.JobObjectWindowsIntegrationTests.test_fast_root_exit_cannot_hide_surviving_child
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }
+      - name: Required resident updater suites
+        env:
+          PYTHONPATH: nova
+        run: |
+          python -m unittest -v tests.test_updater_transaction
+          python -m unittest -v tests.test_update_runner
+          python -m unittest -v tests.test_updater_resident
+          python -m unittest -v tests.test_updater_diagnostics
+          python -m unittest -v tests.test_resident_process_ipc
+          python -m unittest -v tests.test_resident_lifecycle_contract
+      - name: Windows full test suite
+        env:
+          PYTHONPATH: nova
+        run: python -m unittest discover -s tests -v
+      - name: Tray and resident ownership hardening
+        env:
+          PYTHONPATH: nova
+        run: python -m unittest -v tests.test_resident_hardening
       - name: Real multiprocess lock IPC and termination
         env:
           PYTHONPATH: nova
@@ -128,10 +135,6 @@ jobs:
         run: |
           python -m unittest -v tests.test_resident_process_ipc
           python -m unittest -v tests.test_resident_process_ipc
-      - name: Resident updater paths
-        env:
-          PYTHONPATH: nova
-        run: python -m unittest -v tests.test_update_runner tests.test_updater_resident tests.test_updater_diagnostics
       - name: Windows session shutdown
         env:
           PYTHONPATH: nova
