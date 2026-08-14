@@ -37,13 +37,22 @@ jobs:
           python -m unittest -v tests.test_updater_diagnostics
           python -m unittest -v tests.test_resident_process_ipc
           python -m unittest -v tests.test_resident_lifecycle_contract
-      - name: Recovery quarantine and update gates
+      - name: Recovery schema v2 and gates
         env:
           PYTHONPATH: nova
         run: |
+          python -m unittest -v tests.test_pip_job_object
           python -m unittest -v tests.test_recovery_bootstrap
           python -m unittest -v tests.test_recovery_update_gate
-          python -m unittest -v tests.test_pip_job_object
+          python -m unittest -v tests.test_dependency_snapshot
+          python -m unittest -v tests.test_stable_recovery_bootstrap
+          python -m unittest -v tests.test_updater_entrypoint_guards
+      - name: Real crash and multiprocess recovery
+        env:
+          PYTHONPATH: nova
+        run: |
+          python -m unittest -v tests.test_update_crash_recovery
+          python -m unittest -v tests.test_recovery_multiprocess
       - name: Tray readiness regression
         env:
           PYTHONPATH: nova
@@ -74,7 +83,7 @@ jobs:
   windows-smoke:
     name: Windows reliability smoke / Python 3.11
     runs-on: windows-latest
-    timeout-minutes: 30
+    timeout-minutes: 40
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -94,6 +103,13 @@ jobs:
         env:
           PYTHONPATH: nova
         run: python -m unittest -v tests.test_recovery_update_gate
+      - name: Dependency snapshot and stable bootstrap
+        env:
+          PYTHONPATH: nova
+        run: |
+          python -m unittest -v tests.test_dependency_snapshot
+          python -m unittest -v tests.test_stable_recovery_bootstrap
+          python -m unittest -v tests.test_updater_entrypoint_guards
       - name: Windows Job Object suite
         env:
           PYTHONPATH: nova
@@ -107,6 +123,33 @@ jobs:
             python -m unittest -v tests.test_pip_job_object.JobObjectWindowsIntegrationTests.test_fast_root_exit_cannot_hide_surviving_child
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }
+      - name: Windows abrupt updater death inside Job Object must not skip
+        env:
+          PYTHONPATH: nova
+        shell: pwsh
+        run: |
+          $lines = @(& python -m unittest -v tests.test_update_crash_recovery.UpdateCrashRecoveryTests.test_killing_updater_while_job_contains_dependency_leaves_no_child 2>&1 | ForEach-Object { "$_" })
+          $code = $LASTEXITCODE
+          $lines | ForEach-Object { Write-Host $_ }
+          if ($code -ne 0) { exit $code }
+          if (($lines -join "`n") -match "skipped") {
+            Write-Host "::error title=Native Job crash test skipped::This Windows-native safety test must execute, not skip."
+            exit 1
+          }
+      - name: Real transaction crash boundaries
+        env:
+          PYTHONPATH: nova
+        run: python -m unittest -v tests.test_update_crash_recovery
+      - name: Real recovery multiprocess locking
+        env:
+          PYTHONPATH: nova
+        run: python -m unittest -v tests.test_recovery_multiprocess
+      - name: Recovery multiprocess race repeat
+        env:
+          PYTHONPATH: nova
+        run: |
+          python -m unittest -v tests.test_recovery_multiprocess
+          python -m unittest -v tests.test_recovery_multiprocess
       - name: Required resident updater suites
         env:
           PYTHONPATH: nova
@@ -126,7 +169,7 @@ jobs:
           $code = $LASTEXITCODE
           $lines | ForEach-Object { Write-Host $_ }
           if ($code -ne 0) {
-            $start = [Math]::Max(0, $lines.Count - 100)
+            $start = [Math]::Max(0, $lines.Count - 120)
             $tail = $lines[$start..($lines.Count - 1)] -join "`n"
             $escaped = $tail.Replace('%','%25').Replace("`r",'%0D').Replace("`n",'%0A')
             Write-Host "::error title=Windows unittest failure::$escaped"
