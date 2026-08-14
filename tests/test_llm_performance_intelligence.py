@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import closing
 import sqlite3
 import tempfile
 import unittest
@@ -74,7 +75,7 @@ class LLMPerformanceMonitorTests(unittest.TestCase):
                 gpu_after=None,
                 error_type="Timeout",
             )
-            with sqlite3.connect(path) as conn:
+            with closing(sqlite3.connect(path)) as conn:
                 columns = {row[1] for row in conn.execute("PRAGMA table_info(llm_calls)").fetchall()}
                 row = conn.execute("SELECT * FROM llm_calls LIMIT 1").fetchone()
             forbidden = {"prompt", "response", "content", "messages", "tool_arguments", "secret", "api_key"}
@@ -128,7 +129,7 @@ class AgentInstrumentationTests(unittest.TestCase):
             self.assertEqual(post.call_args.kwargs["timeout"], 9.0)
             self.assertEqual(agent._last_llm_metrics["prompt_tokens"], 50)
             self.assertEqual(agent._last_llm_metrics["output_tokens"], 30)
-            with sqlite3.connect(Path(td) / "llm.db") as conn:
+            with closing(sqlite3.connect(Path(td) / "llm.db")) as conn:
                 blob = " ".join(str(x) for x in conn.execute("SELECT * FROM llm_calls").fetchone())
             self.assertNotIn("SECRETO-PROMPT", blob)
             self.assertNotIn("SECRETO-RESPUESTA", blob)
