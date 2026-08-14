@@ -187,10 +187,13 @@ class JobObjectWindowsIntegrationTests(unittest.TestCase):
         ready = root / "child.ready"
         pid_file = root / "child.pid"
         started = root / "root.started"
+        # child.ready is deliberately the LAST write: its existence is the
+        # synchronization barrier proving child.pid is already durable enough
+        # to read. No arbitrary sleep is used as the correctness mechanism.
         child_code = (
             "from pathlib import Path; import os, threading; "
-            f"Path(r'{ready}').write_text('ready', encoding='utf-8'); "
             f"Path(r'{pid_file}').write_text(str(os.getpid()), encoding='utf-8'); "
+            f"Path(r'{ready}').write_text('ready', encoding='utf-8'); "
             "threading.Event().wait(30)"
         )
         root_code = (
@@ -209,12 +212,21 @@ class JobObjectWindowsIntegrationTests(unittest.TestCase):
             # only if the suspended process never executed user/pip code.
             self.assertFalse(started.exists(), "containment setup failed after process execution")
             self.skipTest(f"runner does not permit nested Job assignment: {exc}")
-        self.assertTrue(self._wait_path(ready), "contained child did not signal readiness")
-        child_pid = int(pid_file.read_text(encoding="utf-8"))
-        api = proc.api
-        creation = api.process_creation_time(child_pid)
-        self.assertIsNotNone(creation)
-        return proc, child_pid, int(creation)
+        try:
+            self.assertTrue(self._wait_path(ready), "contained child did not signal readiness")
+            self.assertTrue(pid_file.is_file(), "ready signal appeared before child PID metadata")
+            child_pid = int(pid_file.read_text(encoding="utf-8"))
+            api = proc.api
+            creation = api.process_creation_time(child_pid)
+            self.assertIsNotNone(creation)
+            return proc, child_pid, int(creation)
+        except BaseException:
+            # Do not leak a contained process or keep the TemporaryDirectory in
+            # use when a test assertion/setup step itself fails.
+            try:
+                proc.close()
+            finally:
+                raise
 
     def test_closing_kill_on_close_job_terminates_root_and_descendant(self):
         with tempfile.TemporaryDirectory() as td:
@@ -230,20 +242,26 @@ class JobObjectWindowsIntegrationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             proc, child_pid, creation = self._launch_tree(Path(td), root_exits=True)
             api = proc.api
-            self.assertEqual(proc.wait(timeout=5), 0)
-            # The direct/root process is gone while its child is intentionally
-            # alive. A root-only/snapshot implementation can false-positive here.
-            self.assertEqual(api.process_creation_time(child_pid), creation)
-            result = verify_normal_completion(proc, 1.0)
-            self.assertIsNotNone(result)
-            self.assertTrue(result.authoritative_containment)
-            self.assertTrue(result.terminated_confirmed, result.detail + " " + repr(result.termination_errors))
-            self.assertTrue(result.rollback_allowed)
-            self.assertFalse(result.remaining_processes)
-            self.assertTrue(
-                self._wait_identity_gone_or_reused(api, child_pid, creation),
-                "orphan child survived an authoritative Job completion check",
-            )
+            try:
+                self.assertEqual(proc.wait(timeout=5), 0)
+                # The direct/root process is gone while its child is intentionally
+                # alive. A root-only/snapshot implementation can false-positive here.
+                self.assertEqual(api.process_creation_time(child_pid), creation)
+                result = verify_normal_completion(proc, 1.0)
+                self.assertIsNotNone(result)
+                self.assertTrue(result.authoritative_containment)
+                self.assertTrue(result.terminated_confirmed, result.detail + " " + repr(result.termination_errors))
+                self.assertTrue(result.rollback_allowed)
+                self.assertFalse(result.remaining_processes)
+                self.assertTrue(
+                    self._wait_identity_gone_or_reused(api, child_pid, creation),
+                    "orphan child survived an authoritative Job completion check",
+                )
+            finally:
+                try:
+                    proc.close()
+                except Exception:
+                    pass
 
 
 if __name__ == "__main__":
