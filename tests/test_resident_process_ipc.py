@@ -29,12 +29,28 @@ def _wait_for_path(path: Path, timeout: float = 3.0) -> bool:
     deadline = time.monotonic() + timeout
     event = threading.Event()
     while time.monotonic() < deadline:
-        if path.exists(): return True
+        if path.exists():
+            return True
         event.wait(0.02)
     return path.exists()
 
+
+def _wait_for_owner(path: Path, timeout: float = 3.0) -> dict:
+    deadline = time.monotonic() + timeout
+    event = threading.Event()
+    while time.monotonic() < deadline:
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(data, dict) and data.get("pid") and data.get("owner_id"):
+                return data
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            pass
+        event.wait(0.02)
+    return {}
+
+
 OWNER_SCRIPT = r'''
-import json, sys, threading, time
+import sys, threading, time
 from pathlib import Path
 from assistant.instance_lock import InstanceLock
 from assistant.instance_commands import InstanceCommandMailbox
@@ -42,8 +58,7 @@ lock = InstanceLock(path=Path(sys.argv[1]), owner_path=Path(sys.argv[2]), role="
 if not lock.acquire(): raise SystemExit(20)
 mailbox = InstanceCommandMailbox(Path(sys.argv[3]), owner_id=lock.owner_id)
 marker = Path(sys.argv[4])
-print(json.dumps({"pid": __import__("os").getpid(), "owner_id": lock.owner_id}), flush=True)
-deadline = time.monotonic() + 10.0
+deadline = time.monotonic() + 12.0
 while time.monotonic() < deadline:
     message = mailbox.consume(owner_id=lock.owner_id)
     if message and message.get("ok"):
@@ -78,33 +93,48 @@ raise SystemExit(0 if mailbox.send(sys.argv[3], target_owner_id=sys.argv[2]) els
 '''
 
 BLOCKING_OWNER_SCRIPT = r'''
-import json, os, sys, threading
+import sys, threading
 from pathlib import Path
 from assistant.instance_lock import InstanceLock
 lock = InstanceLock(path=Path(sys.argv[1]), owner_path=Path(sys.argv[2]), role="runtime")
 if not lock.acquire(): raise SystemExit(50)
-print(json.dumps({"pid": os.getpid(), "owner_id": lock.owner_id}), flush=True)
-threading.Event().wait(10.0)
+threading.Event().wait(12.0)
 lock.release()
 '''
 
 
+@unittest.skipUnless(os.name == "nt", "real kernel resident integration is executed on windows-latest")
 class ResidentProcessIPCTests(unittest.TestCase):
     def _paths(self, folder: Path):
         return folder / "runtime.lock", folder / "owner.json", folder / "commands"
 
     def test_two_process_launches_keep_one_runtime_show_first_and_updater_waits_for_real_exit(self):
         with tempfile.TemporaryDirectory() as td:
-            folder = Path(td); lock_path, owner_path, commands = self._paths(folder); marker = folder / "shown.marker"
-            owner_proc = subprocess.Popen([sys.executable, "-c", OWNER_SCRIPT, str(lock_path), str(owner_path), str(commands), str(marker)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=_env())
+            folder = Path(td)
+            lock_path, owner_path, commands = self._paths(folder)
+            marker = folder / "shown.marker"
+            owner_proc = subprocess.Popen(
+                [sys.executable, "-c", OWNER_SCRIPT, str(lock_path), str(owner_path), str(commands), str(marker)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                env=_env(),
+            )
             result = None
             try:
-                line = owner_proc.stdout.readline().strip(); self.assertTrue(line, owner_proc.stderr.read()); owner = json.loads(line)
-                secondary = subprocess.run([sys.executable, "-c", SECONDARY_SCRIPT, str(lock_path), str(owner_path), str(commands)], capture_output=True, text=True, env=_env(), timeout=5)
-                self.assertEqual(secondary.returncode, 0, secondary.stderr)
+                owner = _wait_for_owner(owner_path, 4.0)
+                self.assertTrue(owner, f"runtime owner metadata was not published; rc={owner_proc.poll()}")
+                secondary = subprocess.run(
+                    [sys.executable, "-c", SECONDARY_SCRIPT, str(lock_path), str(owner_path), str(commands)],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    env=_env(),
+                    timeout=5,
+                )
+                self.assertEqual(secondary.returncode, 0)
                 self.assertTrue(_wait_for_path(marker), "secondary launch did not restore first runtime")
                 probe = InstanceLock(path=lock_path, owner_path=owner_path, publish_owner=False)
                 self.assertFalse(probe.acquire(), "two runtimes acquired the same scoped lock")
+
                 started = time.monotonic()
                 result = coordinate_runtime_shutdown(
                     NOVA_ROOT,
@@ -115,7 +145,10 @@ class ResidentProcessIPCTests(unittest.TestCase):
                     mailbox=InstanceCommandMailbox(commands),
                 )
                 elapsed = time.monotonic() - started
-                self.assertTrue(result.ok, result.error); self.assertTrue(result.command_sent); self.assertTrue(result.process_terminated); self.assertTrue(result.lock_acquired)
+                self.assertTrue(result.ok, result.error)
+                self.assertTrue(result.command_sent)
+                self.assertTrue(result.process_terminated)
+                self.assertTrue(result.lock_acquired)
                 self.assertGreaterEqual(elapsed, 0.18, "updater returned before owner completed delayed exit")
                 self.assertIsNotNone(owner_proc.poll(), "owner process is still alive after updater authorization")
                 competing = InstanceLock(path=lock_path, owner_path=owner_path, publish_owner=False)
@@ -123,40 +156,72 @@ class ResidentProcessIPCTests(unittest.TestCase):
                 metadata = InstanceLock(path=lock_path, owner_path=owner_path, publish_owner=False).read_owner()
                 self.assertEqual(metadata.get("role"), "updater")
             finally:
-                if result is not None: result.release_guard()
-                if owner_proc.poll() is None: owner_proc.terminate(); owner_proc.wait(timeout=3)
+                if result is not None:
+                    result.release_guard()
+                if owner_proc.poll() is None:
+                    owner_proc.terminate()
+                    owner_proc.wait(timeout=3)
 
     def test_two_separate_senders_do_not_overwrite_commands(self):
         with tempfile.TemporaryDirectory() as td:
-            folder = Path(td); lock_path, owner_path, commands = self._paths(folder)
-            owner = InstanceLock(path=lock_path, owner_path=owner_path, role="runtime"); self.assertTrue(owner.acquire())
+            folder = Path(td)
+            lock_path, owner_path, commands = self._paths(folder)
+            owner = InstanceLock(path=lock_path, owner_path=owner_path, role="runtime")
+            self.assertTrue(owner.acquire())
             try:
-                processes = [subprocess.Popen([sys.executable, "-c", SENDER_SCRIPT, str(commands), owner.owner_id, command], env=_env()) for command in ("show", "status")]
-                for proc in processes: self.assertEqual(proc.wait(timeout=5), 0)
+                processes = [
+                    subprocess.Popen(
+                        [sys.executable, "-c", SENDER_SCRIPT, str(commands), owner.owner_id, command],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        env=_env(),
+                    )
+                    for command in ("show", "status")
+                ]
+                for proc in processes:
+                    self.assertEqual(proc.wait(timeout=5), 0)
                 mailbox = InstanceCommandMailbox(commands, owner_id=owner.owner_id)
                 rows = [mailbox.consume(owner_id=owner.owner_id), mailbox.consume(owner_id=owner.owner_id)]
                 self.assertTrue(all(row and row.get("ok") for row in rows))
                 self.assertEqual({row["command"] for row in rows}, {"show", "status"})
                 self.assertEqual(len({row["command_id"] for row in rows}), 2)
-            finally: owner.release()
+            finally:
+                owner.release()
 
     def test_crash_with_pending_shutdown_is_ignored_by_immediate_new_generation(self):
         with tempfile.TemporaryDirectory() as td:
-            folder = Path(td); lock_path, owner_path, commands = self._paths(folder)
-            old_proc = subprocess.Popen([sys.executable, "-c", BLOCKING_OWNER_SCRIPT, str(lock_path), str(owner_path)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=_env())
+            folder = Path(td)
+            lock_path, owner_path, commands = self._paths(folder)
+            old_proc = subprocess.Popen(
+                [sys.executable, "-c", BLOCKING_OWNER_SCRIPT, str(lock_path), str(owner_path)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                env=_env(),
+            )
             try:
-                line = old_proc.stdout.readline().strip(); self.assertTrue(line, old_proc.stderr.read()); old = json.loads(line)
-                mailbox = InstanceCommandMailbox(commands); self.assertTrue(mailbox.send("shutdown_for_update", target_owner_id=old["owner_id"]))
-                old_proc.terminate(); old_proc.wait(timeout=5)
-                new_owner = InstanceLock(path=lock_path, owner_path=owner_path, role="runtime"); self.assertTrue(new_owner.acquire(), "kernel lock did not recover")
+                old = _wait_for_owner(owner_path, 4.0)
+                self.assertTrue(old, f"old runtime owner metadata was not published; rc={old_proc.poll()}")
+                mailbox = InstanceCommandMailbox(commands)
+                self.assertTrue(mailbox.send("shutdown_for_update", target_owner_id=old["owner_id"]))
+                old_proc.terminate()
+                old_proc.wait(timeout=5)
+
+                new_owner = InstanceLock(path=lock_path, owner_path=owner_path, role="runtime")
+                self.assertTrue(new_owner.acquire(), "kernel lock did not recover after unexpected termination")
                 try:
                     self.assertNotEqual(new_owner.owner_id, old["owner_id"])
                     new_mailbox = InstanceCommandMailbox(commands, owner_id=new_owner.owner_id)
-                    self.assertEqual(new_mailbox.consume(owner_id=new_owner.owner_id), {"ok": False, "error": "wrong_owner"})
-                    self.assertIsNone(new_mailbox.consume(owner_id=new_owner.owner_id)); self.assertTrue(new_owner.acquired)
-                finally: new_owner.release()
+                    rejected = new_mailbox.consume(owner_id=new_owner.owner_id)
+                    self.assertEqual(rejected, {"ok": False, "error": "wrong_owner"})
+                    self.assertIsNone(new_mailbox.consume(owner_id=new_owner.owner_id))
+                    self.assertTrue(new_owner.acquired)
+                finally:
+                    new_owner.release()
             finally:
-                if old_proc.poll() is None: old_proc.terminate(); old_proc.wait(timeout=3)
+                if old_proc.poll() is None:
+                    old_proc.terminate()
+                    old_proc.wait(timeout=3)
 
 
-if __name__ == "__main__": unittest.main()
+if __name__ == "__main__":
+    unittest.main()
