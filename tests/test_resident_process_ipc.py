@@ -123,6 +123,7 @@ class ResidentProcessIPCTests(unittest.TestCase):
             try:
                 owner = _wait_for_owner(owner_path, 4.0)
                 self.assertTrue(owner, f"runtime owner metadata was not published; rc={owner_proc.poll()}")
+                self.assertGreater(int(owner.get("process_creation_time") or 0), 0, "Windows owner metadata must contain real process creation time")
                 secondary = subprocess.run(
                     [sys.executable, "-c", SECONDARY_SCRIPT, str(lock_path), str(owner_path), str(commands)],
                     stdout=subprocess.DEVNULL,
@@ -141,7 +142,7 @@ class ResidentProcessIPCTests(unittest.TestCase):
                     timeout=5.0,
                     expected_pid=int(owner["pid"]),
                     lock_factory=lambda: InstanceLock(path=lock_path, owner_path=owner_path, publish_owner=False, role="observer"),
-                    guard_factory=lambda: InstanceLock(path=lock_path, owner_path=owner_path, role="updater"),
+                    guard_factory=lambda: InstanceLock(path=lock_path, owner_path=owner_path, publish_owner=False, role="updater"),
                     mailbox=InstanceCommandMailbox(commands),
                 )
                 elapsed = time.monotonic() - started
@@ -155,6 +156,7 @@ class ResidentProcessIPCTests(unittest.TestCase):
                 self.assertFalse(competing.acquire(), "updater released guard before file replacement")
                 metadata = InstanceLock(path=lock_path, owner_path=owner_path, publish_owner=False).read_owner()
                 self.assertEqual(metadata.get("role"), "updater")
+                self.assertGreater(int(metadata.get("process_creation_time") or 0), 0)
             finally:
                 if result is not None:
                     result.release_guard()
@@ -201,6 +203,7 @@ class ResidentProcessIPCTests(unittest.TestCase):
             try:
                 old = _wait_for_owner(owner_path, 4.0)
                 self.assertTrue(old, f"old runtime owner metadata was not published; rc={old_proc.poll()}")
+                self.assertGreater(int(old.get("process_creation_time") or 0), 0)
                 mailbox = InstanceCommandMailbox(commands)
                 self.assertTrue(mailbox.send("shutdown_for_update", target_owner_id=old["owner_id"]))
                 old_proc.terminate()
