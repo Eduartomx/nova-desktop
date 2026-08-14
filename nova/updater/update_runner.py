@@ -14,6 +14,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+SUPERVISOR_ALREADY_RUNNING_CODE = 5
+PIP_TERMINATION_UNCONFIRMED_CODE = 6
+
 
 def nova_root() -> Path:
     return Path(__file__).resolve().parents[1]
@@ -196,6 +199,18 @@ def _runtime_components(root: Path, *, lock_factory=None, guard_factory=None, ma
     return lock_factory, guard_factory, mailbox
 
 
+def _acquire_supervisor_mutex(root: Path, supervisor_lock_factory=None):
+    if str(root) not in sys.path:
+        sys.path.insert(0, str(root))
+    if supervisor_lock_factory is None:
+        from assistant.update_supervisor import create_supervisor_mutex
+        supervisor_lock_factory = create_supervisor_mutex
+    lock = supervisor_lock_factory()
+    if not lock.acquire():
+        return None
+    return lock
+
+
 def _try_guard(guard_factory):
     guard = guard_factory()
     try:
@@ -359,12 +374,7 @@ def _guarded_previous_owner_result(
 
 
 def _acquire_verified_guard(observer, guard_factory, deadline: float, process_factory):
-    """Acquire updater guard after the captured runtime already terminated.
-
-    Every ordinary failure from this point is explicitly marked with
-    ``process_terminated=True`` so the supervisor can relaunch recovery without
-    ever authorizing file mutation without a guard.
-    """
+    """Acquire updater guard after the captured runtime already terminated."""
     event = threading.Event()
     last = None
     while time.monotonic() <= deadline:
@@ -666,7 +676,17 @@ def status_path(root: Path) -> Path:
     return root / "data" / "update_last.json"
 
 
-def write_status(root: Path, *, ok: bool, before: str, after: str, log: Path, error: str = "") -> None:
+def write_status(
+    root: Path,
+    *,
+    ok: bool,
+    before: str,
+    after: str,
+    log: Path,
+    error: str = "",
+    state: str = "",
+    remaining_pids: list[int] | None = None,
+) -> None:
     path = status_path(root)
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -677,6 +697,10 @@ def write_status(root: Path, *, ok: bool, before: str, after: str, log: Path, er
         "log": str(log),
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
+    if state:
+        payload["state"] = str(state)
+    if remaining_pids:
+        payload["remaining_pids"] = sorted({int(pid) for pid in remaining_pids if int(pid) > 0})[:32]
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
@@ -738,9 +762,28 @@ def _append_log_best_effort(log: Path, text: str) -> None:
         return
 
 
-def _write_status_best_effort(root: Path, *, ok: bool, before: str, after: str, log: Path, error: str) -> None:
+def _write_status_best_effort(
+    root: Path,
+    *,
+    ok: bool,
+    before: str,
+    after: str,
+    log: Path,
+    error: str,
+    state: str = "",
+    remaining_pids: list[int] | None = None,
+) -> None:
     try:
-        write_status(root, ok=ok, before=before, after=after, log=log, error=error)
+        write_status(
+            root,
+            ok=ok,
+            before=before,
+            after=after,
+            log=log,
+            error=error,
+            state=state,
+            remaining_pids=remaining_pids,
+        )
     except Exception as exc:
         _append_log_best_effort(log, f"\n[WARN ESTADO] {type(exc).__name__}: {exc}\n")
 
@@ -753,11 +796,30 @@ def _read_version_best_effort(root: Path, fallback: str, log: Path, label: str) 
         return fallback
 
 
+def _read_recovery_best_effort(root: Path) -> dict[str, Any]:
+    try:
+        path = root / "data" / "update_recovery.json"
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
 def _release_coordination_guard_best_effort(coordination: ShutdownCoordination, log: Path) -> None:
     try:
         coordination.release_guard()
     except Exception as exc:
         _append_log_best_effort(log, f"\n[WARN GUARD] {type(exc).__name__}: {exc}\n")
+
+
+def _release_supervisor_mutex_best_effort(lock, log: Path | None = None) -> None:
+    if lock is None:
+        return
+    try:
+        lock.release()
+    except Exception as exc:
+        if log is not None:
+            _append_log_best_effort(log, f"\n[WARN SUPERVISOR MUTEX] {type(exc).__name__}: {exc}\n")
 
 
 def _launch_recovery_once(root: Path, log: Path) -> tuple[bool, str]:
@@ -770,73 +832,125 @@ def _launch_recovery_once(root: Path, log: Path) -> tuple[bool, str]:
     return bool(launched), str(detail or "")
 
 
-def main(argv=None) -> int:
+def main(argv=None, *, supervisor_lock_factory=None) -> int:
     parser = argparse.ArgumentParser(description="Supervisa una actualización de Nova y relanza la aplicación.")
     parser.add_argument("--parent-pid", type=int, default=0)
     parser.add_argument("--wait-seconds", type=float, default=20.0)
     args = parser.parse_args(argv)
     root = nova_root()
-    logs = root / "data" / "updater_logs"
-    log = logs / ("update_" + time.strftime("%Y%m%d_%H%M%S") + ".log")
-    try:
-        logs.mkdir(parents=True, exist_ok=True)
-    except Exception:
-        pass
 
-    before = _read_version_best_effort(root, "0.0.0", log, "ANTES")
+    # Lock ordering invariant:
+    # supervisor mutex -> runtime coordination/guard -> update/rollback
+    # -> release runtime guard -> launch -> release supervisor mutex.
     try:
-        coordination = coordinate_runtime_shutdown(root, args.wait_seconds, expected_pid=args.parent_pid)
+        supervisor_mutex = _acquire_supervisor_mutex(root, supervisor_lock_factory)
     except Exception as exc:
-        # Defensive boundary for injected/custom coordinators.  The production
-        # coordinator already converts ordinary failures to structured results.
-        coordination = ShutdownCoordination(False, f"coordination_exception:{type(exc).__name__}")
-
-    if not coordination.ok:
-        if coordination.process_terminated:
-            error = "Nova terminó, pero la coordinación no obtuvo un guard verificable; no se modificaron archivos. " + coordination.error
-        else:
-            error = "Nova no terminó de forma verificable; no se modificaron archivos. " + coordination.error
-        _write_status_best_effort(root, ok=False, before=before, after=before, log=log, error=error)
-        _release_coordination_guard_best_effort(coordination, log)
-        if coordination.process_terminated:
-            _launch_recovery_once(root, log)
-        else:
-            try:
-                _show_surviving_runtime(root, coordination)
-            except Exception as exc:
-                _append_log_best_effort(log, f"\n[WARN SHOW] {type(exc).__name__}: {exc}\n")
+        print(f"[ERROR] No pude adquirir el mutex del supervisor: {type(exc).__name__}: {exc}")
         return 4
+    if supervisor_mutex is None:
+        print("Actualización ya en curso.")
+        return SUPERVISOR_ALREADY_RUNNING_CODE
 
-    rc = 2
-    ok = False
-    after = before
-    error = ""
-    runner_error = ""
-    launched = False
-    launch_detail = ""
-
+    log: Path | None = None
     try:
+        logs = root / "data" / "updater_logs"
+        log = logs / ("update_" + time.strftime("%Y%m%d_%H%M%S") + ".log")
         try:
-            rc, runner_error = run_update(root, log)
-            rc = int(rc)
+            logs.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+
+        before = _read_version_best_effort(root, "0.0.0", log, "ANTES")
+        try:
+            coordination = coordinate_runtime_shutdown(root, args.wait_seconds, expected_pid=args.parent_pid)
         except Exception as exc:
-            rc = 2
-            runner_error = f"run_update inesperado: {type(exc).__name__}: {exc}"
-        ok = rc == 0
-        if runner_error:
-            error = str(runner_error)
-        elif not ok:
-            error = f"El updater terminó con código {rc}. Revisa {log}."
+            coordination = ShutdownCoordination(False, f"coordination_exception:{type(exc).__name__}")
 
-        after = _read_version_best_effort(root, before, log, "DESPUÉS")
-        _write_status_best_effort(root, ok=ok, before=before, after=after, log=log, error=error)
+        if not coordination.ok:
+            if coordination.process_terminated:
+                error = "Nova terminó, pero la coordinación no obtuvo un guard verificable; no se modificaron archivos. " + coordination.error
+            else:
+                error = "Nova no terminó de forma verificable; no se modificaron archivos. " + coordination.error
+            _write_status_best_effort(
+                root,
+                ok=False,
+                before=before,
+                after=before,
+                log=log,
+                error=error,
+                state="coordination_failed",
+            )
+            _release_coordination_guard_best_effort(coordination, log)
+            if coordination.process_terminated:
+                _launch_recovery_once(root, log)
+            else:
+                try:
+                    _show_surviving_runtime(root, coordination)
+                except Exception as exc:
+                    _append_log_best_effort(log, f"\n[WARN SHOW] {type(exc).__name__}: {exc}\n")
+            return 4
+
+        rc = 2
+        ok = False
+        after = before
+        error = ""
+        runner_error = ""
+        launched = False
+        fail_closed_no_launch = False
+
+        try:
+            try:
+                rc, runner_error = run_update(root, log)
+                rc = int(rc)
+            except Exception as exc:
+                rc = 2
+                runner_error = f"run_update inesperado: {type(exc).__name__}: {exc}"
+
+            fail_closed_no_launch = rc == PIP_TERMINATION_UNCONFIRMED_CODE
+            ok = rc == 0
+            remaining_pids: list[int] = []
+            state = "completed" if ok else "update_failed"
+            if fail_closed_no_launch:
+                recovery = _read_recovery_best_effort(root)
+                state = "pip_termination_unconfirmed"
+                remaining_pids = [
+                    int(pid) for pid in (recovery.get("remaining_pids") or [])
+                    if str(pid).isdigit() and int(pid) > 0
+                ][:32]
+                error = str(recovery.get("message") or "La terminación de pip no pudo confirmarse; Nova no se relanzará automáticamente.")
+            elif runner_error:
+                error = str(runner_error)
+            elif not ok:
+                error = f"El updater terminó con código {rc}. Revisa {log}."
+
+            after = _read_version_best_effort(root, before, log, "DESPUÉS")
+            _write_status_best_effort(
+                root,
+                ok=ok,
+                before=before,
+                after=after,
+                log=log,
+                error=error,
+                state=state,
+                remaining_pids=remaining_pids,
+            )
+        finally:
+            _release_coordination_guard_best_effort(coordination, log)
+            if not fail_closed_no_launch:
+                launched, _launch_detail = _launch_recovery_once(root, log)
+            else:
+                _append_log_best_effort(
+                    log,
+                    "\n[FAIL-CLOSED] pip_termination_unconfirmed: guard liberado después de agotar la escalada; Nova no fue relanzada.\n",
+                )
+
+        if fail_closed_no_launch:
+            return PIP_TERMINATION_UNCONFIRMED_CODE
+        if ok:
+            return 0 if launched else 3
+        return rc or 2
     finally:
-        _release_coordination_guard_best_effort(coordination, log)
-        launched, launch_detail = _launch_recovery_once(root, log)
-
-    if ok:
-        return 0 if launched else 3
-    return rc or 2
+        _release_supervisor_mutex_best_effort(supervisor_mutex, log)
 
 
 if __name__ == "__main__":
