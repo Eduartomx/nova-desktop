@@ -102,7 +102,7 @@ def download_bytes(repo: str, ref: str, path: str) -> bytes:
         endpoint = f"repos/{repo}/contents/{path}?ref={urllib.parse.quote(ref, safe='')}"
         p = subprocess.run([gh, "api", endpoint, "-H", "Accept: application/vnd.github.raw+json"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
         if p.returncode != 0:
-            detail = (p.stderr or p.stdout or b"descarga gh falló").decode("utf-8", errors="ignore"); raise RuntimeError(detail)
+            detail = (p.stderr or p.stdout or b"gh download failed").decode("utf-8", errors="ignore"); raise RuntimeError(detail)
         return p.stdout
 
 
