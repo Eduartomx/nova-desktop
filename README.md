@@ -55,38 +55,92 @@ Nova usa `pystray`. `available=True` solo se establece después del callback de 
 
 Está desactivado por defecto y usa `HKCU\Software\Microsoft\Windows\CurrentVersion\Run\NovaDesktop`. El comando usa la instalación real con `--background` y quoting seguro. Al desactivar, Nova elimina la entrada solo si coincide con esta instalación; si pertenece a otra instalación informa conflicto y no la modifica.
 
-## Updater seguro
+## Updater residente seguro
 
 `update_runner.py` adquiere primero `update_supervisor.lock`, antes de leer el runtime o enviar `shutdown_for_update`. El orden normal obligatorio es:
 
 ```text
 supervisor mutex
 → coordinación/guard del runtime
-→ update o rollback
+→ transacción o recovery
 → liberación del guard del runtime
-→ intento de launch
+→ intento acotado de launch
 → liberación del supervisor mutex
 ```
 
 El orden inverso no se usa. Si UI, `ACTUALIZAR_NOVA.cmd` o ejecución directa intentan iniciar simultáneamente otro supervisor, solo uno puede poseer el mutex. El segundo no envía `shutdown_for_update`, no ejecuta el updater, no modifica `update_last.json`, no relanza Nova y termina con código **5 — actualización ya en curso**.
 
-La UI tampoco inicia un cierre local al pulsar **Actualizar**. Guarda la referencia al supervisor, marca `_update_supervisor_active`, deshabilita el botón y rechaza dobles pulsaciones mientras ese proceso siga vivo. El seguimiento usa `poll()` mediante `root.after()`; nunca bloquea Tk con `wait()`. Si el supervisor termina mientras el runtime original sigue abierto, la UI vuelve a consultar el resultado, lo muestra en la misma sesión y rehabilita el botón. Un `Popen()` fallido restaura inmediatamente el estado y Nova permanece abierta.
+La UI no inicia un cierre local al pulsar **Actualizar**. Guarda la referencia al supervisor, marca `_update_supervisor_active`, deshabilita el botón y rechaza dobles pulsaciones mientras ese proceso siga vivo. El seguimiento usa `poll()` mediante `root.after()` y nunca bloquea Tk con `wait()`.
 
-El supervisor sigue siendo la única autoridad que envía `shutdown_for_update`; ese comando llega a `RuntimeLifecycleManager`, que lo traduce a `request_shutdown("update")`. La coordinación es exception-safe para errores operacionales. Si falla antes de confirmar la terminación del runtime, no se ejecuta el updater ni se lanza otra instancia. Si el runtime ya terminó de forma verificable pero falla el guard, tampoco se actualiza: se libera cualquier guard retenido best-effort y se intenta exactamente un relanzamiento visible de recuperación con código `4`.
+El supervisor sigue siendo la única autoridad que envía `shutdown_for_update`; ese comando llega a `RuntimeLifecycleManager`, que lo traduce a `request_shutdown("update")`. Después de una coordinación correcta, el guard del runtime permanece adquirido durante staging, journal, reemplazo, dependencias, validación y rollback.
 
-Después de una coordinación correcta el guard del runtime permanece adquirido durante staging, reemplazo, dependencias, validación y cualquier rollback.
+### Motor interno sin entrypoint privilegiado
+
+El motor de actualización ya no se autoriza con `--yes`. `update_runner.py`, mientras posee el mutex del supervisor y el runtime guard, importa `resident_update_engine` y ejecuta la transacción **en el mismo proceso**.
+
+`python updater/resident_update_engine.py --yes` devuelve un error seguro antes de consultar GitHub, crear staging, tocar archivos o iniciar pip. El updater histórico `nova_updater_legacy.py` permanece únicamente como implementación importable de compatibilidad y su ejecución directa queda interceptada antes de sus side effects. `nova_updater.py`, la UI y los scripts `.cmd` siguen delegando al supervisor.
+
+### Journal antes de toda mutación
+
+La transacción ahora publica un journal durable inmediatamente después de crear y validar el backup y **antes** de reemplazar/eliminar un archivo, modificar `managed_files.json`, ejecutar pip o validar la nueva instalación.
+
+Orden esencial:
+
+```text
+crear + validar backup
+→ publicar schema 2: transaction_prepared
+→ preparar bootstrap estable
+→ si requirements cambia: capturar snapshot anterior de dependencias
+→ files_applying  (files_may_have_changed=true)
+→ aplicar archivos + managed_files
+→ files_applied
+→ si corresponde: dependencies_starting
+   (dependencies_may_have_changed=true ANTES de ejecutar pip)
+→ dependencies_running
+→ update_validation_in_progress
+→ update_validated
+→ cleared
+```
+
+Una muerte anterior a la creación del backup/journal no implica mutación de la instalación. Una muerte posterior a `transaction_prepared` deja una barrera persistente y el supervisor no decide relanzar Nova únicamente por el código de salida del motor: vuelve a inspeccionar el journal durable.
+
+### Máquina de estados schema 2 + CAS
+
+`data/update_recovery.json` usa `schema_version=2`, `attempt_id` obligatorio y `generation` monotónica. Cada transición ocurre bajo un lock de journal del sistema operativo, vuelve a leer el estado actual y aplica compare-and-swap sobre `attempt_id + generation`. Un escritor obsoleto no puede sobrescribir un intento distinto, un rollback más avanzado, `dependency_repair_required` ni un estado ya limpiado por otra generación.
+
+Estados actuales:
+
+```text
+transaction_prepared
+files_applying
+files_applied
+dependencies_starting
+dependencies_running
+update_validation_in_progress
+update_validated
+pip_termination_unconfirmed
+waiting_for_processes
+rollback_in_progress
+rollback_completed
+rollback_validation_in_progress
+rollback_validation_completed
+dependency_repair_required
+cleared
+```
+
+El grafo de transiciones es explícito; no se aceptan saltos arbitrarios. Las escrituras usan temporal + `flush` + `fsync` cuando corresponde + `os.replace`. Journals schema 1 conocidos se migran de forma explícita; JSON truncado, esquema desconocido o estados no migrables fallan cerrados.
+
+El journal no contiene comandos completos, variables de entorno, tokens ni contenido de archivos. Los errores se sanitizan. `backup_path` y cualquier snapshot se guardan como referencias relativas autorizadas, no como rutas externas confiadas ciegamente.
 
 ### Contención autoritativa de pip en Windows
 
 `pip install -r requirements.txt` conserva un timeout explícito de **15 minutos** por defecto; es inyectable para pruebas, rechaza valores no positivos/no finitos y limita valores excesivos a una hora. No usa `shell=True`.
 
-En Windows Nova ya no usa `psutil.children(recursive=True)` como prueba de que todo el árbol terminó. El proceso de pip se crea **suspendido** con `CreateProcessW`; antes de ejecutar una sola instrucción se crea y configura un **Windows Job Object** con `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, se asigna el proceso con `AssignProcessToJobObject` y solo entonces se reanuda su thread principal con `ResumeThread`.
+En Windows Nova no usa `psutil.children(recursive=True)` como prueba de que todo el árbol terminó. Pip se crea **suspendido** con `CreateProcessW`; antes de ejecutar una sola instrucción se crea/configura un **Windows Job Object** con `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, se asigna el proceso con `AssignProcessToJobObject` y solo entonces se reanuda el thread principal con `ResumeThread`.
 
-Las APIs y estructuras Win32 usadas por esta ruta tienen firmas `ctypes` explícitas. Los handles de proceso, thread y Job Object se cierran en todos los caminos. Si la creación/configuración/asignación del Job Object falla antes de reanudar pip, pip no se considera iniciado, no existe downgrade silencioso a `psutil` como garantía y el rollback de archivos puede continuar con seguridad. En entornos con jobs anidados se intenta únicamente una ruta nativa compatible todavía suspendida; si no puede obtenerse contención autoritativa, la instalación de dependencias falla antes de ejecutar pip.
+Si la creación/configuración/asignación del Job Object falla antes de reanudar pip, pip no se considera iniciado y no existe downgrade silencioso a `psutil` como garantía. Las pruebas Windows incluyen además la muerte abrupta del updater mientras el Job contiene un proceso hijo: el hijo no puede sobrevivir al cierre del Job.
 
-El cierre del Job Object y sus consultas nativas son la autoridad para afirmar la terminación en Windows. `psutil` puede seguir ayudando en observabilidad, pero no convierte por sí solo una terminación en confirmada.
-
-En Unix se conserva la estrategia de nueva sesión/grupo de procesos, señales y verificación de identidad fuerte.
+En Unix se conserva nueva sesión/grupo de procesos, señales y verificación mediante identidad fuerte.
 
 ### Identidades fuertes
 
@@ -100,88 +154,87 @@ Los procesos pendientes no se representan únicamente por PID. El journal usa id
 }
 ```
 
-Para considerar que un proceso registrado sigue vivo deben coincidir PID **y** tiempo de creación normalizado. Un PID reutilizado con otro `creation_time` no bloquea la recuperación y nunca se termina basándose únicamente en ese PID. Los errores de acceso/inspección se tratan de forma conservadora y mantienen la cuarentena.
+Para considerar que un proceso registrado sigue vivo deben coincidir PID **y** tiempo de creación normalizado. Un PID reutilizado con otro `creation_time` no bloquea la recuperación y nunca se termina basándose únicamente en ese PID. Los errores de acceso/inspección se tratan de forma conservadora.
 
-### Cuarentena persistente
+### Cuarentena persistente y códigos 6/7
 
-Si pip llegó a arrancar y no puede demostrarse la terminación del contenedor/árbol, la transacción devuelve **código 6 — `pip_termination_unconfirmed`**. En ese momento Nova:
+Si pip llegó a arrancar y no puede demostrarse la terminación del contenedor/árbol, la transacción devuelve **6 — `pip_termination_unconfirmed`**. No inicia rollback concurrente, no relanza Nova y conserva backup, journal e identidades fuertes.
 
-- no inicia rollback concurrente;
-- no declara que los archivos fueron restaurados;
-- no relanza Nova;
-- conserva backup y manifiesto;
-- crea o actualiza atómicamente `data/update_recovery.json`;
-- marca recuperación obligatoria y dependencia potencialmente modificada.
+La cuarentena sobrevive al cierre del supervisor, reinicios de Nova y reinicios de Windows. Mientras exista un intento activo —o el journal no pueda validarse— el startup y una actualización nueva quedan bloqueados con **7 — `recovery_required_or_in_progress`**.
 
-La cuarentena es persistente: sobrevivirá al cierre del supervisor, a un nuevo intento de abrir Nova y a un reinicio de Windows. Mientras exista un journal válido pendiente —o el journal sea corrupto/desconocido— el arranque normal y una nueva actualización quedan bloqueados con **código 7 — `recovery_required_or_in_progress`**.
+El updater gate no sobrescribe el journal mientras los procesos registrados siguen vivos. Una salida inesperada del motor tampoco habilita el relanzamiento: si al volver del motor existe un journal activo/corrupto, el supervisor devuelve 7 y conserva backup/journal.
 
-Un nuevo updater no sobrescribe el journal ni destruye el backup anterior. Primero intenta el recovery gate bajo el mutex del supervisor. Si las identidades fuertes aún siguen vivas o no pueden comprobarse, devuelve 7 sin descargar archivos ni iniciar pip.
+### Snapshot y validación fuerte de dependencias
 
-### Journal de recuperación
+Si `requirements.txt` cambiará, Nova captura antes de aplicar archivos un snapshot del entorno Python anterior dentro del backup autorizado. El snapshot contiene nombres de distribuciones normalizados, **versiones exactas instaladas**, conjunto anterior, hash SHA-256 del propio snapshot, hash del `requirements.txt` anterior y la lista acotada de imports críticos aplicables.
 
-`data/update_recovery.json` usa esquema versionado y escritura atómica mediante archivo temporal, `flush`, `fsync` cuando corresponde y `os.replace`. Incluye `attempt_id`, `generation`, estado, timestamps, `recovery_required`, referencia al backup, incertidumbre de dependencias, estado del rollback, identidades fuertes pendientes y errores técnicos sanitizados.
+Tras restaurar archivos:
 
-Estados de recuperación soportados:
+- si pip nunca pudo ejecutar código, no se exige una reparación de dependencias innecesaria;
+- si pip pudo ejecutarse, el conjunto actual debe coincidir con el snapshot: una distribución añadida, eliminada o con versión distinta bloquea la limpieza;
+- el `requirements.txt` restaurado debe conservar su hash anterior;
+- imports críticos se prueban en un subprocess aislado y acotado con `python -I`;
+- recovery **no ejecuta pip** para corregir diferencias.
 
-```text
-pip_termination_unconfirmed
-waiting_for_processes
-rollback_in_progress
-rollback_completed
-validation_in_progress
-validation_completed
-cleared
-```
+Si la comparación/imports no permiten demostrar compatibilidad suficiente, el journal avanza a `dependency_repair_required`; conserva cuarentena y backup y no relanza Nova.
 
-JSON truncado/corrupto, esquema desconocido o campos de identidad inválidos producen fail-closed. El `backup_path` no se usa ciegamente: debe resolver dentro de la raíz autorizada de backups, sin traversal ni escape mediante symlinks, y el manifiesto interno vuelve a validar rutas relativas antes de restaurar.
+Esto es deliberadamente más fuerte que comprobar `importlib.metadata.version(name)` para saber si un paquete “existe”, pero **no equivale a un rollback transaccional de `.venv`**. El proyecto no inventa versiones/hashes para un lockfile porque el `requirements.txt` actual no está completamente fijado.
 
-### Gate extremadamente temprano del arranque
+### Bootstrap estable de recuperación
 
-`nova/app.py` ejecuta el recovery gate antes de `_claim_instance`, antes de importar Tk, antes de `assistant.core_runtime`, antes de Agent/UI y antes de iniciar servicios normales.
-
-El flujo es:
+Antes de tocar archivos, el updater prepara una generación stdlib-only en:
 
 ```text
-stdlib bootstrap
-→ leer/validar journal
-→ comprobar identidades fuertes
-→ si hay recuperación segura: supervisor mutex
-→ runtime/recovery guard
-→ rollback reanudable
-→ validación
-→ clear del journal
-→ release runtime/recovery guard
-→ un solo launch --post-recovery
-→ release supervisor mutex
-→ solo entonces puede existir un arranque normal
+data/recovery_runtime/
+  active.json
+  generations/<generation>/
+    manifest.json
+    recovery_bootstrap.py
+    recovery_state.py
+    recovery_journal.py
+    recovery_attempts.py
+    recovery_files.py
+    recovery_environment.py
+    recovery_locking.py
 ```
 
-Si hay procesos registrados todavía vivos, errores de inspección o journal inválido, Nova muestra un aviso mínimo y sale con 7 sin cargar el asistente completo. Si el propio bootstrap mínimo no puede importarse y existe un journal, `app.py` también falla cerrado.
+Cada generación se escribe completa, se verifica por SHA-256 y solo después se reemplaza atómicamente `active.json`. La generación conocida como buena anterior no se sobreescribe en sitio.
+
+En `app.py` el orden es **recovery gate antes de `_claim_instance`**. Se intenta primero el bootstrap administrado; si su import/ejecución falla y existe journal, se carga únicamente la generación estable cuyo manifest y archivos coinciden con sus hashes. Si ambas copias fallan, `app.py` usa `MessageBoxW` directamente en Windows y sale con 7, sin depender de stderr/pythonw, sin reclamar instancia y sin importar Tk completo, Agent ni módulos normales del asistente.
 
 ### Recuperación reanudable e idempotente
 
-Cuando las identidades pendientes dejan de estar vivas, solo un proceso puede recuperar. Bajo `update_supervisor.lock` y un guard exclusivo de runtime/recovery se vuelve a leer el journal, se valida el backup y se marca `rollback_in_progress` de forma atómica.
+Cuando las identidades pendientes dejan de estar vivas, solo un proceso puede recuperar:
 
-El rollback restaurador es idempotente: restaura archivos modificados y eliminados desde backup, elimina únicamente archivos `created_new`, restaura el estado previo de `managed_files.json` y valida cada destino contra las raíces autorizadas. **No ejecuta pip durante recovery.** Si el proceso muere a mitad del rollback, el estado y backup permanecen y una ejecución posterior puede repetir la restauración de forma segura.
+```text
+supervisor mutex
+→ runtime/recovery guard
+→ recargar journal + CAS
+→ validar backup/manifest
+→ rollback_in_progress
+→ restauración pura e idempotente
+→ rollback_completed
+→ rollback_validation_in_progress
+→ validar archivos + dependencias cuando corresponde
+→ rollback_validation_completed
+→ cleared
+→ release runtime/recovery guard
+→ un solo launch --post-recovery
+→ release supervisor mutex
+```
 
-Después se marca `rollback_completed`, se valida la instalación restaurada sin instalar dependencias, se marca `validation_completed` y solo tras éxito se limpia la cuarentena. El launch posterior usa `--post-recovery` y se intenta una sola vez. Si ese launch falla, la cuarentena se restablece en `validation_completed` para que el siguiente intento no repita innecesariamente el rollback y vuelva a intentar únicamente el arranque.
+El restaurador nuevo **no administra ni borra journals**. Restaura modificados/eliminados, elimina solo `created_new`, restaura `managed_files.json` y vuelve a validar traversal/symlinks en cada reanudación. Una muerte a mitad del rollback permite repetirlo de forma segura.
 
-Si rollback o validación fallan, el journal y backup se conservan, se registra un error sanitizado y Nova no arranca normalmente.
+Si falla rollback o validación, journal y backup permanecen. Si el launch final falla después de validar/limpiar, el intento actual se vuelve a cuarentenar en `rollback_validation_completed`; el siguiente recovery reintenta el launch sin repetir innecesariamente el rollback.
 
-### Alcance real del rollback
+### Códigos principales
 
-El rollback transaccional cubre **archivos administrados por Nova**. Restaura modificados/eliminados, elimina solo archivos creados por la actualización fallida y restaura `managed_files.json`.
-
-Esto **no reconstruye exactamente `.venv`**. Si pip llegó a iniciarse, el entorno de dependencias puede haber cambiado aunque los archivos hayan vuelto a su estado anterior. La cuarentena/recovery evita ejecutar sobre un entorno que todavía esté mutando; no constituye un snapshot transaccional completo de todos los paquetes Python.
-
-### Códigos principales del updater residente
-
-- `0`: actualización/recovery correspondiente completado correctamente.
-- `3`: actualización correcta pero falló el relanzamiento normal.
-- `4`: coordinación del runtime no verificable.
-- `5`: otro supervisor de actualización ya está activo.
-- `6`: la transacción actual inició pip y no pudo confirmar su terminación; se creó cuarentena persistente.
-- `7`: existe recuperación obligatoria, está en curso o no puede validarse con seguridad; no se permite arranque/update normal.
+- `0`: operación correspondiente completada.
+- `3`: update correcto pero falló el relanzamiento normal heredado.
+- `4`: coordinación no verificable o entrypoint interno directo bloqueado.
+- `5`: otro supervisor ya está activo.
+- `6`: pip pudo ejecutar y su terminación no pudo confirmarse.
+- `7`: recuperación obligatoria/activa/corrupta o motor terminó con intento durable todavía activo.
 
 ## Atajos
 
@@ -201,24 +254,48 @@ Defaults actuales: **Ctrl + Alt + N**, **Ctrl + Alt + Shift + N** y **F9**. Resi
 
 ## Nova Doctor
 
-Doctor informa lifecycle, ventana visible/oculta, bandeja lista/degradada, instancia única/scope, autostart real/conflicto y estado del updater residente. El chequeo del updater indica supervisor activo/inactivo mediante el mutex del kernel, último resultado disponible y recuperación pendiente. Si hay cuarentena, informa su estado; las identidades/PID restantes solo aparecen cuando son necesarias para diagnosticar `pip_termination_unconfirmed`/`waiting_for_processes`.
+Doctor informa lifecycle, ventana visible/oculta, bandeja lista/degradada, instancia única/scope, autostart real/conflicto y estado del updater residente. El estado activo/inactivo del supervisor proviene del mutex del kernel. Si hay cuarentena, informa su estado; las identidades/PID restantes solo aparecen cuando son necesarias para diagnosticar espera de procesos.
 
 ## Privacidad
 
-Resident Mode y el recovery journal no añaden screenshots, captura de teclado, memoria de juegos, telemetría externa ni servidores de red. El journal no guarda comandos completos, variables de entorno, tokens, prompts ni contenido de archivos. Los errores se sanitizan y las identidades persistidas se limitan a PID, tiempo de creación y rol técnico.
+Resident Mode y recovery no añaden screenshots, captura de teclado, memoria de juegos, telemetría externa ni servidores de red. Journal/snapshot no guardan comandos completos, variables de entorno, tokens, prompts ni contenido de archivos.
 
 ## Pruebas
 
-Ubuntu ejecuta `compileall`, la suite completa y las suites explícitas del updater/recovery. Windows ejecuta además Job Object real, escenario root→child, repetición de la carrera, lifecycle, owner/IPC, mutex multiproceso, rollback, recovery bootstrap, gates, session shutdown, Gaming Awareness, Instant Wake/hotkeys y core. Las pruebas de recuperación usan eventos/locks/fixtures en lugar de pausas arbitrarias como mecanismo principal de sincronización.
+Ubuntu ejecuta `compileall`, suite completa y suites explícitas de updater/recovery. Windows ejecuta además Job Object real, carrera root→child repetida, muerte abrupta del updater con proceso dentro del Job sin permitir `skip`, crash reales mediante `os._exit` en fronteras transaccionales, dos recovery supervisors en procesos reales, muerte del dueño del lock y reanudación, lifecycle, IPC, session shutdown, Gaming Awareness, Instant Wake/hotkeys y core.
+
+Las pruebas nuevas se concentran en:
+
+- `tests/test_recovery_bootstrap.py`
+- `tests/test_recovery_update_gate.py`
+- `tests/test_pip_job_object.py`
+- `tests/test_dependency_snapshot.py`
+- `tests/test_stable_recovery_bootstrap.py`
+- `tests/test_updater_entrypoint_guards.py`
+- `tests/test_update_crash_recovery.py`
+- `tests/test_recovery_multiprocess.py`
 
 La documentación técnica completa está en [`docs/v0.9.9-resident-runtime.md`](docs/v0.9.9-resident-runtime.md).
 
 ## Recuperación manual y diagnóstico
 
-La primera acción ante una cuarentena es **no borrar `data/update_recovery.json` ni el backup**. Puede consultarse el estado con el recovery bootstrap de la misma instalación y Nova Doctor cuando el arranque normal vuelva a ser seguro. Si el journal indica procesos pendientes, debe esperarse a que desaparezca la identidad fuerte original; no se debe matar un proceso únicamente porque reutilizó el mismo PID.
+Ante cuarentena, **no borres `data/update_recovery.json`, `data/updater_backups/` ni `data/recovery_runtime/`**. Consulta el estado con:
 
-Si la recuperación automática vuelve a fallar, conserva `data/update_recovery.json`, `data/updater_backups/` y los logs del updater para diagnóstico. La reparación manual debe hacerse sobre una copia/instalación de prueba o restaurando explícitamente desde el backup validado; borrar la cuarentena a mano sin resolver el estado de dependencias elimina la barrera fail-closed y no es un procedimiento soportado.
+```text
+python updater/recovery_bootstrap.py --status
+```
+
+Si el bootstrap administrado no funciona, el aviso nativo de `app.py` muestra el comando apuntando a la generación estable validada. La recuperación manual soportada usa el mismo bootstrap con `--recover`; borrar el journal a mano elimina la barrera fail-closed y no es un procedimiento soportado.
+
+`dependency_repair_required` significa que los archivos pudieron restaurarse pero el entorno Python ya no coincide suficientemente con el snapshot anterior. Conserva el backup/journal y reconstruye o repara la `.venv` de forma explícita antes de retirar la cuarentena; recovery no intenta adivinar qué debe desinstalar o degradar con pip.
+
+## Riesgos residuales
+
+- El rollback cubre archivos administrados y valida el entorno; no crea un snapshot bit-a-bit de `.venv`.
+- Daño de disco/I/O, corrupción fuera del conjunto administrado o cambios externos concurrentes pueden requerir reparación manual.
+- El snapshot exacto detecta diferencias de distribuciones/versiones, pero no convierte un `requirements.txt` no fijado en un entorno reproducible.
+- Ante cualquier identidad, journal, backup, manifest, hash o validación que no pueda demostrarse, la política es mantener la cuarentena en lugar de asumir éxito.
 
 ## Validación manual pendiente
 
-Antes de aprobar v0.9.9 deben probarse en una **instalación/fixture descartable de Windows**, no dañando la instalación principal: actualización normal; doble clic; timeout de pip con terminación confirmada; terminación no confirmada simulada; creación y persistencia de cuarentena; reinicio de Nova y de Windows con cuarentena; bloqueo de startup/update; desaparición de identidades fuertes; recovery reanudado; restauración/validación; un solo relanzamiento `--post-recovery`; y fallo de recovery conservando journal/backup.
+Antes de aprobar v0.9.9 deben probarse en una **instalación/fixture descartable de Windows 11**, no dañando la instalación principal: actualización normal; doble clic; timeout de pip confirmado; terminación no confirmada simulada; persistencia de cuarentena tras reiniciar Nova/Windows; bloqueo de startup/update; desaparición de identidades fuertes; recovery reanudado; snapshot de dependencias; bootstrap estable; restauración/validación; un solo `--post-recovery`; y fallo simulado de recovery conservando journal/backup.
