@@ -34,6 +34,9 @@ def install_core_runtime():
     from .experience_reliability import install_skill_reliability_hooks
     install_skill_reliability_hooks()
 
+    from .doctor_updater import install_doctor_updater
+    install_doctor_updater()
+
     from .tools_desktop import install_tools_desktop
     from .tools_file_safety import install_tools_file_safety
     from .tools_workspace import install_tools_v060
@@ -155,6 +158,7 @@ def architecture_status() -> dict:
         "llm_warm_manager", "instant_wake", "configurable_hotkeys",
         "gaming_awareness", "gaming_vram_policy", "gaming_perception_throttle", "gaming_state_sync",
         "runtime_lifecycle", "resident_mode", "system_tray", "single_instance", "windows_autostart",
+        "update_supervisor_mutex", "updater_recovery_diagnostics",
         "agent", "tools", "ui", "task_engine",
     ]
     return {
