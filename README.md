@@ -6,7 +6,7 @@ GitHub (`Eduartomx/nova-desktop`) es la fuente de verdad. El updater estable sin
 
 ## Estado
 
-La base publicada es **v0.9.8 — Gaming Reliability**. La rama de desarrollo prepara **v0.9.9 — Resident Mode & Runtime Lifecycle**; no debe publicarse hasta validación manual y aprobación.
+La base publicada es **v0.9.8 — Gaming Reliability**. La rama de desarrollo prepara **v0.9.9 — Resident Mode & Runtime Lifecycle**; no debe publicarse hasta validación manual y aprobación explícita.
 
 ### v0.9.8 — Gaming Reliability
 
@@ -57,7 +57,7 @@ Está desactivado por defecto y usa `HKCU\Software\Microsoft\Windows\CurrentVers
 
 ## Updater seguro
 
-`update_runner.py` adquiere primero `update_supervisor.lock`, antes de leer el runtime o enviar `shutdown_for_update`. El orden obligatorio es:
+`update_runner.py` adquiere primero `update_supervisor.lock`, antes de leer el runtime o enviar `shutdown_for_update`. El orden normal obligatorio es:
 
 ```text
 supervisor mutex
@@ -74,19 +74,114 @@ La UI tampoco inicia un cierre local al pulsar **Actualizar**. Guarda la referen
 
 El supervisor sigue siendo la única autoridad que envía `shutdown_for_update`; ese comando llega a `RuntimeLifecycleManager`, que lo traduce a `request_shutdown("update")`. La coordinación es exception-safe para errores operacionales. Si falla antes de confirmar la terminación del runtime, no se ejecuta el updater ni se lanza otra instancia. Si el runtime ya terminó de forma verificable pero falla el guard, tampoco se actualiza: se libera cualquier guard retenido best-effort y se intenta exactamente un relanzamiento visible de recuperación con código `4`.
 
-Después de una coordinación correcta el guard del runtime permanece adquirido durante staging, reemplazo, dependencias, validación y cualquier rollback. En rutas normales, incluso ante fallo del updater, el orden sigue siendo update/rollback → release guard → un solo `launch_nova(--post-update)`.
+Después de una coordinación correcta el guard del runtime permanece adquirido durante staging, reemplazo, dependencias, validación y cualquier rollback.
 
-### Timeout y árbol de pip
+### Contención autoritativa de pip en Windows
 
-`pip install -r requirements.txt` tiene timeout explícito de **15 minutos** por defecto; es inyectable para pruebas, rechaza valores no positivos/no finitos y limita valores excesivos a una hora. No usa `shell=True` ni existe un timeout externo que mate todo `nova_updater.py` en mitad de la transacción.
+`pip install -r requirements.txt` conserva un timeout explícito de **15 minutos** por defecto; es inyectable para pruebas, rechaza valores no positivos/no finitos y limita valores excesivos a una hora. No usa `shell=True`.
 
-Pip se inicia en una unidad identificable: nueva sesión/grupo en Unix y nuevo process group en Windows. Nova usa `psutil` de forma recursiva en Windows y grupo de procesos en Unix para descubrir descendientes. Al vencer el timeout intenta terminación limpia, espera un periodo de gracia acotado, vuelve a inspeccionar el árbol, fuerza los procesos restantes, espera/reapea el proceso directo y verifica nuevamente. El mensaje **“detenidos y esperados de forma verificable”** solo se usa cuando esa comprobación termina sin procesos conocidos vivos y con inspección completa.
+En Windows Nova ya no usa `psutil.children(recursive=True)` como prueba de que todo el árbol terminó. El proceso de pip se crea **suspendido** con `CreateProcessW`; antes de ejecutar una sola instrucción se crea y configura un **Windows Job Object** con `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, se asigna el proceso con `AssignProcessToJobObject` y solo entonces se reanuda su thread principal con `ResumeThread`.
 
-Si la terminación queda **confirmada**, pip se considera iniciado: Nova ejecuta rollback de archivos administrados, conserva el backup y persiste `dependencies_may_have_changed=true` y `recovery_required=true`. El rollback restaura modificados/eliminados, elimina únicamente archivos creados por la actualización y restaura `managed_files.json`, pero **no reconstruye exactamente `.venv`**.
+Las APIs y estructuras Win32 usadas por esta ruta tienen firmas `ctypes` explícitas. Los handles de proceso, thread y Job Object se cierran en todos los caminos. Si la creación/configuración/asignación del Job Object falla antes de reanudar pip, pip no se considera iniciado, no existe downgrade silencioso a `psutil` como garantía y el rollback de archivos puede continuar con seguridad. En entornos con jobs anidados se intenta únicamente una ruta nativa compatible todavía suspendida; si no puede obtenerse contención autoritativa, la instalación de dependencias falla antes de ejecutar pip.
 
-Si la terminación de pip o sus descendientes **no puede confirmarse** después de la escalada normal y forzada, Nova entra en fail-closed: no inicia rollback concurrente, no declara `files_rollback_ok=true`, conserva backup/manifiesto, persiste `status=pip_termination_unconfirmed` y los PID restantes necesarios, y el supervisor **no relanza Nova desde esa `.venv`**. El updater usa código **6** para esta rama excepcional. El guard del runtime se mantiene mientras se agota la escalada y se libera después de que el updater ya decidió fail-closed; no se ejecuta Nova sobre un entorno que todavía pueda estar mutando.
+El cierre del Job Object y sus consultas nativas son la autoridad para afirmar la terminación en Windows. `psutil` puede seguir ayudando en observabilidad, pero no convierte por sí solo una terminación en confirmada.
 
-`data/update_recovery.json` diferencia rollback completado, rollback incompleto e incertidumbre por terminación de pip. No guarda argumentos completos de procesos, tokens, contenido de archivos ni rutas externas sensibles.
+En Unix se conserva la estrategia de nueva sesión/grupo de procesos, señales y verificación de identidad fuerte.
+
+### Identidades fuertes
+
+Los procesos pendientes no se representan únicamente por PID. El journal usa identidades equivalentes a:
+
+```json
+{
+  "pid": 1234,
+  "creation_time": 1720000000123456,
+  "role": "pip_root_or_descendant"
+}
+```
+
+Para considerar que un proceso registrado sigue vivo deben coincidir PID **y** tiempo de creación normalizado. Un PID reutilizado con otro `creation_time` no bloquea la recuperación y nunca se termina basándose únicamente en ese PID. Los errores de acceso/inspección se tratan de forma conservadora y mantienen la cuarentena.
+
+### Cuarentena persistente
+
+Si pip llegó a arrancar y no puede demostrarse la terminación del contenedor/árbol, la transacción devuelve **código 6 — `pip_termination_unconfirmed`**. En ese momento Nova:
+
+- no inicia rollback concurrente;
+- no declara que los archivos fueron restaurados;
+- no relanza Nova;
+- conserva backup y manifiesto;
+- crea o actualiza atómicamente `data/update_recovery.json`;
+- marca recuperación obligatoria y dependencia potencialmente modificada.
+
+La cuarentena es persistente: sobrevivirá al cierre del supervisor, a un nuevo intento de abrir Nova y a un reinicio de Windows. Mientras exista un journal válido pendiente —o el journal sea corrupto/desconocido— el arranque normal y una nueva actualización quedan bloqueados con **código 7 — `recovery_required_or_in_progress`**.
+
+Un nuevo updater no sobrescribe el journal ni destruye el backup anterior. Primero intenta el recovery gate bajo el mutex del supervisor. Si las identidades fuertes aún siguen vivas o no pueden comprobarse, devuelve 7 sin descargar archivos ni iniciar pip.
+
+### Journal de recuperación
+
+`data/update_recovery.json` usa esquema versionado y escritura atómica mediante archivo temporal, `flush`, `fsync` cuando corresponde y `os.replace`. Incluye `attempt_id`, `generation`, estado, timestamps, `recovery_required`, referencia al backup, incertidumbre de dependencias, estado del rollback, identidades fuertes pendientes y errores técnicos sanitizados.
+
+Estados de recuperación soportados:
+
+```text
+pip_termination_unconfirmed
+waiting_for_processes
+rollback_in_progress
+rollback_completed
+validation_in_progress
+validation_completed
+cleared
+```
+
+JSON truncado/corrupto, esquema desconocido o campos de identidad inválidos producen fail-closed. El `backup_path` no se usa ciegamente: debe resolver dentro de la raíz autorizada de backups, sin traversal ni escape mediante symlinks, y el manifiesto interno vuelve a validar rutas relativas antes de restaurar.
+
+### Gate extremadamente temprano del arranque
+
+`nova/app.py` ejecuta el recovery gate antes de `_claim_instance`, antes de importar Tk, antes de `assistant.core_runtime`, antes de Agent/UI y antes de iniciar servicios normales.
+
+El flujo es:
+
+```text
+stdlib bootstrap
+→ leer/validar journal
+→ comprobar identidades fuertes
+→ si hay recuperación segura: supervisor mutex
+→ runtime/recovery guard
+→ rollback reanudable
+→ validación
+→ clear del journal
+→ release runtime/recovery guard
+→ un solo launch --post-recovery
+→ release supervisor mutex
+→ solo entonces puede existir un arranque normal
+```
+
+Si hay procesos registrados todavía vivos, errores de inspección o journal inválido, Nova muestra un aviso mínimo y sale con 7 sin cargar el asistente completo. Si el propio bootstrap mínimo no puede importarse y existe un journal, `app.py` también falla cerrado.
+
+### Recuperación reanudable e idempotente
+
+Cuando las identidades pendientes dejan de estar vivas, solo un proceso puede recuperar. Bajo `update_supervisor.lock` y un guard exclusivo de runtime/recovery se vuelve a leer el journal, se valida el backup y se marca `rollback_in_progress` de forma atómica.
+
+El rollback restaurador es idempotente: restaura archivos modificados y eliminados desde backup, elimina únicamente archivos `created_new`, restaura el estado previo de `managed_files.json` y valida cada destino contra las raíces autorizadas. **No ejecuta pip durante recovery.** Si el proceso muere a mitad del rollback, el estado y backup permanecen y una ejecución posterior puede repetir la restauración de forma segura.
+
+Después se marca `rollback_completed`, se valida la instalación restaurada sin instalar dependencias, se marca `validation_completed` y solo tras éxito se limpia la cuarentena. El launch posterior usa `--post-recovery` y se intenta una sola vez. Si ese launch falla, la cuarentena se restablece en `validation_completed` para que el siguiente intento no repita innecesariamente el rollback y vuelva a intentar únicamente el arranque.
+
+Si rollback o validación fallan, el journal y backup se conservan, se registra un error sanitizado y Nova no arranca normalmente.
+
+### Alcance real del rollback
+
+El rollback transaccional cubre **archivos administrados por Nova**. Restaura modificados/eliminados, elimina solo archivos creados por la actualización fallida y restaura `managed_files.json`.
+
+Esto **no reconstruye exactamente `.venv`**. Si pip llegó a iniciarse, el entorno de dependencias puede haber cambiado aunque los archivos hayan vuelto a su estado anterior. La cuarentena/recovery evita ejecutar sobre un entorno que todavía esté mutando; no constituye un snapshot transaccional completo de todos los paquetes Python.
+
+### Códigos principales del updater residente
+
+- `0`: actualización/recovery correspondiente completado correctamente.
+- `3`: actualización correcta pero falló el relanzamiento normal.
+- `4`: coordinación del runtime no verificable.
+- `5`: otro supervisor de actualización ya está activo.
+- `6`: la transacción actual inició pip y no pudo confirmar su terminación; se creó cuarentena persistente.
+- `7`: existe recuperación obligatoria, está en curso o no puede validarse con seguridad; no se permite arranque/update normal.
 
 ## Atajos
 
@@ -106,18 +201,24 @@ Defaults actuales: **Ctrl + Alt + N**, **Ctrl + Alt + Shift + N** y **F9**. Resi
 
 ## Nova Doctor
 
-Doctor informa lifecycle, ventana visible/oculta, bandeja lista/degradada, instancia única/scope, autostart real/conflicto y estado del updater residente. El chequeo del updater indica supervisor activo/inactivo mediante el mutex del kernel, último resultado disponible, recuperación pendiente y `pip_termination_unconfirmed`; los PID restantes solo aparecen cuando esa recuperación los necesita.
+Doctor informa lifecycle, ventana visible/oculta, bandeja lista/degradada, instancia única/scope, autostart real/conflicto y estado del updater residente. El chequeo del updater indica supervisor activo/inactivo mediante el mutex del kernel, último resultado disponible y recuperación pendiente. Si hay cuarentena, informa su estado; las identidades/PID restantes solo aparecen cuando son necesarias para diagnosticar `pip_termination_unconfirmed`/`waiting_for_processes`.
 
 ## Privacidad
 
-Resident Mode no añade screenshots periódicos, captura de teclado, lectura de memoria de juegos, telemetría externa ni servidores de red. Los archivos de control no guardan prompts, títulos de ventana, contenido de pantalla, tokens ni secretos.
+Resident Mode y el recovery journal no añaden screenshots, captura de teclado, memoria de juegos, telemetría externa ni servidores de red. El journal no guarda comandos completos, variables de entorno, tokens, prompts ni contenido de archivos. Los errores se sanitizan y las identidades persistidas se limitan a PID, tiempo de creación y rol técnico.
 
 ## Pruebas
 
-Ubuntu ejecuta `compileall` y la suite completa. Windows ejecuta explícitamente lifecycle, owner/IPC, una integración con procesos separados reales para lock/comandos/terminación, el mutex del supervisor con dos procesos simultáneos y recuperación tras muerte del propietario, updater, rollback transaccional, session shutdown, Gaming Awareness, Instant Wake/hotkeys y core. Las pruebas de pip simulan timeout/terminate/kill/verificación sin sleeps reales.
+Ubuntu ejecuta `compileall`, la suite completa y las suites explícitas del updater/recovery. Windows ejecuta además Job Object real, escenario root→child, repetición de la carrera, lifecycle, owner/IPC, mutex multiproceso, rollback, recovery bootstrap, gates, session shutdown, Gaming Awareness, Instant Wake/hotkeys y core. Las pruebas de recuperación usan eventos/locks/fixtures en lugar de pausas arbitrarias como mecanismo principal de sincronización.
 
 La documentación técnica completa está en [`docs/v0.9.9-resident-runtime.md`](docs/v0.9.9-resident-runtime.md).
 
+## Recuperación manual y diagnóstico
+
+La primera acción ante una cuarentena es **no borrar `data/update_recovery.json` ni el backup**. Puede consultarse el estado con el recovery bootstrap de la misma instalación y Nova Doctor cuando el arranque normal vuelva a ser seguro. Si el journal indica procesos pendientes, debe esperarse a que desaparezca la identidad fuerte original; no se debe matar un proceso únicamente porque reutilizó el mismo PID.
+
+Si la recuperación automática vuelve a fallar, conserva `data/update_recovery.json`, `data/updater_backups/` y los logs del updater para diagnóstico. La reparación manual debe hacerse sobre una copia/instalación de prueba o restaurando explícitamente desde el backup validado; borrar la cuarentena a mano sin resolver el estado de dependencias elimina la barrera fail-closed y no es un procedimiento soportado.
+
 ## Validación manual pendiente
 
-Antes de publicar v0.9.9 deben comprobarse en Windows 11: X→bandeja, restauración por hotkey/bandeja, wake/F9 oculto, Gaming Mode + Qwen oculto, segunda ejecución, autostart real, conflicto de otra instalación, doble clic/arranques simultáneos de actualización, actualización real, fallo al iniciar el supervisor sin cerrar Nova, timeout recuperable de dependencias y una recuperación fail-closed controlada, salida completa y ausencia de servicios duplicados tras reiniciar.
+Antes de aprobar v0.9.9 deben probarse en una **instalación/fixture descartable de Windows**, no dañando la instalación principal: actualización normal; doble clic; timeout de pip con terminación confirmada; terminación no confirmada simulada; creación y persistencia de cuarentena; reinicio de Nova y de Windows con cuarentena; bloqueo de startup/update; desaparición de identidades fuertes; recovery reanudado; restauración/validación; un solo relanzamiento `--post-recovery`; y fallo de recovery conservando journal/backup.
