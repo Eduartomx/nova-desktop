@@ -228,6 +228,7 @@ class UpdateRunnerTests(unittest.TestCase):
         )
         self.assertFalse(result.ok)
         self.assertEqual(result.error, "runtime_lock_timeout_after_process_exit")
+        self.assertTrue(result.process_terminated)
         self.assertEqual(shared.holder, "competitor")
         self.assertEqual(mailbox.calls, [("shutdown_for_update", "a" * 32)])
 
@@ -291,6 +292,46 @@ class UpdateRunnerTests(unittest.TestCase):
         )
         self.assertFalse(result.ok)
         self.assertEqual(result.error, "shutdown_command_delivery_failed")
+
+    def test_lock_construction_error_is_structured_and_never_escapes(self):
+        def broken_factory():
+            raise OSError("lock construction failed")
+
+        result = coordinate_runtime_shutdown(
+            Path(tempfile.gettempdir()),
+            timeout=0.01,
+            lock_factory=broken_factory,
+            guard_factory=broken_factory,
+            mailbox=_Mailbox(),
+        )
+        self.assertFalse(result.ok)
+        self.assertFalse(result.process_terminated)
+        self.assertIn("coordination_exception:OSError", result.error)
+
+    def test_guard_acquire_error_after_verified_runtime_exit_is_structured_and_shutdown_sent_once(self):
+        shared = _SharedLock(holder="runtime")
+        mailbox = _Mailbox()
+        process = _Process(shared, terminates=True)
+        calls = {"count": 0}
+
+        def guard_factory():
+            calls["count"] += 1
+            if calls["count"] == 1:
+                return _Lock(shared, "guard")
+            raise OSError("guard reopen failed")
+
+        result = coordinate_runtime_shutdown(
+            Path(tempfile.gettempdir()),
+            timeout=0.2,
+            lock_factory=lambda: _Lock(shared, "observer"),
+            guard_factory=guard_factory,
+            mailbox=mailbox,
+            process_factory=lambda pid: process,
+        )
+        self.assertFalse(result.ok)
+        self.assertTrue(result.process_terminated)
+        self.assertIn("runtime_guard_acquire_failed:OSError", result.error)
+        self.assertEqual(mailbox.calls, [("shutdown_for_update", "a" * 32)])
 
     def test_post_update_relaunches_exactly_one_visible_instance(self):
         with tempfile.TemporaryDirectory() as td:
@@ -367,6 +408,15 @@ class UpdateRunnerTests(unittest.TestCase):
         self.assertEqual(guard.calls, 1)
         launch.assert_called_once()
 
+    def test_pip_timeout_updater_error_keeps_primary_code_and_relaunches_once(self):
+        rc, events, guard, launch, _status = self._run_main_case(
+            update_result=(2, "pip install excedió el timeout configurado")
+        )
+        self.assertEqual(rc, 2)
+        self.assert_update_release_launch_order(events)
+        self.assertEqual(guard.calls, 1)
+        launch.assert_called_once()
+
     def test_run_update_exception_relaunches_exactly_once(self):
         rc, events, _guard, launch, _status = self._run_main_case(update_exception=RuntimeError("boom"))
         self.assertEqual(rc, 2)
@@ -423,6 +473,53 @@ class UpdateRunnerTests(unittest.TestCase):
         self.assertEqual(rc, 3)
         self.assert_update_release_launch_order(events)
         launch.assert_called_once()
+
+    def test_coordination_exception_before_termination_keeps_runtime_and_never_updates_or_launches(self):
+        from updater import update_runner
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            with patch("updater.update_runner.nova_root", return_value=root), \
+                 patch("updater.update_runner.read_version", return_value="0.9.8"), \
+                 patch("updater.update_runner.coordinate_runtime_shutdown", side_effect=OSError("coordination exploded")), \
+                 patch("updater.update_runner.run_update") as run_update, \
+                 patch("updater.update_runner.launch_nova") as launch:
+                rc = update_runner.main([])
+        self.assertEqual(rc, 4)
+        run_update.assert_not_called()
+        launch.assert_not_called()
+
+    def test_coordination_failure_after_verified_exit_releases_guard_and_launches_recovery_once(self):
+        from updater import update_runner
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            events = []
+            guard = _EventGuard(events)
+            failed = ShutdownCoordination(
+                False,
+                "runtime_guard_acquire_failed:OSError",
+                owner_pid=4242,
+                owner_id="a" * 32,
+                process_terminated=True,
+                guard=guard,
+            )
+
+            def fake_launch(_root):
+                events.append("launch_nova")
+                return True, "ok"
+
+            with patch("updater.update_runner.nova_root", return_value=root), \
+                 patch("updater.update_runner.read_version", return_value="0.9.8"), \
+                 patch("updater.update_runner.coordinate_runtime_shutdown", return_value=failed), \
+                 patch("updater.update_runner.run_update") as run_update, \
+                 patch("updater.update_runner._show_surviving_runtime") as show, \
+                 patch("updater.update_runner.launch_nova", side_effect=fake_launch) as launch:
+                rc = update_runner.main([])
+        self.assertEqual(rc, 4)
+        run_update.assert_not_called()
+        show.assert_not_called()
+        self.assertEqual(guard.calls, 1)
+        launch.assert_called_once_with(root)
+        self.assertEqual(events, ["release_guard", "launch_nova"])
 
     def test_coordination_failure_status_failure_still_attempts_show_and_never_runs_update(self):
         from updater import update_runner
