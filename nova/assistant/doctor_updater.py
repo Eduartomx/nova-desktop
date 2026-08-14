@@ -15,13 +15,28 @@ def _read_json(path: Path) -> dict[str, Any]:
         return {}
 
 
+def _read_recovery(path: Path) -> tuple[dict[str, Any], bool]:
+    path = Path(path)
+    if not path.exists():
+        return {}, False
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return {}, True
+        return data, False
+    except Exception:
+        # Startup itself fails closed on a corrupt journal; Doctor may still be
+        # called directly by tests/repair tools, so expose the condition safely.
+        return {}, True
+
+
 def updater_diagnostic(root: Path, *, supervisor_probe=None) -> dict[str, Any]:
     root = Path(root)
     probe = supervisor_probe or supervisor_status
     mutex = probe()
     active = mutex.get("active")
     last = _read_json(root / "data" / "update_last.json")
-    recovery = _read_json(root / "data" / "update_recovery.json")
+    recovery, recovery_corrupt = _read_recovery(root / "data" / "update_recovery.json")
 
     active_text = "activo" if active is True else ("inactivo" if active is False else "no verificable")
     parts = [f"supervisor {active_text}"]
@@ -36,27 +51,52 @@ def updater_diagnostic(root: Path, *, supervisor_probe=None) -> dict[str, Any]:
     else:
         parts.append("sin resultado de actualización registrado")
 
-    recovery_required = bool(recovery.get("recovery_required"))
-    recovery_state = str(recovery.get("status") or "")
-    if recovery_required:
-        parts.append("recuperación pendiente")
+    recovery_state = str(recovery.get("state") or recovery.get("status") or "")
+    recovery_required = bool(recovery.get("recovery_required")) or recovery_corrupt
+    if recovery_corrupt:
+        parts.append("journal de recuperación corrupto/no verificable")
+    elif recovery_required:
+        generation = int(recovery.get("generation") or 0)
+        parts.append("recuperación pendiente" + (f" ({recovery_state}, gen {generation})" if recovery_state else ""))
     else:
         parts.append("sin recuperación pendiente")
 
-    remaining = [
-        int(pid) for pid in (recovery.get("remaining_pids") or [])
-        if str(pid).isdigit() and int(pid) > 0
-    ][:32]
-    if recovery_state == "pip_termination_unconfirmed":
+    remaining: list[int] = []
+    if recovery_state in {"pip_termination_unconfirmed", "waiting_for_processes"}:
+        rows = recovery.get("remaining_processes") or []
+        if isinstance(rows, list):
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                try:
+                    pid = int(row.get("pid") or 0)
+                except Exception:
+                    pid = 0
+                if pid > 0:
+                    remaining.append(pid)
+        # Compatibility with the pre-schema journal: PID-only values are shown
+        # for diagnosis but are never used as proof of identity or termination.
+        if not remaining:
+            for raw in (recovery.get("remaining_pids") or []):
+                try:
+                    pid = int(raw)
+                except Exception:
+                    continue
+                if pid > 0:
+                    remaining.append(pid)
+        remaining = sorted(set(remaining))[:32]
+
+    pip_unconfirmed = recovery_state == "pip_termination_unconfirmed"
+    if pip_unconfirmed:
         parts.append("terminación de pip no confirmada")
-        if remaining:
-            parts.append("PID restantes: " + ", ".join(str(pid) for pid in remaining))
+    if remaining:
+        parts.append("PID restantes: " + ", ".join(str(pid) for pid in remaining))
 
     probe_error = str(mutex.get("error") or "")
     if probe_error:
         parts.append("mutex no verificable")
 
-    severity = "warn" if recovery_required or active is None else "ok"
+    severity = "error" if recovery_corrupt else ("warn" if recovery_required or active is None else "ok")
     return {
         "name": "Updater residente",
         "status": severity,
@@ -66,9 +106,11 @@ def updater_diagnostic(root: Path, *, supervisor_probe=None) -> dict[str, Any]:
             "last_state": last_state,
             "last_ok": last.get("ok") if last else None,
             "recovery_required": recovery_required,
-            "recovery_state": recovery_state,
-            "pip_termination_unconfirmed": recovery_state == "pip_termination_unconfirmed",
-            "remaining_pids": remaining if recovery_state == "pip_termination_unconfirmed" else [],
+            "recovery_state": recovery_state or ("corrupt" if recovery_corrupt else ""),
+            "recovery_generation": int(recovery.get("generation") or 0) if recovery else 0,
+            "journal_corrupt": recovery_corrupt,
+            "pip_termination_unconfirmed": pip_unconfirmed,
+            "remaining_pids": remaining,
         },
     }
 
