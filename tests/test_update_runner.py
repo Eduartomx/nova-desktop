@@ -80,6 +80,18 @@ class _Process:
         self.closed = True
 
 
+class _EventGuard:
+    def __init__(self, events, *, fail=False):
+        self.events = events
+        self.fail = fail
+        self.calls = 0
+    def release(self):
+        self.calls += 1
+        self.events.append("release_guard")
+        if self.fail:
+            raise RuntimeError("release failed")
+
+
 class UpdateRunnerTests(unittest.TestCase):
     def lock_factory(self, shared):
         return lambda: _Lock(shared, "guard")
@@ -292,29 +304,145 @@ class UpdateRunnerTests(unittest.TestCase):
             self.assertEqual(command[-1], "--post-update")
             self.assertNotIn("--background", command)
 
-    def test_main_does_not_run_updater_when_runtime_termination_is_unverified(self):
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            with patch("updater.update_runner.nova_root", return_value=root), \
-                 patch("updater.update_runner.coordinate_runtime_shutdown", return_value=ShutdownCoordination(False, "owner_process_timeout", 7, "a" * 32)), \
-                 patch("updater.update_runner.run_update") as run_update, \
-                 patch("updater.update_runner._show_surviving_runtime", return_value=True):
-                from updater import update_runner
-                rc = update_runner.main(["--wait-seconds", "0.01"])
-            self.assertEqual(rc, 4)
-            run_update.assert_not_called()
+    def _run_main_case(
+        self,
+        *,
+        update_result=(0, ""),
+        update_exception=None,
+        read_side_effect=None,
+        status_exception=None,
+        release_exception=False,
+        launch_result=(True, "ok"),
+        launch_exception=None,
+    ):
+        from updater import update_runner
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        root = Path(temp.name)
+        events = []
+        guard = _EventGuard(events, fail=release_exception)
+        coordination = ShutdownCoordination(True, process_terminated=True, lock_acquired=True, guard=guard)
 
-    def test_updater_failure_still_relaunches_once_after_verified_shutdown(self):
+        def fake_update(_root, _log):
+            events.append("run_update")
+            if update_exception is not None:
+                raise update_exception
+            return update_result
+
+        def fake_launch(_root):
+            events.append("launch_nova")
+            if launch_exception is not None:
+                raise launch_exception
+            return launch_result
+
+        read_value = read_side_effect if read_side_effect is not None else ["0.9.8", "0.9.9"]
+        status_side_effect = status_exception if status_exception is not None else None
+        with patch("updater.update_runner.nova_root", return_value=root), \
+             patch("updater.update_runner.coordinate_runtime_shutdown", return_value=coordination), \
+             patch("updater.update_runner.run_update", side_effect=fake_update), \
+             patch("updater.update_runner.read_version", side_effect=read_value), \
+             patch("updater.update_runner.write_status", side_effect=status_side_effect) as status, \
+             patch("updater.update_runner.launch_nova", side_effect=fake_launch) as launch:
+            rc = update_runner.main([])
+        return rc, events, guard, launch, status
+
+    def assert_update_release_launch_order(self, events):
+        self.assertIn("run_update", events)
+        self.assertIn("release_guard", events)
+        self.assertIn("launch_nova", events)
+        self.assertLess(events.index("run_update"), events.index("release_guard"))
+        self.assertLess(events.index("release_guard"), events.index("launch_nova"))
+
+    def test_success_releases_guard_before_exactly_one_launch(self):
+        rc, events, guard, launch, _status = self._run_main_case()
+        self.assertEqual(rc, 0)
+        self.assert_update_release_launch_order(events)
+        self.assertEqual(guard.calls, 1)
+        launch.assert_called_once()
+
+    def test_run_update_error_relaunches_exactly_once(self):
+        rc, events, guard, launch, _status = self._run_main_case(update_result=(7, "failed"))
+        self.assertEqual(rc, 7)
+        self.assert_update_release_launch_order(events)
+        self.assertEqual(guard.calls, 1)
+        launch.assert_called_once()
+
+    def test_run_update_exception_relaunches_exactly_once(self):
+        rc, events, _guard, launch, _status = self._run_main_case(update_exception=RuntimeError("boom"))
+        self.assertEqual(rc, 2)
+        self.assert_update_release_launch_order(events)
+        launch.assert_called_once()
+
+    def test_second_read_version_failure_does_not_block_launch(self):
+        rc, events, _guard, launch, _status = self._run_main_case(
+            read_side_effect=["0.9.8", RuntimeError("version read failed")]
+        )
+        self.assertEqual(rc, 0)
+        self.assert_update_release_launch_order(events)
+        launch.assert_called_once()
+
+    def test_write_status_failure_after_success_does_not_block_launch(self):
+        rc, events, _guard, launch, status = self._run_main_case(status_exception=RuntimeError("status failed"))
+        self.assertEqual(rc, 0)
+        self.assert_update_release_launch_order(events)
+        status.assert_called_once()
+        launch.assert_called_once()
+
+    def test_write_status_failure_after_update_failure_does_not_block_launch(self):
+        rc, events, _guard, launch, status = self._run_main_case(
+            update_result=(9, "update failed"), status_exception=RuntimeError("status failed")
+        )
+        self.assertEqual(rc, 9)
+        self.assert_update_release_launch_order(events)
+        status.assert_called_once()
+        launch.assert_called_once()
+
+    def test_release_guard_failure_still_attempts_exactly_one_launch(self):
+        rc, events, guard, launch, _status = self._run_main_case(release_exception=True)
+        self.assertEqual(rc, 0)
+        self.assert_update_release_launch_order(events)
+        self.assertEqual(guard.calls, 1)
+        launch.assert_called_once()
+
+    def test_successful_update_with_failed_relaunch_returns_three(self):
+        rc, events, _guard, launch, _status = self._run_main_case(launch_result=(False, "cannot start"))
+        self.assertEqual(rc, 3)
+        self.assert_update_release_launch_order(events)
+        launch.assert_called_once()
+
+    def test_failed_update_keeps_primary_code_even_if_relaunch_fails(self):
+        rc, events, _guard, launch, _status = self._run_main_case(
+            update_result=(6, "failed"), launch_result=(False, "cannot start")
+        )
+        self.assertEqual(rc, 6)
+        self.assert_update_release_launch_order(events)
+        launch.assert_called_once()
+
+    def test_launch_exception_after_success_returns_three_without_second_attempt(self):
+        rc, events, _guard, launch, _status = self._run_main_case(launch_exception=RuntimeError("spawn failed"))
+        self.assertEqual(rc, 3)
+        self.assert_update_release_launch_order(events)
+        launch.assert_called_once()
+
+    def test_coordination_failure_status_failure_still_attempts_show_and_never_runs_update(self):
+        from updater import update_runner
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
+            events = []
+            failed = ShutdownCoordination(False, "owner_process_timeout", 7, "a" * 32)
             with patch("updater.update_runner.nova_root", return_value=root), \
-                 patch("updater.update_runner.coordinate_runtime_shutdown", return_value=ShutdownCoordination(True, process_terminated=True, lock_acquired=True)), \
-                 patch("updater.update_runner.run_update", return_value=(2, "failed")), \
-                 patch("updater.update_runner.launch_nova", return_value=(True, "ok")) as launch:
-                from updater import update_runner
-                rc = update_runner.main([])
-            self.assertEqual(rc, 2)
-            launch.assert_called_once_with(root)
+                 patch("updater.update_runner.read_version", return_value="0.9.8"), \
+                 patch("updater.update_runner.coordinate_runtime_shutdown", return_value=failed), \
+                 patch("updater.update_runner.write_status", side_effect=RuntimeError("status failed")), \
+                 patch("updater.update_runner.run_update") as run_update, \
+                 patch("updater.update_runner._show_surviving_runtime", side_effect=lambda *_: events.append("show") or True) as show, \
+                 patch("updater.update_runner.launch_nova") as launch:
+                rc = update_runner.main(["--wait-seconds", "0.01"])
+        self.assertEqual(rc, 4)
+        run_update.assert_not_called()
+        launch.assert_not_called()
+        show.assert_called_once()
+        self.assertEqual(events, ["show"])
 
 
 if __name__ == "__main__":
