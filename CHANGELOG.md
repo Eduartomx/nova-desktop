@@ -20,15 +20,19 @@
 - El updater captura el proceso propietario antes de solicitar cierre. En Windows usa HANDLE real y firmas ctypes explícitas para `OpenProcess`, `GetProcessTimes`, `WaitForSingleObject` y `CloseHandle`.
 - Una actualización solo queda autorizada cuando el proceso propietario terminó realmente y el updater conserva el lock de la sesión como guard exclusivo.
 - El guard se mantiene durante descarga, staging, reemplazo, instalación de dependencias, validación y rollback; si otro runtime gana una carrera por el lock, la actualización falla cerrada sin modificar archivos.
+- Una vez que `coordinate_runtime_shutdown()` devuelve `ok=True`, el supervisor garantiza exactamente un intento de relanzamiento visible con `--post-update`, incluso si `run_update()`, la lectura posterior de versión, `write_status()`, el logging o la liberación del guard producen errores.
+- El orden de recuperación queda fijado como actualización/rollback → liberación del guard → `launch_nova()`. Las operaciones administrativas de estado/log son best-effort y no pueden impedir el intento de recuperación.
+- Si la coordinación falla, no se ejecuta el updater; la escritura de estado es best-effort y se intenta igualmente `_show_surviving_runtime()` para recuperar la instancia que continúa viva.
 - El rollback usa un manifiesto transaccional explícito con `modified_existing`, `deleted_existing`, `created_new` y `unchanged`: restaura los dos primeros, elimina únicamente `created_new` y nunca toca `unchanged`.
 - `managed_files.json` conserva y restaura su estado previo. Reemplazos viables usan archivo temporal + `os.replace()` para reducir instalaciones parciales.
-- Si el rollback no puede completarse, el error se propaga, se escribe estado explícito de recuperación y el backup se conserva para reparación manual.
+- El rollback transaccional garantiza el estado de los archivos administrados, no una reversión exacta de `.venv`. Si `pip` llegó a iniciarse, el entorno de dependencias puede haber cambiado aunque los archivos se restauren correctamente.
+- En una recuperación posterior a pip se conservan el backup y un estado explícito con `files_rollback_ok`, `dependencies_may_have_changed` y `recovery_required`; el mensaje no afirma que volver a ejecutar `requirements.txt` elimine paquetes adicionales o reconstruya exactamente el entorno anterior.
+- Si el rollback de archivos no puede completarse, el error se propaga, se escribe estado explícito de recuperación y el backup se conserva para reparación manual.
 - Botón UI, `ACTUALIZAR_NOVA.cmd` y ejecución interactiva directa de `nova_updater.py` usan el mismo supervisor. El camino interno `--yes` solo se utiliza después de la coordinación segura.
-- Después de éxito o error del updater, una vez terminado el runtime anterior de forma verificable, se libera el guard y se lanza exactamente una instancia visible con `--post-update`.
 - El autostart sigue bajo HKCU, sin administrador y desactivado por defecto. Al desactivar solo elimina `NovaDesktop` si el valor coincide exactamente con la instalación actual; una entrada de otra instalación produce conflicto explícito y no se modifica.
 - `WM_QUERYENDSESSION`/`WM_ENDSESSION` se integran al shutdown real para logoff/apagado de Windows.
 - Nova Doctor informa lifecycle, ventana visible/oculta, bandeja lista/degradada, propiedad/scope de instancia, estado real/conflicto de autostart, último motivo de salida y errores recientes sin contenido sensible.
-- Se añaden pruebas de bandeja con visibilidad real, timeout y callback tardío; rollback con archivos reales y SHA-256; PID reutilizado/metadata obsoleta; updater activo; carrera de guard; cleanup con scheduler Tk roto; y la integración multiproceso real de Windows.
+- Se añaden pruebas de bandeja con visibilidad real, timeout y callback tardío; rollback con archivos reales y SHA-256; incertidumbre de dependencias posterior a pip; relanzamiento ante excepciones administrativas; PID reutilizado/metadata obsoleta; updater activo; carrera de guard; cleanup con scheduler Tk roto; y la integración multiproceso real de Windows.
 - CI mantiene la suite completa Ubuntu y ejecuta explícitamente en `windows-latest` lifecycle, bandeja, rollback, IPC/procesos, updater, session shutdown, Gaming Awareness, Instant Wake/hotkeys y núcleo nativo.
 
 ## v0.9.8 — Gaming Reliability
