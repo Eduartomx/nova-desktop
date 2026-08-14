@@ -95,6 +95,10 @@ jobs:
         run: python -m pip install --disable-pip-version-check psutil pillow pystray requests beautifulsoup4
       - name: Compile all Nova source on Windows
         run: python -m compileall -q nova
+      - name: Windows recovery detail
+        env:
+          PYTHONPATH: nova
+        run: python -m unittest -v tests.test_recovery_windows_detail
       - name: Recovery bootstrap unit suite
         env:
           PYTHONPATH: nova
