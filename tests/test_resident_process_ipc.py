@@ -12,7 +12,8 @@ import unittest
 
 from assistant.instance_commands import InstanceCommandMailbox
 from assistant.instance_lock import InstanceLock
-from updater.update_runner import coordinate_runtime_shutdown
+from assistant.update_supervisor import create_supervisor_mutex
+from updater.update_runner import SUPERVISOR_ALREADY_RUNNING_CODE, coordinate_runtime_shutdown
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 NOVA_ROOT = REPO_ROOT / "nova"
@@ -98,6 +99,55 @@ from pathlib import Path
 from assistant.instance_lock import InstanceLock
 lock = InstanceLock(path=Path(sys.argv[1]), owner_path=Path(sys.argv[2]), role="runtime")
 if not lock.acquire(): raise SystemExit(50)
+threading.Event().wait(12.0)
+lock.release()
+'''
+
+SUPERVISOR_SCRIPT = r'''
+import os, sys, threading, time
+from pathlib import Path
+from assistant.update_supervisor import create_supervisor_mutex
+from updater import update_runner
+from updater.update_runner import ShutdownCoordination
+root = Path(sys.argv[1])
+mutex_path = Path(sys.argv[2])
+markers = Path(sys.argv[3])
+finish = Path(sys.argv[4])
+markers.mkdir(parents=True, exist_ok=True)
+pid = os.getpid()
+def mark(kind):
+    (markers / (kind + "_" + str(pid))).write_text(str(pid), encoding="utf-8")
+class Guard:
+    def release(self): mark("guard_release")
+def coordinate(*_a, **_kw):
+    mark("shutdown")
+    return ShutdownCoordination(True, process_terminated=True, lock_acquired=True, guard=Guard())
+def run_update(*_a, **_kw):
+    mark("run")
+    deadline = time.monotonic() + 8.0
+    event = threading.Event()
+    while time.monotonic() < deadline and not finish.exists(): event.wait(0.02)
+    if not finish.exists(): return 9, "test owner timeout"
+    return 0, ""
+def launch(*_a, **_kw): mark("launch"); return True, "ok"
+update_runner.nova_root = lambda: root
+update_runner.coordinate_runtime_shutdown = coordinate
+update_runner.run_update = run_update
+update_runner.read_version = lambda *_a, **_kw: "0.9.8"
+update_runner.write_status = lambda *_a, **_kw: None
+update_runner.launch_nova = launch
+rc = update_runner.main([], supervisor_lock_factory=lambda: create_supervisor_mutex(path=mutex_path))
+mark("rc" + str(rc))
+raise SystemExit(rc)
+'''
+
+SUPERVISOR_HOLDER_SCRIPT = r'''
+import sys, threading
+from pathlib import Path
+from assistant.update_supervisor import create_supervisor_mutex
+lock = create_supervisor_mutex(path=Path(sys.argv[1]))
+if not lock.acquire(): raise SystemExit(70)
+Path(sys.argv[2]).write_text("held", encoding="utf-8")
 threading.Event().wait(12.0)
 lock.release()
 '''
@@ -224,6 +274,80 @@ class ResidentProcessIPCTests(unittest.TestCase):
                 if old_proc.poll() is None:
                     old_proc.terminate()
                     old_proc.wait(timeout=3)
+
+    def test_two_real_supervisors_only_owner_coordinates_updates_and_launches(self):
+        with tempfile.TemporaryDirectory() as td:
+            folder = Path(td)
+            root = folder / "nova"
+            root.mkdir()
+            mutex = folder / "scope" / "update_supervisor.lock"
+            markers = folder / "markers"
+            finish = folder / "finish.marker"
+            first = subprocess.Popen(
+                [sys.executable, "-c", SUPERVISOR_SCRIPT, str(root), str(mutex), str(markers), str(finish)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=_env(),
+            )
+            second = None
+            try:
+                self.assertTrue(_wait_for_path(markers / f"run_{first.pid}", 5.0), "first supervisor never reached run_update")
+                second = subprocess.Popen(
+                    [sys.executable, "-c", SUPERVISOR_SCRIPT, str(root), str(mutex), str(markers), str(finish)],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    env=_env(),
+                )
+                second_rc = second.wait(timeout=5)
+                self.assertEqual(second_rc, SUPERVISOR_ALREADY_RUNNING_CODE, second.stderr.read())
+                self.assertFalse((markers / f"shutdown_{second.pid}").exists())
+                self.assertFalse((markers / f"run_{second.pid}").exists())
+                self.assertFalse((markers / f"launch_{second.pid}").exists())
+                self.assertTrue((markers / f"rc{SUPERVISOR_ALREADY_RUNNING_CODE}_{second.pid}").exists())
+
+                finish.write_text("finish", encoding="utf-8")
+                first_rc = first.wait(timeout=5)
+                self.assertEqual(first_rc, 0, first.stderr.read())
+                self.assertTrue((markers / f"shutdown_{first.pid}").exists())
+                self.assertTrue((markers / f"run_{first.pid}").exists())
+                self.assertTrue((markers / f"guard_release_{first.pid}").exists())
+                self.assertTrue((markers / f"launch_{first.pid}").exists())
+                self.assertEqual(len(list(markers.glob("shutdown_*"))), 1)
+                self.assertEqual(len(list(markers.glob("run_*"))), 1)
+                self.assertEqual(len(list(markers.glob("launch_*"))), 1)
+            finally:
+                finish.write_text("finish", encoding="utf-8")
+                for proc in (second, first):
+                    if proc is not None and proc.poll() is None:
+                        proc.terminate()
+                        proc.wait(timeout=3)
+
+    def test_dead_supervisor_process_does_not_leave_mutex_owned(self):
+        with tempfile.TemporaryDirectory() as td:
+            folder = Path(td)
+            mutex = folder / "scope" / "update_supervisor.lock"
+            held = folder / "held.marker"
+            proc = subprocess.Popen(
+                [sys.executable, "-c", SUPERVISOR_HOLDER_SCRIPT, str(mutex), str(held)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                env=_env(),
+            )
+            try:
+                self.assertTrue(_wait_for_path(held, 5.0))
+                competing = create_supervisor_mutex(path=mutex)
+                self.assertFalse(competing.acquire(), "mutex allowed two live supervisor owners")
+                proc.terminate()
+                proc.wait(timeout=5)
+                recovered = create_supervisor_mutex(path=mutex)
+                self.assertTrue(recovered.acquire(), "kernel mutex remained stuck after owner process died")
+                recovered.release()
+            finally:
+                if proc.poll() is None:
+                    proc.terminate()
+                    proc.wait(timeout=3)
 
 
 if __name__ == "__main__":
