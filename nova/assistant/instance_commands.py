@@ -25,9 +25,6 @@ class InstanceCommandMailbox:
         if self.legacy_path is not None:
             raw = raw.parent / "commands"
         self.directory = raw
-        # Production senders always pass the current target explicitly. A local
-        # fallback generation keeps direct unit use deterministic without ever
-        # creating untargeted command files.
         self.owner_id = str(owner_id or uuid.uuid4().hex)
         self.max_age_seconds = max(1.0, float(max_age_seconds))
 
@@ -45,9 +42,25 @@ class InstanceCommandMailbox:
             raise ValueError("invalid target owner")
         return value
 
+    def _published_owner_allows(self, target_owner_id: str) -> bool:
+        owner_path = self.directory.parent / "owner.json"
+        if not owner_path.exists():
+            return True
+        try:
+            owner = json.loads(owner_path.read_text(encoding="utf-8"))
+            if not isinstance(owner, dict):
+                return False
+            if str(owner.get("owner_id") or "") != str(target_owner_id):
+                return False
+            return str(owner.get("role") or "runtime") == "runtime"
+        except (OSError, ValueError, TypeError, UnicodeError, json.JSONDecodeError):
+            return False
+
     def send(self, command: str, *, target_owner_id: str | None = None) -> bool:
         command = self.validate(command)
         target = self._validate_owner_id(target_owner_id or self.owner_id)
+        if not self._published_owner_allows(target):
+            return False
         self.directory.mkdir(parents=True, exist_ok=True)
         command_id = uuid.uuid4().hex
         payload = {"command_id": command_id, "target_owner_id": target, "command": command, "created_at": time.time()}
@@ -90,9 +103,6 @@ class InstanceCommandMailbox:
     def consume(self, *, owner_id: str | None = None) -> dict[str, Any] | None:
         target_owner = self._validate_owner_id(owner_id or self.owner_id)
         if self.legacy_path is not None and self.legacy_path.exists():
-            # v0.9.9 pre-hardening used one untargeted mailbox file. Never
-            # interpret it after owner-targeting was introduced: delete it and
-            # surface an invalid message instead of risking cross-generation use.
             try:
                 self.legacy_path.unlink(missing_ok=True)
             except OSError:
