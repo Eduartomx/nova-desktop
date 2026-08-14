@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -76,7 +77,15 @@ class ScopeTests(unittest.TestCase):
 
 
 class _Lifecycle:
-    def show_window(self): return True
+    def __init__(self, state="running"):
+        self.state = state
+        self.show_calls = 0
+    @property
+    def window_hidden(self): return self.state == "hidden"
+    def show_window(self):
+        self.show_calls += 1
+        self.state = "running"
+        return True
     def request_shutdown(self, _reason): return True
 
 
@@ -86,15 +95,33 @@ class _UI:
 
 
 class AsyncReadyIcon:
-    visible = True
-    def __init__(self): self.stop_calls = 0
+    def __init__(self):
+        self._visible = False
+        self.stop_calls = 0
+        self.visible_seen_after_setup = False
+        self.setup_called = threading.Event()
+    @property
+    def visible(self): return self._visible
+    @visible.setter
+    def visible(self, value): self._visible = bool(value)
     def run_detached(self, setup=None):
         def ready():
-            if setup is not None: setup(self)
+            self.setup_called.set()
+            if setup is not None:
+                setup(self)
+                self.visible_seen_after_setup = bool(self.visible)
         threading.Thread(target=ready, daemon=True).start()
     def stop(self): self.stop_calls += 1
     def update_menu(self): pass
     def notify(self, *_args): pass
+
+
+class VisibilityFailIcon(AsyncReadyIcon):
+    @AsyncReadyIcon.visible.setter
+    def visible(self, value):
+        if value:
+            raise RuntimeError("visibility failed")
+        self._visible = False
 
 
 class AsyncFailIcon(AsyncReadyIcon):
@@ -103,21 +130,45 @@ class AsyncFailIcon(AsyncReadyIcon):
 
 
 class AsyncTimeoutIcon(AsyncReadyIcon):
+    def __init__(self):
+        super().__init__()
+        self.setup_callback = None
     def run_detached(self, setup=None):
-        return None
+        self.setup_callback = setup
+        self.setup_called.set()
+    def fire_late(self):
+        if self.setup_callback is not None:
+            self.setup_callback(self)
+
+
+class MenuFailIcon(AsyncReadyIcon):
+    def update_menu(self):
+        raise RuntimeError("menu backend lost")
 
 
 class TrayReadinessTests(unittest.TestCase):
-    def make(self, icon, timeout=0.2):
-        return TrayController(_UI(), _Lifecycle(), icon_factory=lambda _tray: icon, ready_timeout=timeout)
+    def make(self, icon, timeout=0.2, lifecycle=None):
+        return TrayController(_UI(), lifecycle or _Lifecycle(), icon_factory=lambda _tray: icon, ready_timeout=timeout)
 
-    def test_async_backend_success_marks_available_only_after_setup(self):
+    def test_async_backend_success_requires_controller_to_make_icon_visible(self):
         icon = AsyncReadyIcon()
+        self.assertFalse(icon.visible)
         tray = self.make(icon)
         self.assertTrue(tray.start())
+        self.assertTrue(icon.visible)
+        self.assertTrue(icon.visible_seen_after_setup)
         self.assertTrue(tray.available)
         self.assertFalse(tray.degraded)
         self.assertTrue(tray.status()["ready"])
+
+    def test_visibility_exception_is_degraded(self):
+        icon = VisibilityFailIcon()
+        tray = self.make(icon)
+        self.assertFalse(tray.start())
+        self.assertFalse(tray.available)
+        self.assertTrue(tray.degraded)
+        self.assertIn("visibility failed", tray.last_error)
+        self.assertEqual(icon.stop_calls, 1)
 
     def test_async_backend_failure_is_degraded(self):
         tray = self.make(AsyncFailIcon())
@@ -125,12 +176,46 @@ class TrayReadinessTests(unittest.TestCase):
         self.assertFalse(tray.available)
         self.assertTrue(tray.degraded)
 
-    def test_async_backend_timeout_is_degraded(self):
-        tray = self.make(AsyncTimeoutIcon(), timeout=0.1)
+    def test_async_backend_timeout_is_degraded_and_stops_attempt_icon(self):
+        icon = AsyncTimeoutIcon()
+        tray = self.make(icon, timeout=0.1)
         self.assertFalse(tray.start())
         self.assertFalse(tray.available)
         self.assertTrue(tray.degraded)
         self.assertIn("timeout", tray.last_error)
+        self.assertEqual(icon.stop_calls, 1)
+        self.assertFalse(icon.visible)
+
+    def test_late_callback_after_timeout_cannot_validate_next_generation(self):
+        first = AsyncTimeoutIcon()
+        second = AsyncReadyIcon()
+        icons = iter((first, second))
+        tray = TrayController(_UI(), _Lifecycle(), icon_factory=lambda _tray: next(icons), ready_timeout=0.1)
+        self.assertFalse(tray.start())
+        first_generation = tray.status()["generation"]
+        self.assertEqual(first_generation, 0)
+        self.assertTrue(tray.start())
+        second_generation = tray.status()["generation"]
+        self.assertGreater(second_generation, 0)
+        self.assertIs(tray.icon, second)
+        first.fire_late()
+        time.sleep(0.02)
+        self.assertFalse(first.visible, "expired setup callback must be inert")
+        self.assertTrue(tray.available)
+        self.assertIs(tray.icon, second)
+        self.assertEqual(tray.status()["generation"], second_generation)
+        self.assertEqual(second.stop_calls, 0)
+
+    def test_degradation_while_hidden_requests_tk_safe_restore_via_lifecycle(self):
+        lifecycle = _Lifecycle(state="hidden")
+        icon = MenuFailIcon()
+        tray = self.make(icon, lifecycle=lifecycle)
+        self.assertTrue(tray.start())
+        tray.refresh_menu()
+        self.assertTrue(tray.degraded)
+        self.assertFalse(tray.available)
+        self.assertEqual(lifecycle.show_calls, 1)
+        self.assertEqual(lifecycle.state, "running")
 
 
 class SecondaryLaunchTests(unittest.TestCase):
