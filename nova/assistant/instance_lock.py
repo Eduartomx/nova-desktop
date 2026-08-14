@@ -2,9 +2,11 @@ from __future__ import annotations
 
 """Kernel-backed single-instance ownership for one Nova runtime per user session.
 
-The lock itself is authoritative. ``owner.json`` is durable generation metadata
-used to target local commands and to let the updater capture the owning process
-before asking it to terminate. Metadata never contains a raw Windows SID.
+The kernel lock is authoritative. ``owner.json`` identifies the last published
+owner generation. Runtime owners publish metadata; updater probes may acquire
+the same kernel lock without overwriting that metadata, and an updater guard
+publishes an explicit ``updater`` role only after the runtime process is gone.
+Raw Windows SIDs are never persisted.
 """
 
 from dataclasses import dataclass
@@ -85,13 +87,15 @@ def _windows_identity() -> tuple[str, int]:
 def runtime_identity() -> dict[str, Any]:
     try:
         user_hash, session_id = _windows_identity()
+        source = "windows_sid_session"
     except Exception:
         user_raw = "|".join((os.environ.get("USERDOMAIN", ""), os.environ.get("USERNAME", ""), str(Path.home())))
         session_raw = os.environ.get("SESSIONNAME") or os.environ.get("XDG_SESSION_ID") or "default"
         user_hash = _hash_text(user_raw)
         session_id = int(_hash_text(session_raw, 8), 16)
+        source = "profile_session_fallback"
     scope_id = _hash_text(f"{user_hash}|{session_id}")
-    return {"user_hash": user_hash, "session_id": int(session_id), "scope_id": scope_id}
+    return {"user_hash": user_hash, "session_id": int(session_id), "scope_id": scope_id, "identity_source": source}
 
 
 def _scope_id() -> str:
@@ -142,7 +146,15 @@ def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
 
 
 class InstanceLock:
-    def __init__(self, *, path: Path | None = None, owner_path: Path | None = None, locker=None):
+    def __init__(
+        self,
+        *,
+        path: Path | None = None,
+        owner_path: Path | None = None,
+        locker=None,
+        publish_owner: bool = True,
+        role: str = "runtime",
+    ):
         paths = runtime_paths()
         self.path = Path(path) if path is not None else paths.lock
         self.owner_path = Path(owner_path) if owner_path is not None else (paths.owner if path is None else self.path.with_name("owner.json"))
@@ -151,6 +163,8 @@ class InstanceLock:
         self.acquired = False
         self.owner_id = ""
         self.release_requested = False
+        self.publish_owner = bool(publish_owner)
+        self.role = str(role or "runtime")[:32]
         self.identity = runtime_identity()
 
     def _lock_stream(self, stream) -> bool:
@@ -196,11 +210,16 @@ class InstanceLock:
         self._file = stream
         self.acquired = True
         self.release_requested = False
+        if not self.publish_owner:
+            self.owner_id = ""
+            return True
+
         self.owner_id = uuid.uuid4().hex
         metadata = {
             "pid": int(os.getpid()),
             "owner_id": self.owner_id,
             "generation": self.owner_id,
+            "role": self.role,
             "scope_id": str(self.identity["scope_id"]),
             "user_hash": str(self.identity["user_hash"]),
             "session_id": int(self.identity["session_id"]),
@@ -212,20 +231,30 @@ class InstanceLock:
             try:
                 self._unlock_stream(stream)
             finally:
-                stream.close(); self._file = None; self.acquired = False; self.owner_id = ""
+                stream.close()
+                self._file = None
+                self.acquired = False
+                self.owner_id = ""
             raise
         return True
 
     def read_owner(self) -> dict[str, Any] | None:
         try:
             data = json.loads(self.owner_path.read_text(encoding="utf-8"))
-            if not isinstance(data, dict): return None
+            if not isinstance(data, dict):
+                return None
             required = {"pid", "owner_id", "scope_id", "user_hash", "session_id"}
-            if not required.issubset(data): return None
-            if str(data.get("scope_id")) != str(self.identity["scope_id"]): return None
-            pid = int(data.get("pid") or 0); owner_id = str(data.get("owner_id") or "")
-            if pid <= 0 or len(owner_id) < 16: return None
-            data["pid"] = pid; data["session_id"] = int(data.get("session_id") or 0)
+            if not required.issubset(data):
+                return None
+            if str(data.get("scope_id")) != str(self.identity["scope_id"]):
+                return None
+            pid = int(data.get("pid") or 0)
+            owner_id = str(data.get("owner_id") or "")
+            if pid <= 0 or len(owner_id) < 16:
+                return None
+            data["pid"] = pid
+            data["session_id"] = int(data.get("session_id") or 0)
+            data["role"] = str(data.get("role") or "runtime")
             return data
         except (OSError, ValueError, TypeError, json.JSONDecodeError, UnicodeError):
             return None
@@ -235,13 +264,15 @@ class InstanceLock:
         return {
             "acquired": bool(self.acquired),
             "release_requested": bool(self.release_requested),
-            "owner_id": self.owner_id if self.acquired else str(owner.get("owner_id") or ""),
+            "owner_id": self.owner_id if self.acquired and self.publish_owner else str(owner.get("owner_id") or ""),
             "pid": int(owner.get("pid") or (os.getpid() if self.acquired else 0)),
+            "role": self.role if self.acquired and self.publish_owner else str(owner.get("role") or ""),
             "ownership": "kernel_file_lock",
             "scope": "windows_user_session" if os.name == "nt" else "user_session",
             "scope_id": str(self.identity["scope_id"]),
             "session_id": int(self.identity["session_id"]),
             "user_hash": str(self.identity["user_hash"]),
+            "identity_source": str(self.identity.get("identity_source") or ""),
         }
 
     def defer_release(self) -> None:
@@ -252,7 +283,12 @@ class InstanceLock:
             return
         stream = self._file
         try:
-            # owner.json deliberately survives unlock as last-generation metadata.
+            # Published metadata deliberately survives unlock as last-generation
+            # metadata until the next published owner replaces it atomically.
             self._unlock_stream(stream)
         finally:
-            stream.close(); self._file = None; self.acquired = False; self.owner_id = ""; self.release_requested = False
+            stream.close()
+            self._file = None
+            self.acquired = False
+            self.owner_id = ""
+            self.release_requested = False
