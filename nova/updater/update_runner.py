@@ -12,7 +12,6 @@ import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
 
 
 def nova_root() -> Path:
@@ -39,11 +38,7 @@ def console_python(root: Path) -> Path:
 
 
 class ProcessCapture:
-    """A stable reference to the owner process.
-
-    Windows uses a real process HANDLE captured before shutdown is requested,
-    preventing PID reuse from being mistaken for the original runtime.
-    """
+    """Stable reference to a runtime process captured before shutdown request."""
 
     def __init__(self, pid: int, handle=None, *, already_terminated=False):
         self.pid = int(pid)
@@ -75,8 +70,7 @@ class ProcessCapture:
         handle = kernel32.OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
         if not handle:
             error = ctypes.get_last_error()
-            # ERROR_INVALID_PARAMETER: PID no longer exists.
-            if error == 87:
+            if error == 87:  # ERROR_INVALID_PARAMETER: process no longer exists.
                 return cls(pid, already_terminated=True)
             raise ctypes.WinError(error)
         capture = cls(pid, handle)
@@ -90,8 +84,7 @@ class ProcessCapture:
         if os.name == "nt" and self.handle:
             WAIT_OBJECT_0 = 0
             WAIT_TIMEOUT = 258
-            millis = min(int(timeout * 1000), 0xFFFFFFFE)
-            result = int(self._kernel32.WaitForSingleObject(self.handle, millis))
+            result = int(self._kernel32.WaitForSingleObject(self.handle, min(int(timeout * 1000), 0xFFFFFFFE)))
             if result == WAIT_OBJECT_0:
                 return True
             if result == WAIT_TIMEOUT:
@@ -169,20 +162,19 @@ def coordinate_runtime_shutdown(
     mailbox=None,
     process_factory=None,
 ) -> ShutdownCoordination:
-    """Authorize updating only after BOTH owner death and lock reacquisition."""
+    """Authorize file writes only after owner death AND lock reacquisition."""
     lock_factory, mailbox = _runtime_components(root, lock_factory=lock_factory, mailbox=mailbox)
     process_factory = process_factory or ProcessCapture.open
     deadline = time.monotonic() + max(0.0, float(timeout))
 
-    # No current runtime: lock is already obtainable, therefore there is no
-    # owner process that could be executing managed Nova files.
-    if _probe_lock(lock_factory):
-        return ShutdownCoordination(True, process_terminated=True, lock_acquired=True)
-
+    lock_free_at_capture = _probe_lock(lock_factory)
     observer = lock_factory()
     owner = observer.read_owner()
     if not owner:
+        if lock_free_at_capture:
+            return ShutdownCoordination(True, process_terminated=True, lock_acquired=True)
         return ShutdownCoordination(False, "runtime_owner_metadata_unavailable")
+
     owner_pid = int(owner.get("pid") or 0)
     owner_id = str(owner.get("owner_id") or "")
     if expected_pid and owner_pid != int(expected_pid):
@@ -191,18 +183,21 @@ def coordinate_runtime_shutdown(
     try:
         captured = process_factory(owner_pid)
     except Exception as exc:
-        return ShutdownCoordination(False, f"owner_process_capture_failed:{type(exc).__name__}", owner_pid=owner_pid, owner_id=owner_id)
+        # If the lock is free but stale metadata points at a PID we cannot open,
+        # fail safe rather than guessing that the previous runtime is gone.
+        return ShutdownCoordination(False, f"owner_process_capture_failed:{type(exc).__name__}", owner_pid=owner_pid, owner_id=owner_id, lock_acquired=lock_free_at_capture)
 
+    command_sent = False
     try:
-        # Re-read after opening the HANDLE. If ownership changed in that tiny
-        # window, the captured process is not the generation we intend to stop.
         verify = observer.read_owner()
         if verify:
             if int(verify.get("pid") or 0) != owner_pid or str(verify.get("owner_id") or "") != owner_id:
                 return ShutdownCoordination(False, "runtime_owner_changed_during_capture", owner_pid=owner_pid, owner_id=owner_id)
 
-        command_sent = False
-        if not getattr(captured, "already_terminated", False):
+        # If the lock was already free, this may be the final-unlock window:
+        # never send shutdown to a process that no longer owns the lock, but do
+        # still wait for the captured PID before authorizing file replacement.
+        if not lock_free_at_capture and not getattr(captured, "already_terminated", False):
             command_sent = bool(mailbox.send("shutdown_for_update", target_owner_id=owner_id))
             if not command_sent:
                 return ShutdownCoordination(False, "shutdown_command_delivery_failed", owner_pid=owner_pid, owner_id=owner_id)
@@ -213,7 +208,7 @@ def coordinate_runtime_shutdown(
         except Exception as exc:
             return ShutdownCoordination(False, f"owner_process_wait_failed:{type(exc).__name__}", owner_pid=owner_pid, owner_id=owner_id, command_sent=command_sent)
         if not process_terminated:
-            return ShutdownCoordination(False, "owner_process_timeout", owner_pid=owner_pid, owner_id=owner_id, command_sent=command_sent)
+            return ShutdownCoordination(False, "owner_process_timeout", owner_pid=owner_pid, owner_id=owner_id, command_sent=command_sent, lock_acquired=lock_free_at_capture)
     finally:
         try:
             captured.close()
@@ -244,15 +239,7 @@ def coordinate_runtime_shutdown(
 
 
 def request_runtime_shutdown(root: Path, timeout: float = 20.0, *, lock_factory=None, mailbox=None, process_factory=None) -> bool:
-    return bool(
-        coordinate_runtime_shutdown(
-            root,
-            timeout,
-            lock_factory=lock_factory,
-            mailbox=mailbox,
-            process_factory=process_factory,
-        ).ok
-    )
+    return bool(coordinate_runtime_shutdown(root, timeout, lock_factory=lock_factory, mailbox=mailbox, process_factory=process_factory).ok)
 
 
 def status_path(root: Path) -> Path:
@@ -262,14 +249,7 @@ def status_path(root: Path) -> Path:
 def write_status(root: Path, *, ok: bool, before: str, after: str, log: Path, error: str = "") -> None:
     path = status_path(root)
     path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {
-        "ok": bool(ok),
-        "before": before,
-        "after": after,
-        "error": str(error or ""),
-        "log": str(log),
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-    }
+    payload = {"ok": bool(ok), "before": before, "after": after, "error": str(error or ""), "log": str(log), "timestamp": datetime.now(timezone.utc).isoformat()}
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
@@ -283,13 +263,7 @@ def launch_nova(root: Path) -> tuple[bool, str]:
         flags = 0
         if os.name == "nt":
             flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-        subprocess.Popen(
-            [str(py), str(app), "--post-update"],
-            cwd=str(root),
-            creationflags=flags,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+        subprocess.Popen([str(py), str(app), "--post-update"], cwd=str(root), creationflags=flags, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return True, f"{py} {app} --post-update"
     except Exception as exc:
         return False, str(exc)
@@ -337,8 +311,6 @@ def main(argv=None) -> int:
     if not coordination.ok:
         error = "Nova no terminó de forma verificable; no se modificaron archivos. " + coordination.error
         write_status(root, ok=False, before=before, after=before, log=log, error=error)
-        # If the original runtime is still alive, restore visibility through the
-        # same owner-targeted IPC instead of launching a competing runtime.
         _show_surviving_runtime(root, coordination)
         return 4
 
@@ -348,8 +320,6 @@ def main(argv=None) -> int:
     error = runner_error or ("" if ok else f"El updater terminó con código {rc}. Revisa {log}.")
     write_status(root, ok=ok, before=before, after=after, log=log, error=error)
 
-    # At this point the previous owner is confirmed dead and its lock is free.
-    # Exactly one visible post-update process is launched on both success/error.
     launched, launch_detail = launch_nova(root)
     if not launched:
         with open(log, "a", encoding="utf-8", errors="replace") as stream:
