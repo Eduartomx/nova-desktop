@@ -26,11 +26,14 @@ class CoreConsolidationTests(unittest.TestCase):
 
     def test_instance_is_claimed_before_core_runtime_and_background_is_supported(self):
         app = (Path(__file__).resolve().parents[1] / "nova" / "app.py").read_text(encoding="utf-8")
-        claim = app.index("instance_lock, command_mailbox = _claim_instance()")
+        claim = app.index("instance_lock, command_mailbox, secondary_code = _claim_instance()")
         core = app.index("from assistant.core_runtime import install_core_runtime")
         self.assertLess(claim, core)
         self.assertIn('parser.add_argument("--background", action="store_true")', app)
         self.assertIn('parser.add_argument("--post-update", action="store_true")', app)
+        secondary_exit = app.index("if instance_lock is None:")
+        tk_create = app.index("root = tk.Tk()")
+        self.assertLess(secondary_exit, tk_create)
 
     def test_memory_features_are_native_without_installers(self):
         with tempfile.TemporaryDirectory() as td:
