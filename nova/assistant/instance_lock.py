@@ -3,9 +3,9 @@ from __future__ import annotations
 """Kernel-backed single-instance ownership for one Nova runtime per user session.
 
 The kernel lock is authoritative. ``owner.json`` identifies the last published
-owner generation. Runtime owners publish metadata; updater probes may acquire
-the same kernel lock without overwriting that metadata, and an updater guard
-publishes an explicit ``updater`` role only after it owns the kernel lock.
+owner generation. Runtime owners publish metadata; updater probes/guards may
+first acquire the same kernel lock without overwriting the previous metadata,
+then publish an explicit ``updater`` role only after validating that evidence.
 Raw Windows SIDs are never persisted.
 """
 
@@ -248,6 +248,34 @@ class InstanceLock:
         import fcntl
         fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
 
+    def publish_owner_metadata(self) -> dict[str, Any]:
+        """Publish this already-acquired lock as the current owner generation."""
+        if not self.acquired or self._file is None:
+            raise RuntimeError("cannot publish metadata without acquired lock")
+        if self.owner_id and self.process_creation_time:
+            current = self.read_owner()
+            if current and str(current.get("owner_id") or "") == self.owner_id:
+                return current
+        owner_id = uuid.uuid4().hex
+        marker = process_creation_time(os.getpid())
+        if not marker:
+            raise RuntimeError("could not determine owner process creation time")
+        metadata = {
+            "pid": int(os.getpid()),
+            "process_creation_time": int(marker),
+            "owner_id": owner_id,
+            "generation": owner_id,
+            "role": self.role,
+            "scope_id": str(self.identity["scope_id"]),
+            "user_hash": str(self.identity["user_hash"]),
+            "session_id": int(self.identity["session_id"]),
+            "created_at": _utc_now(),
+        }
+        _atomic_json(self.owner_path, metadata)
+        self.owner_id = owner_id
+        self.process_creation_time = int(marker)
+        return metadata
+
     def acquire(self) -> bool:
         if self.acquired:
             return True
@@ -270,26 +298,10 @@ class InstanceLock:
         self.release_requested = False
         if not self.publish_owner:
             self.owner_id = ""
+            self.process_creation_time = 0
             return True
-
-        self.owner_id = uuid.uuid4().hex
         try:
-            marker = process_creation_time(os.getpid())
-            if not marker:
-                raise RuntimeError("could not determine owner process creation time")
-            self.process_creation_time = int(marker)
-            metadata = {
-                "pid": int(os.getpid()),
-                "process_creation_time": self.process_creation_time,
-                "owner_id": self.owner_id,
-                "generation": self.owner_id,
-                "role": self.role,
-                "scope_id": str(self.identity["scope_id"]),
-                "user_hash": str(self.identity["user_hash"]),
-                "session_id": int(self.identity["session_id"]),
-                "created_at": _utc_now(),
-            }
-            _atomic_json(self.owner_path, metadata)
+            self.publish_owner_metadata()
         except Exception:
             try:
                 self._unlock_stream(stream)
@@ -329,13 +341,14 @@ class InstanceLock:
 
     def status(self) -> dict[str, Any]:
         owner = self.read_owner() or {}
+        published_self = bool(self.acquired and self.owner_id and self.process_creation_time)
         return {
             "acquired": bool(self.acquired),
             "release_requested": bool(self.release_requested),
-            "owner_id": self.owner_id if self.acquired and self.publish_owner else str(owner.get("owner_id") or ""),
-            "pid": int(owner.get("pid") or (os.getpid() if self.acquired else 0)),
+            "owner_id": self.owner_id if published_self else str(owner.get("owner_id") or ""),
+            "pid": int((os.getpid() if published_self else owner.get("pid")) or (os.getpid() if self.acquired else 0)),
             "process_creation_time": int(self.process_creation_time or owner.get("process_creation_time") or 0),
-            "role": self.role if self.acquired and self.publish_owner else str(owner.get("role") or ""),
+            "role": self.role if published_self else str(owner.get("role") or ""),
             "ownership": "kernel_file_lock",
             "scope": "windows_user_session" if os.name == "nt" else "user_session",
             "scope_id": str(self.identity["scope_id"]),
