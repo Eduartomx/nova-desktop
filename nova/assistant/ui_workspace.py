@@ -9,14 +9,115 @@ from pathlib import Path
 
 from .doctor import NovaDoctor
 
+SUPERVISOR_ALREADY_RUNNING_CODE = 5
+PIP_TERMINATION_UNCONFIRMED_CODE = 6
+UPDATE_POLL_MS = 300
 
-def _start_update_supervisor(ui, *, root: Path | None = None, popen=None, show_error=None) -> bool:
-    """Start the resident-aware updater without initiating local shutdown.
 
-    The supervisor is the only component allowed to request
-    ``shutdown_for_update``.  This helper deliberately leaves the current UI and
-    runtime alive until that command reaches ``RuntimeLifecycleManager``.
-    """
+def _set_update_button_state(ui, state: str) -> None:
+    button = getattr(ui, 'update_button', None)
+    if button is None:
+        return
+    try:
+        button.configure(state=state)
+    except Exception:
+        pass
+
+
+def _update_status_token(path: Path) -> str:
+    try:
+        data = json.loads(Path(path).read_text(encoding='utf-8'))
+        if not isinstance(data, dict):
+            return ''
+        return '|'.join(
+            str(data.get(key) or '')
+            for key in ('timestamp', 'state', 'before', 'after', 'error', 'log')
+        )
+    except Exception:
+        return ''
+
+
+def _schedule_update_poll(ui, *, root: Path, consume_status=None) -> None:
+    tk_root = getattr(ui, 'root', None)
+    if tk_root is None:
+        return
+    try:
+        tk_root.after(
+            UPDATE_POLL_MS,
+            lambda: _poll_update_supervisor(ui, root=root, consume_status=consume_status),
+        )
+    except Exception:
+        # Tk may already be destroyed because shutdown_for_update succeeded.
+        return
+
+
+def _poll_update_supervisor(ui, *, root: Path, consume_status=None) -> None:
+    if not bool(getattr(ui, '_update_supervisor_active', False)):
+        return
+    proc = getattr(ui, '_update_supervisor_process', None)
+    if proc is None:
+        ui._update_supervisor_active = False
+        _set_update_button_state(ui, 'normal')
+        return
+    try:
+        rc = proc.poll()
+    except Exception as exc:
+        ui._update_supervisor_active = False
+        ui._update_supervisor_process = None
+        _set_update_button_state(ui, 'normal')
+        try:
+            ui.status_var.set(f'No pude consultar el supervisor: {exc}')
+        except Exception:
+            pass
+        return
+
+    if rc is None:
+        try:
+            ui.status_var.set('Actualización en curso…')
+        except Exception:
+            pass
+        _schedule_update_poll(ui, root=root, consume_status=consume_status)
+        return
+
+    ui._update_supervisor_active = False
+    ui._update_supervisor_process = None
+    _set_update_button_state(ui, 'normal')
+
+    if int(rc) == SUPERVISOR_ALREADY_RUNNING_CODE:
+        try:
+            ui.status_var.set('Ya existe una actualización en curso.')
+            if hasattr(ui, '_append'):
+                ui._append('system', 'Ya existe una actualización en curso; no inicié otro supervisor.')
+        except Exception:
+            pass
+        return
+
+    consumed = False
+    if callable(consume_status):
+        try:
+            consumed = bool(consume_status(only_if_new=True))
+        except TypeError:
+            consumed = bool(consume_status())
+        except Exception:
+            consumed = False
+
+    if consumed:
+        return
+    try:
+        if int(rc) == 4:
+            ui.status_var.set('No se pudo coordinar la actualización; Nova continúa abierta.')
+        elif int(rc) == PIP_TERMINATION_UNCONFIRMED_CODE:
+            ui.status_var.set('Actualización detenida por seguridad: terminación de pip no confirmada.')
+        elif int(rc) != 0:
+            ui.status_var.set(f'El supervisor terminó con código {rc}; revisa el estado de actualización.')
+        else:
+            ui.status_var.set('El supervisor terminó; no publicó un resultado nuevo.')
+    except Exception:
+        pass
+
+
+def _start_update_supervisor(ui, *, root: Path | None = None, popen=None, show_error=None, consume_status=None) -> bool:
+    """Start one resident-aware updater without initiating local shutdown."""
     root = Path(root) if root is not None else Path(__file__).resolve().parent.parent
     runner = root / 'updater' / 'update_runner.py'
     py = root / '.venv' / 'Scripts' / 'python.exe'
@@ -24,7 +125,22 @@ def _start_update_supervisor(ui, *, root: Path | None = None, popen=None, show_e
         current = Path(sys.executable)
         py = current.with_name('python.exe') if current.name.casefold() == 'pythonw.exe' and current.with_name('python.exe').exists() else current
 
+    existing = getattr(ui, '_update_supervisor_process', None)
+    if bool(getattr(ui, '_update_supervisor_active', False)):
+        try:
+            if existing is None or existing.poll() is None:
+                ui.status_var.set('Actualización ya en curso.')
+                return False
+        except Exception:
+            ui.status_var.set('Actualización ya en curso.')
+            return False
+        ui._update_supervisor_active = False
+        ui._update_supervisor_process = None
+
     def report_error(message: str):
+        ui._update_supervisor_active = False
+        ui._update_supervisor_process = None
+        _set_update_button_state(ui, 'normal')
         try:
             ui.status_var.set('No pude iniciar el supervisor; Nova continúa abierta.')
         except Exception:
@@ -36,6 +152,9 @@ def _start_update_supervisor(ui, *, root: Path | None = None, popen=None, show_e
         report_error(f'Falta el supervisor de actualización:\n{runner}')
         return False
 
+    status_file = root / 'data' / 'update_last.json'
+    ui._update_status_before_supervisor = _update_status_token(status_file)
+    ui._update_supervisor_root = root
     try:
         ui.status_var.set('Iniciando supervisor de actualización…')
     except Exception:
@@ -43,7 +162,7 @@ def _start_update_supervisor(ui, *, root: Path | None = None, popen=None, show_e
 
     try:
         launcher = popen or subprocess.Popen
-        launcher(
+        proc = launcher(
             [str(py), str(runner), '--parent-pid', str(os.getpid())],
             cwd=str(root),
             creationflags=getattr(subprocess, 'CREATE_NEW_CONSOLE', 0),
@@ -52,10 +171,14 @@ def _start_update_supervisor(ui, *, root: Path | None = None, popen=None, show_e
         report_error(str(exc))
         return False
 
+    ui._update_supervisor_process = proc
+    ui._update_supervisor_active = True
+    _set_update_button_state(ui, 'disabled')
     try:
         ui.status_var.set('Actualización iniciada. Nova permanecerá activa hasta que el supervisor solicite el cierre.')
     except Exception:
         pass
+    _schedule_update_poll(ui, root=root, consume_status=consume_status)
     return True
 
 
@@ -81,41 +204,72 @@ def install_ui_v060():
         tk.Label(bar, textvariable=self.workspace_var, anchor='w').pack(side='left', padx=(6, 8), fill='x', expand=True)
         tk.Button(bar, text='📁 Proyectos', command=self.show_workspace_manager, width=12).pack(side='right')
         tk.Button(bar, text='🩺 Doctor', command=self.quick_doctor, width=10).pack(side='right', padx=(0, 6))
-        tk.Button(bar, text='⬆ Actualizar', command=self.quick_update, width=11).pack(side='right', padx=(0, 6))
+        self.update_button = tk.Button(bar, text='⬆ Actualizar', command=self.quick_update, width=11)
+        self.update_button.pack(side='right', padx=(0, 6))
         self._append('system', 'v0.6.x: Memory, Workspace Intelligence y actualización nativa desde GitHub.')
 
     def init(self, *a, **kw):
         self.workspace_window = None; self.workspace_listbox = None; self.workspace_rows = []
+        self._update_supervisor_process = None
+        self._update_supervisor_active = False
+        self._update_supervisor_root = Path(__file__).resolve().parent.parent
+        self._update_status_before_supervisor = ''
+        self._last_update_status_token = ''
         original_init(self, *a, **kw)
         self.root.title(f'{self.name} · Asistente local')
         self.root.after(280, self._refresh_workspace_label)
         self.root.after(900, self._consume_update_status)
 
-    def consume_update_status(self):
-        path = Path(__file__).resolve().parent.parent / 'data' / 'update_last.json'
-        if not path.exists():
-            return
+    def consume_update_status(self, only_if_new=False):
+        root = Path(getattr(self, '_update_supervisor_root', Path(__file__).resolve().parent.parent))
+        path = root / 'data' / 'update_last.json'
+        if not path.exists() or bool(getattr(self, '_update_supervisor_active', False)):
+            return False
         try:
             data = json.loads(path.read_text(encoding='utf-8'))
+            if not isinstance(data, dict):
+                return False
+            token = _update_status_token(path)
+            if only_if_new and token and token == str(getattr(self, '_update_status_before_supervisor', '') or ''):
+                return False
+            if token and token == str(getattr(self, '_last_update_status_token', '') or ''):
+                return False
+            self._last_update_status_token = token
             path.unlink(missing_ok=True)
             before = str(data.get('before') or '?')
             after = str(data.get('after') or '?')
             log = str(data.get('log') or '')
+            state = str(data.get('state') or '')
             tray = getattr(self, 'tray_controller', None)
             if data.get('ok'):
                 self._append('system', f'Actualización completada: Nova {before} → {after}.')
                 self.status_var.set(f'Nova {after} · actualización correcta')
                 if tray is not None:
                     tray.notify('update_finished', 'Nova actualizada', f'Actualización a Nova {after} completada.')
-            else:
-                error = str(data.get('error') or 'Error desconocido')
-                self._append('system', f'La actualización no se pudo completar. Nova se reinició sin quedar cerrada.\n{error}\nLog: {log}')
-                self.status_var.set('La actualización falló; Nova fue restaurada/reiniciada')
-                if tray is not None:
-                    tray.notify('update_error', 'Nova necesita atención', 'La actualización no pudo completarse. Abre Nova para revisarla.')
-                messagebox.showwarning('Nova · Actualización', f'La actualización no se completó.\n\n{error}\n\nLog:\n{log}', parent=self.root)
+                return True
+
+            error = str(data.get('error') or 'Error desconocido')
+            if state == 'coordination_failed':
+                self._append('system', f'No se pudo iniciar la actualización y Nova permaneció abierta.\n{error}\nLog: {log}')
+                self.status_var.set('No se pudo coordinar la actualización; Nova continúa abierta')
+                messagebox.showwarning('Nova · Actualización', f'La actualización no pudo comenzar.\n\n{error}\n\nLog:\n{log}', parent=self.root)
+                return True
+            if state == 'pip_termination_unconfirmed':
+                pids = [int(pid) for pid in (data.get('remaining_pids') or []) if str(pid).isdigit() and int(pid) > 0]
+                pid_text = ('\nPID restantes: ' + ', '.join(str(pid) for pid in pids)) if pids else ''
+                self._append('system', f'Actualización detenida por seguridad: no se confirmó la terminación de pip. No se relanzó Nova automáticamente.\n{error}{pid_text}\nLog: {log}')
+                self.status_var.set('Recuperación pendiente · terminación de pip no confirmada')
+                messagebox.showwarning('Nova · Recuperación requerida', f'{error}{pid_text}\n\nLog:\n{log}', parent=self.root)
+                return True
+
+            self._append('system', f'La actualización no se pudo completar. Nova se reinició sin quedar cerrada.\n{error}\nLog: {log}')
+            self.status_var.set('La actualización falló; Nova fue restaurada/reiniciada')
+            if tray is not None:
+                tray.notify('update_error', 'Nova necesita atención', 'La actualización no pudo completarse. Abre Nova para revisarla.')
+            messagebox.showwarning('Nova · Actualización', f'La actualización no se completó.\n\n{error}\n\nLog:\n{log}', parent=self.root)
+            return True
         except Exception:
-            pass
+            return False
 
     def refresh_label(self):
         try:
@@ -182,7 +336,9 @@ def install_ui_v060():
     def quick_update(self):
         return _start_update_supervisor(
             self,
+            root=Path(getattr(self, '_update_supervisor_root', Path(__file__).resolve().parent.parent)),
             show_error=lambda title, message: messagebox.showerror(title, message, parent=self.root),
+            consume_status=self._consume_update_status,
         )
 
     UI._build = build; UI.__init__ = init; UI._refresh_workspace_label = refresh_label; UI._refresh_workspace_manager = refresh_manager
