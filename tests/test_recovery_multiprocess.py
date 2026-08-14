@@ -94,7 +94,11 @@ class RecoveryMultiprocessTests(unittest.TestCase):
             first = ctx.Process(target=_recovery_worker, args=(str(root), str(backup_root), str(lock_dir), entered, release, results, str(launch_log), True))
             first.start()
             self.assertTrue(entered.wait(15), "first recovery did not enter restore")
-            second = ctx.Process(target=_recovery_worker, args=(str(root), str(backup_root), str(lock_dir), ctx.Event(), ctx.Event(), results, str(launch_log), False))
+            # Keep these semaphore-backed objects referenced by the parent until
+            # the spawned child has rebuilt them. Creating them inline lets the
+            # resource tracker unlink them before spawn completes on Linux.
+            second_entered = ctx.Event(); second_release = ctx.Event()
+            second = ctx.Process(target=_recovery_worker, args=(str(root), str(backup_root), str(lock_dir), second_entered, second_release, results, str(launch_log), False))
             second.start(); second.join(15)
             self.assertFalse(second.is_alive(), "second recovery did not return while lock was held")
             second_result = results.get(timeout=5)
