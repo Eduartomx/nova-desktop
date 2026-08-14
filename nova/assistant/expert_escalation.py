@@ -4,8 +4,13 @@ from __future__ import annotations
 
 The escalation implementation remains unchanged in ``expert_escalation_legacy``.
 Only its connection context is hardened so every existing transaction closes the
-SQLite handle deterministically on Windows.
+SQLite handle deterministically on Windows. Public module assignments are
+mirrored into the preserved implementation so resilience patches keep their
+pre-facade module-global semantics.
 """
+
+import sys
+import types
 
 try:
     from . import expert_escalation_legacy as _legacy
@@ -41,5 +46,13 @@ def _connect_and_close(self):
     return _ClosingSQLiteContext(conn)
 
 
+class _ExpertEscalationProxyModule(types.ModuleType):
+    def __setattr__(self, name, value):
+        super().__setattr__(name, value)
+        if not name.startswith("__") and hasattr(_legacy, name):
+            setattr(_legacy, name, value)
+
+
 _legacy.ExpertEscalation._connect = _connect_and_close
 ExpertEscalation = _legacy.ExpertEscalation
+sys.modules[__name__].__class__ = _ExpertEscalationProxyModule
