@@ -71,6 +71,12 @@ class UpdaterTransactionTests(unittest.TestCase):
         self.assertTrue(rows)
         return rows[-1]
 
+    def assert_previous_tree_preserved_with_recovery_marker(self, root: Path, before: dict[str, str]):
+        after = snapshot_tree(root)
+        for rel, digest in before.items():
+            self.assertEqual(after.get(rel), digest, rel)
+        self.assertEqual(set(after) - set(before), {"data/update_recovery.json"})
+
     def test_validation_failure_restores_tree_byte_for_byte_without_dependency_uncertainty(self):
         _base, root, stage, backups, managed, original, new = self.fixture()
         before = snapshot_tree(root)
@@ -143,7 +149,7 @@ class UpdaterTransactionTests(unittest.TestCase):
                 nova_updater.execute_transaction(stage, list(new), set(original), "v-new", "old", "new", backup_root=backups)
         install.assert_called_once_with()
         validate.assert_not_called()
-        self.assertEqual(snapshot_tree(root), before)
+        self.assert_previous_tree_preserved_with_recovery_marker(root, before)
         backup = self.latest_backup(backups)
         status = json.loads((backup / "rollback_status.json").read_text(encoding="utf-8"))
         self.assertTrue(status["files_rollback_ok"])
@@ -164,7 +170,7 @@ class UpdaterTransactionTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "entorno Python puede haber cambiado"):
                 nova_updater.execute_transaction(stage, list(new), set(original), "v-new", "old", "new", backup_root=backups)
         install.assert_called_once_with()
-        self.assertEqual(snapshot_tree(root), before)
+        self.assert_previous_tree_preserved_with_recovery_marker(root, before)
         status = json.loads((self.latest_backup(backups) / "rollback_status.json").read_text(encoding="utf-8"))
         self.assertTrue(status["files_rollback_ok"])
         self.assertTrue(status["dependencies_may_have_changed"])
