@@ -8,6 +8,7 @@ activo por defecto. El aprendizaje por título aislado se rechaza para reducir
 falsos positivos y envenenamiento por texto externo.
 """
 
+from contextlib import contextmanager
 import json
 import sqlite3
 import threading
@@ -84,8 +85,23 @@ class WorkspaceAutoDetector:
         conn.execute("PRAGMA busy_timeout=5000")
         return conn
 
+    @contextmanager
+    def _db(self):
+        """Transaction scope that also closes SQLite deterministically.
+
+        ``sqlite3.Connection.__exit__`` commits/rolls back but does not close the
+        handle. Explicit close matters on Windows where an open DB prevents
+        temporary/update directories from being removed.
+        """
+        conn = self._connect()
+        try:
+            with conn:
+                yield conn
+        finally:
+            conn.close()
+
     def _init_db(self):
-        with self._connect() as conn:
+        with self._db() as conn:
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS workspace_app_associations (
@@ -140,7 +156,7 @@ class WorkspaceAutoDetector:
             return None
         self._last_learn_at[key] = now
 
-        with self._lock, self._connect() as conn:
+        with self._lock, self._db() as conn:
             row = conn.execute(
                 "SELECT * FROM workspace_app_associations WHERE process_name=? AND app_kind=? AND workspace_id=?",
                 (proc, kind, int(workspace_id)),
@@ -161,9 +177,6 @@ class WorkspaceAutoDetector:
                     (proc, kind, int(workspace_id), confirmations, strong_count, confidence, str(source)[:40]),
                 )
 
-            # Evidencia fuerte para un workspace contradice asociaciones competidoras
-            # del mismo proceso/tipo. Esto evita que una app genérica se quede pegada
-            # para siempre a un proyecto antiguo.
             if strong:
                 others = conn.execute(
                     "SELECT id,confirmations,strong_confirmations,contradictions,pinned FROM workspace_app_associations WHERE process_name=? AND app_kind=? AND workspace_id<>?",
@@ -198,8 +211,6 @@ class WorkspaceAutoDetector:
         strong = reason.startswith("cwd dentro") and confidence >= 0.95
         corroborated = bool(active and str(active.get("id")) == str(probable.get("id")) and confidence >= 0.88)
 
-        # Un título de ventana aislado nunca entrena la asociación. Solo se acepta
-        # si el workspace activo elegido por el usuario corrobora la coincidencia.
         if not strong and not corroborated:
             return {"ok": True, "learned": False, "reason": "untrusted_or_weak_evidence"}
         if not self._allowed_kind(app_kind):
@@ -228,7 +239,7 @@ class WorkspaceAutoDetector:
             sql += " WHERE " + " AND ".join(where)
         sql += " ORDER BY pinned DESC, confidence DESC, last_seen DESC LIMIT ?"
         values.append(max(1, min(int(limit), 200)))
-        with self._lock, self._connect() as conn:
+        with self._lock, self._db() as conn:
             rows = conn.execute(sql, tuple(values)).fetchall()
         out = []
         for row in rows:
@@ -298,7 +309,7 @@ class WorkspaceAutoDetector:
         kind = _norm(external.get("app_kind"))
         if not proc or not kind:
             return {"ok": False, "error": "No pude identificar la aplicación actual."}
-        with self._lock, self._connect() as conn:
+        with self._lock, self._db() as conn:
             row = conn.execute(
                 "SELECT * FROM workspace_app_associations WHERE process_name=? AND app_kind=? AND workspace_id=?",
                 (proc, kind, int(ws["id"])),
@@ -330,7 +341,7 @@ class WorkspaceAutoDetector:
             values.append(int(workspace_id))
         if not clauses:
             return {"ok": False, "error": "Se requiere al menos un filtro para olvidar asociaciones."}
-        with self._lock, self._connect() as conn:
+        with self._lock, self._db() as conn:
             cur = conn.execute("DELETE FROM workspace_app_associations WHERE " + " AND ".join(clauses), tuple(values))
             deleted = int(cur.rowcount or 0)
             conn.commit()
