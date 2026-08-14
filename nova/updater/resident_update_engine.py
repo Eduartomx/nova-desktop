@@ -1,156 +1,140 @@
 from __future__ import annotations
 
-"""Hardened resident update entry used only after update_runner coordination.
+"""Import-only resident update transaction orchestrator.
 
-It reuses Nova's existing GitHub download/staging/backup implementation while
-replacing dependency execution and transaction recovery with the v0.9.9
-Job-Object/quarantine contract.
+The low-level dependency launcher lives in resident_engine_core; all installation
+mutation remains in this module and is reachable only through the supervisor.
 """
 
-import argparse
+import os
 from pathlib import Path
-import subprocess
-import sys
+from typing import Any
 
 try:
-    from . import nova_updater as base
-    from .pip_safety import (
-        PipContainmentSetupError,
-        PipTerminationResult,
-        launch_pip_process,
-        terminate_pip_tree,
-        verify_normal_completion,
+    from .resident_engine_core import (
+        DIRECT_EXECUTION_BLOCKED_EXIT_CODE, PIP_TERMINATION_UNCONFIRMED_EXIT_CODE,
+        RECOVERY_REQUIRED_EXIT_CODE, CrashHook, DependencyInstallError,
+        PipTerminationUnconfirmedError, RecoveryRequiredError, _base_root,
+        _ensure_no_recovery_pending, _hook, _install_requirements, _process_identity,
+        base,
     )
-    from .recovery_bootstrap import create_quarantine_journal, create_rollback_recovery_journal
-    from .recovery_state import RecoveryJournalError, load_journal
-except ImportError:  # direct script execution
-    import nova_updater as base
-    from pip_safety import (
-        PipContainmentSetupError,
-        PipTerminationResult,
-        launch_pip_process,
-        terminate_pip_tree,
-        verify_normal_completion,
+    from .recovery_state import (
+        RecoveryJournalError, append_journal_error, capture_dependency_snapshot,
+        create_transaction_journal, load_journal, prepare_stable_recovery_runtime,
+        restore_backup_idempotent, transition_journal, validate_backup_path,
+        validate_restored_install,
     )
-    from recovery_bootstrap import create_quarantine_journal, create_rollback_recovery_journal
-    from recovery_state import RecoveryJournalError, load_journal
+except ImportError:
+    from resident_engine_core import (
+        DIRECT_EXECUTION_BLOCKED_EXIT_CODE, PIP_TERMINATION_UNCONFIRMED_EXIT_CODE,
+        RECOVERY_REQUIRED_EXIT_CODE, CrashHook, DependencyInstallError,
+        PipTerminationUnconfirmedError, RecoveryRequiredError, _base_root,
+        _ensure_no_recovery_pending, _hook, _install_requirements, _process_identity,
+        base,
+    )
+    from recovery_state import (
+        RecoveryJournalError, append_journal_error, capture_dependency_snapshot,
+        create_transaction_journal, load_journal, prepare_stable_recovery_runtime,
+        restore_backup_idempotent, transition_journal, validate_backup_path,
+        validate_restored_install,
+    )
 
-PIP_TERMINATION_UNCONFIRMED_EXIT_CODE = 6
-RECOVERY_REQUIRED_EXIT_CODE = 7
+def _apply_transaction(stage: Path, manifest: dict[str, list[str]], *, crash_hook: CrashHook | None = None) -> None:
+    lists = base._validated_manifest_lists(manifest)
+    replace_rows = list(lists["modified_existing"] + lists["created_new"])
+    delete_rows = list(lists["deleted_existing"])
+    total = len(replace_rows) + len(delete_rows)
+    midpoint = max(1, (total + 1) // 2)
+    completed = 0
+    first_replaced = False
+    midpoint_fired = False
+    for rel in replace_rows:
+        rel_path = base.safe_rel(rel)
+        base._atomic_replace_from(Path(stage) / rel_path, Path(base.ROOT) / rel_path)
+        completed += 1
+        if not first_replaced:
+            first_replaced = True
+            _hook(crash_hook, "after_first_file", rel=rel, completed=completed, total=total)
+        if not midpoint_fired and completed >= midpoint:
+            midpoint_fired = True
+            _hook(crash_hook, "mid_apply", rel=rel, completed=completed, total=total)
+    for rel in delete_rows:
+        target = Path(base.ROOT) / base.safe_rel(rel)
+        if target.exists() and not target.is_file():
+            raise RuntimeError(f"No se puede eliminar destino no-archivo: {rel}")
+        if target.is_file():
+            target.unlink()
+        completed += 1
+        if not midpoint_fired and completed >= midpoint:
+            midpoint_fired = True
+            _hook(crash_hook, "mid_apply", rel=rel, completed=completed, total=total)
 
 
-class DependencyInstallError(RuntimeError):
-    def __init__(self, message: str, *, dependency_started: bool, termination: PipTerminationResult | None = None):
-        super().__init__(message)
-        self.dependency_started = bool(dependency_started)
-        self.termination = termination
+def _dependency_validation_error(detail: str) -> bool:
+    return str(detail or "").startswith(("dependency_", "critical_import_"))
 
 
-class PipTerminationUnconfirmedError(DependencyInstallError):
-    def __init__(self, message: str, result: PipTerminationResult):
-        super().__init__(message, dependency_started=True, termination=result)
-        self.result = result
-
-
-class RecoveryRequiredError(RuntimeError):
-    pass
-
-
-def _ensure_no_recovery_pending() -> None:
-    """Second fail-closed gate before GitHub access, staging or file writes."""
-    try:
-        journal = load_journal(base.ROOT)
-    except RecoveryJournalError as exc:
-        raise RecoveryRequiredError(
-            f"journal de recuperación no verificable: {type(exc).__name__}"
-        ) from exc
-    if journal is not None and bool(journal.get("recovery_required")) and journal.get("state") != "cleared":
-        raise RecoveryRequiredError(
-            f"recuperación persistente activa: {journal.get('state') or 'unknown'}"
+def _rollback_after_failure(
+    root: Path,
+    backup: Path,
+    journal: dict[str, Any],
+    update_error: BaseException,
+    *,
+    backup_root: Path | None,
+    dependencies_may_have_changed: bool,
+    crash_hook: CrashHook | None,
+) -> None:
+    current = journal
+    if current["state"] != "rollback_in_progress":
+        current = transition_journal(
+            root, current, "rollback_in_progress", backup_root=backup_root,
+            dependencies_may_have_changed=bool(dependencies_may_have_changed),
+            files_rollback_attempted=True,
+            remaining_processes=[],
         )
+    _hook(crash_hook, "after_failure_before_rollback", state=current["state"])
+    restore_count = {"n": 0}
 
-
-def _install_requirements(timeout_seconds=None) -> bool:
-    req = base.ROOT / "requirements.txt"
-    if not req.exists():
-        return False
-    timeout = base._normalize_pip_timeout(timeout_seconds)
-    cmd = [sys.executable, "-m", "pip", "install", "-r", str(req)]
-    print(f"Actualizando dependencias Python (timeout {timeout:g}s; contención segura)...")
-    try:
-        proc = launch_pip_process(cmd, cwd=str(base.ROOT))
-    except PipContainmentSetupError as exc:
-        raise DependencyInstallError(
-            f"No pude establecer contención autoritativa para pip antes de ejecutarlo: {exc}",
-            dependency_started=False,
-        ) from exc
+    def progress(kind, count, rel):
+        restore_count["n"] = count
+        _hook(crash_hook, "mid_rollback", kind=kind, count=count, rel=rel)
 
     try:
-        return_code = int(proc.wait(timeout=timeout))
-    except subprocess.TimeoutExpired as exc:
-        result = terminate_pip_tree(proc, base.PIP_TERMINATE_GRACE_SECONDS)
-        if result.terminated_confirmed and result.rollback_allowed:
-            raise DependencyInstallError(
-                f"pip excedió el timeout de {timeout:g}s; la terminación del contenedor fue confirmada y el rollback puede ejecutarse.",
-                dependency_started=True,
-                termination=result,
-            ) from exc
-        raise PipTerminationUnconfirmedError(
-            f"pip excedió el timeout de {timeout:g}s y su terminación completa no pudo demostrarse; se activa cuarentena persistente.",
-            result,
-        ) from exc
-    except Exception as exc:
-        result = terminate_pip_tree(proc, base.PIP_TERMINATE_GRACE_SECONDS)
-        if result.terminated_confirmed and result.rollback_allowed:
-            raise DependencyInstallError(
-                f"falló la espera de pip ({type(exc).__name__}); contenedor terminado de forma verificable.",
-                dependency_started=True,
-                termination=result,
-            ) from exc
-        raise PipTerminationUnconfirmedError(
-            f"falló la espera de pip ({type(exc).__name__}) y la terminación no pudo confirmarse; se activa cuarentena persistente.",
-            result,
-        ) from exc
+        restore_backup_idempotent(root, backup, backup_root=backup_root, progress_hook=progress)
+    except BaseException as exc:
+        if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+            raise
+        try:
+            append_journal_error(root, current, f"rollback_failed:{type(exc).__name__}", backup_root=backup_root)
+        except Exception:
+            pass
+        raise RecoveryRequiredError(f"rollback incompleto; backup preservado: {type(exc).__name__}") from update_error
 
-    completion = verify_normal_completion(proc, base.PIP_TERMINATE_GRACE_SECONDS)
-    if completion is not None:
-        if not completion.terminated_confirmed or not completion.rollback_allowed:
-            raise PipTerminationUnconfirmedError(
-                "pip terminó su proceso raíz, pero el Job Object no pudo confirmar que no quedaran descendientes activos.",
-                completion,
+    _hook(crash_hook, "after_restore_before_validation", operations=restore_count["n"])
+    current = transition_journal(
+        root, current, "rollback_completed", backup_root=backup_root,
+        files_rollback_attempted=True, files_rollback_ok=True,
+    )
+    current = transition_journal(root, current, "rollback_validation_in_progress", backup_root=backup_root)
+    valid, detail = validate_restored_install(root, current, backup)
+    if not valid:
+        if current.get("dependencies_may_have_changed") and _dependency_validation_error(detail):
+            transition_journal(
+                root, current, "dependency_repair_required", backup_root=backup_root,
+                errors=(list(current.get("errors") or []) + [str(detail)])[-128:],
             )
-        if not str(completion.detail).startswith("normal Job Object completion confirmed"):
-            raise DependencyInstallError(
-                "pip dejó descendientes después de finalizar y fue necesario terminar el Job Object; se requiere rollback.",
-                dependency_started=True,
-                termination=completion,
-            )
-    if return_code != 0:
-        raise DependencyInstallError("pip install -r requirements.txt falló", dependency_started=True, termination=completion)
-    return True
-
-
-def _write_quarantine_compat_status(backup: Path, journal: dict) -> None:
-    payload = {
-        "ok": False,
-        "status": "pip_termination_unconfirmed",
-        "state": "pip_termination_unconfirmed",
-        "files_rollback_ok": False,
-        "files_rollback_attempted": False,
-        "dependencies_may_have_changed": True,
-        "recovery_required": True,
-        "remaining_processes": list(journal.get("remaining_processes") or []),
-        "errors": list(journal.get("errors") or []),
-        "backup_path": str(journal.get("backup_path") or ""),
-        "attempt_id": str(journal.get("attempt_id") or ""),
-        "generation": int(journal.get("generation") or 1),
-        "message": "Terminación de pip no confirmada; cuarentena persistente activa.",
-        "timestamp": str(journal.get("updated_at") or ""),
-    }
-    try:
-        base._atomic_write_json(Path(backup) / "rollback_status.json", payload)
-    except Exception:
-        pass
+            raise RecoveryRequiredError(f"dependency_repair_required:{detail}") from update_error
+        append_journal_error(root, current, detail, backup_root=backup_root)
+        raise RecoveryRequiredError(f"rollback validation failed:{detail}") from update_error
+    current = transition_journal(
+        root, current, "rollback_validation_completed", backup_root=backup_root,
+        validation_detail=str(detail)[:500],
+    )
+    _hook(crash_hook, "after_validation_before_clear", state=current["state"])
+    transition_journal(
+        root, current, "cleared", backup_root=backup_root,
+        files_rollback_attempted=True, files_rollback_ok=True,
+    )
 
 
 def execute_transaction(
@@ -163,124 +147,169 @@ def execute_transaction(
     *,
     backup_root: Path | None = None,
     pip_timeout_seconds=None,
+    crash_hook: CrashHook | None = None,
 ):
-    _ensure_no_recovery_pending()
+    root = Path(base.ROOT)
+    _ensure_no_recovery_pending(root)
     manifest = base.build_transaction(stage, new_files, previous)
-    touched = manifest["modified_existing"] + manifest["deleted_existing"] + manifest["created_new"]
-    if not touched:
-        base.write_managed(new_files, tag)
-        return None, manifest
-
     backup = base.create_backup(manifest, old_version, new_version, backup_root=backup_root)
+    backup = validate_backup_path(root, backup, backup_root=backup_root)
     print(f"Backup: {backup}")
-    dependencies_started = False
+
+    journal = create_transaction_journal(root, backup, backup_root=backup_root)
+    _hook(crash_hook, "after_journal_before_files", attempt_id=journal["attempt_id"], generation=journal["generation"])
+
     requirements_changed = "requirements.txt" in set(manifest["modified_existing"] + manifest["created_new"])
     try:
-        base.apply_transaction(stage, manifest)
+        prepare_stable_recovery_runtime(root)
+
         if requirements_changed:
-            try:
-                dependencies_started = bool(_install_requirements(timeout_seconds=pip_timeout_seconds))
-            except DependencyInstallError as exc:
-                dependencies_started = bool(exc.dependency_started)
-                raise
+            snapshot_rel, snapshot_sha = capture_dependency_snapshot(root, backup, backup_root=backup_root)
+            journal = transition_journal(
+                root, journal, "transaction_prepared", backup_root=backup_root,
+                dependency_snapshot_path=snapshot_rel,
+                dependency_snapshot_sha256=snapshot_sha,
+            )
+
+        journal = transition_journal(
+            root, journal, "files_applying", backup_root=backup_root,
+            files_may_have_changed=True,
+        )
+        _apply_transaction(stage, manifest, crash_hook=crash_hook)
+        base.write_managed(new_files, tag)
+        journal = transition_journal(root, journal, "files_applied", backup_root=backup_root)
+        _hook(crash_hook, "after_files_applied", state=journal["state"])
+
+        if requirements_changed:
+            journal = transition_journal(
+                root, journal, "dependencies_starting", backup_root=backup_root,
+                dependencies_may_have_changed=True,
+            )
+            _hook(crash_hook, "after_dependencies_may_change_before_pip", state=journal["state"])
+
+            def on_started(proc):
+                nonlocal journal
+                identities, identity_complete = _process_identity(proc)
+                journal = transition_journal(
+                    root, journal, "dependencies_running", backup_root=backup_root,
+                    remaining_processes=identities,
+                    identity_verification_required=(os.name != "nt" and not identity_complete),
+                )
+                _hook(crash_hook, "dependencies_running", pid=int(getattr(proc, "pid", 0) or 0), state=journal["state"])
+
+            _install_requirements(timeout_seconds=pip_timeout_seconds, on_started=on_started)
+            journal = transition_journal(
+                root, journal, "update_validation_in_progress", backup_root=backup_root,
+                remaining_processes=[], identity_verification_required=False,
+            )
+        else:
+            journal = transition_journal(root, journal, "update_validation_in_progress", backup_root=backup_root)
+
         ok, detail = base.validate_install()
         if not ok:
             raise RuntimeError(detail)
+        journal = transition_journal(
+            root, journal, "update_validated", backup_root=backup_root,
+            validation_detail=str(detail)[:500],
+        )
+        _hook(crash_hook, "after_update_validated_before_clear", state=journal["state"])
+        transition_journal(root, journal, "cleared", backup_root=backup_root)
         print(detail)
-        base.write_managed(new_files, tag)
         return backup, manifest
+
     except PipTerminationUnconfirmedError as update_error:
         result = update_error.result
-        print("La terminación de pip no pudo confirmarse; se conserva el backup y se activa cuarentena persistente.")
-        journal = create_quarantine_journal(
-            base.ROOT,
-            backup,
-            backup_root=Path(backup_root) if backup_root is not None else None,
-            remaining_processes=list(result.remaining_processes or []),
-            errors=list(result.termination_errors or []),
-            recovery_detail=str(update_error),
-            identity_verification_required=not bool(result.identity_inspection_complete),
-        )
-        _write_quarantine_compat_status(backup, journal)
-        raise
-    except Exception as update_error:
-        if isinstance(update_error, DependencyInstallError):
-            dependencies_started = bool(update_error.dependency_started)
-        print("La actualización falló; restaurando transacción cuando es seguro...")
-        rollback_ok = False
-        rollback_error = None
         try:
-            base.restore_backup(
-                backup,
-                dependencies_may_have_changed=False,
-                recovery_detail=str(update_error),
-            )
-            rollback_ok = True
+            journal = load_journal(root, backup_root=backup_root) or journal
+            if journal["state"] != "pip_termination_unconfirmed":
+                journal = transition_journal(
+                    root, journal, "pip_termination_unconfirmed", backup_root=backup_root,
+                    dependencies_may_have_changed=True,
+                    remaining_processes=list(result.remaining_processes or []),
+                    identity_verification_required=not bool(result.identity_inspection_complete),
+                    errors=(list(journal.get("errors") or []) + list(result.termination_errors or []))[-128:],
+                )
+        except Exception as state_error:
+            raise RecoveryRequiredError(f"no se pudo persistir cuarentena de pip:{type(state_error).__name__}") from update_error
+        raise
+    except BaseException as update_error:
+        if isinstance(update_error, (KeyboardInterrupt, SystemExit)):
+            raise
+        current = load_journal(root, backup_root=backup_root)
+        if current is None or current.get("state") == "cleared":
+            raise RecoveryRequiredError("journal activo ausente durante una transacción mutante") from update_error
+        dependencies_changed = bool(current.get("dependencies_may_have_changed"))
+        if isinstance(update_error, DependencyInstallError) and not update_error.dependency_started:
+            dependencies_changed = False
+        _rollback_after_failure(
+            root, backup, current, update_error,
+            backup_root=backup_root,
+            dependencies_may_have_changed=dependencies_changed,
+            crash_hook=crash_hook,
+        )
+        raise
+
+
+def run_supervised_update(
+    root: Path | None = None,
+    *,
+    pip_timeout_seconds=None,
+    crash_hook: CrashHook | None = None,
+) -> int:
+    """Run one update while the caller owns supervisor + runtime guards."""
+    target_root = Path(root or getattr(base, "ROOT", Path(__file__).resolve().parents[1])).resolve()
+    with _base_root(target_root):
+        try:
+            _ensure_no_recovery_pending(target_root)
+            cfg = base.load_config()
+            current = base.version_text()
+            release = base.get_release(cfg)
+            latest = str(release.get("tag_name", "")).lstrip("vV")
+            notes = (release.get("body") or "").strip()
+            print("=" * 58)
+            print("NOVA UPDATER 2.4 - crash durable resident transaction")
+            print("=" * 58)
+            print(f"Repositorio : {cfg['repository']}")
+            print(f"Canal       : {cfg.get('channel', 'stable')}")
+            print(f"Instalada   : {current}")
+            print(f"Disponible  : {latest}")
+            if base.version_key(latest) <= base.version_key(current):
+                print("\nNova ya está actualizada.")
+                return 0
+            if notes:
+                print("\nCambios:\n" + notes[:2500])
+
+            old_execute = base.execute_transaction
+            def guarded_execute(stage, new_files, previous, tag, old_version, new_version, **kwargs):
+                return execute_transaction(
+                    stage, new_files, previous, tag, old_version, new_version,
+                    backup_root=kwargs.get("backup_root"),
+                    pip_timeout_seconds=pip_timeout_seconds if pip_timeout_seconds is not None else kwargs.get("pip_timeout_seconds"),
+                    crash_hook=crash_hook,
+                )
+            base.execute_transaction = guarded_execute
+            try:
+                base.sync_release(cfg, release)
+            finally:
+                base.execute_transaction = old_execute
+            print("\n" + "=" * 58)
+            print(f"NOVA {latest} INSTALADA DESDE GITHUB")
+            print("=" * 58)
+            return 0
+        except PipTerminationUnconfirmedError as exc:
+            print(f"[ERROR] {exc}")
+            return PIP_TERMINATION_UNCONFIRMED_EXIT_CODE
+        except RecoveryRequiredError as exc:
+            print(f"[RECOVERY REQUIRED] {exc}")
+            return RECOVERY_REQUIRED_EXIT_CODE
         except Exception as exc:
-            rollback_error = exc
-
-        if dependencies_started or not rollback_ok:
-            create_rollback_recovery_journal(
-                base.ROOT,
-                backup,
-                backup_root=Path(backup_root) if backup_root is not None else None,
-                rollback_ok=rollback_ok,
-                dependencies_may_have_changed=dependencies_started,
-                errors=[] if rollback_error is None else [f"rollback_failed:{type(rollback_error).__name__}"],
-                recovery_detail=str(update_error),
-            )
-            if rollback_error is not None:
-                raise RecoveryRequiredError(
-                    f"actualización falló y el rollback quedó incompleto; backup preservado: {type(rollback_error).__name__}"
-                ) from update_error
-            raise RecoveryRequiredError(
-                "archivos restaurados, pero las dependencias pudieron cambiar; recuperación/validación persistente requerida"
-            ) from update_error
-
-        raise update_error
+            print(f"[ERROR] {type(exc).__name__}: {exc}")
+            return 2
 
 
 def main(argv=None) -> int:
-    parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("--yes", action="store_true")
-    args, _unknown = parser.parse_known_args(argv)
-    if not args.yes:
-        print("[ERROR] resident_update_engine es un camino interno del supervisor.")
-        return 4
-    try:
-        _ensure_no_recovery_pending()
-        base.execute_transaction = execute_transaction
-        cfg = base.load_config()
-        current = base.version_text()
-        release = base.get_release(cfg)
-        latest = str(release.get("tag_name", "")).lstrip("vV")
-        notes = (release.get("body") or "").strip()
-        print("=" * 58)
-        print("NOVA UPDATER 2.3 - Resident recovery hardened")
-        print("=" * 58)
-        print(f"Repositorio : {cfg['repository']}")
-        print(f"Canal       : {cfg.get('channel', 'stable')}")
-        print(f"Instalada   : {current}")
-        print(f"Disponible  : {latest}")
-        if base.version_key(latest) <= base.version_key(current):
-            print("\nNova ya está actualizada.")
-            return 0
-        if notes:
-            print("\nCambios:\n" + notes[:2500])
-        base.sync_release(cfg, release)
-        print("\n" + "=" * 58)
-        print(f"NOVA {latest} INSTALADA DESDE GITHUB")
-        print("=" * 58)
-        return 0
-    except PipTerminationUnconfirmedError as exc:
-        print(f"[ERROR] {exc}")
-        return PIP_TERMINATION_UNCONFIRMED_EXIT_CODE
-    except RecoveryRequiredError as exc:
-        print(f"[RECOVERY REQUIRED] {exc}")
-        return RECOVERY_REQUIRED_EXIT_CODE
-    except Exception as exc:
-        print(f"[ERROR] {exc}")
-        return 2
+    print("[ERROR] resident_update_engine es import-only; usa updater/update_runner.py.")
+    return DIRECT_EXECUTION_BLOCKED_EXIT_CODE
 
 
 if __name__ == "__main__":
