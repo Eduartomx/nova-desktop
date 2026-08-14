@@ -2,24 +2,43 @@ import argparse
 import sys
 import traceback
 from pathlib import Path
-import tkinter as tk
+
+RECOVERY_REQUIRED_EXIT_CODE = 7
 
 
 def _arguments(argv=None):
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--background", action="store_true")
     parser.add_argument("--post-update", action="store_true")
+    parser.add_argument("--post-recovery", action="store_true")
     args, _unknown = parser.parse_known_args(argv)
     return args
 
 
-def _claim_instance():
-    """Claim the scoped runtime before importing the core or constructing Tk.
+def _startup_recovery_gate(argv=None):
+    """Run before instance ownership, Tk, Agent, or assistant imports."""
+    root = Path(__file__).resolve().parent
+    try:
+        from updater.recovery_bootstrap import startup_recovery_gate
+    except Exception as exc:
+        # If a recovery journal exists but the minimal bootstrap itself cannot
+        # be imported, fail closed instead of loading a possibly inconsistent
+        # assistant stack.
+        journal = root / "data" / "update_recovery.json"
+        if journal.exists():
+            print(f"Nova: recuperación pendiente; bootstrap no disponible ({type(exc).__name__}).", file=sys.stderr)
+            return False, RECOVERY_REQUIRED_EXIT_CODE
+        return True, 0
+    result = startup_recovery_gate(root)
+    if result.continue_startup:
+        return True, 0
+    # A completed recovery may already have launched one --post-recovery Nova;
+    # this bootstrap process exits rather than loading the normal application.
+    return False, int(result.exit_code or (0 if result.recovered and result.launched else RECOVERY_REQUIRED_EXIT_CODE))
 
-    Returns ``(lock, mailbox, exit_code)``. A secondary launch never creates
-    Agent/hotkeys/services; it only targets ``show`` to the exact owner
-    generation that currently holds the kernel lock.
-    """
+
+def _claim_instance():
+    """Claim the scoped runtime before importing the core or constructing Tk."""
     from assistant.instance_commands import InstanceCommandMailbox
     from assistant.instance_lock import InstanceLock, runtime_paths
 
@@ -42,11 +61,6 @@ def _claim_instance():
 
 
 def _cleanup_runtime_error(ui) -> None:
-    """Best-effort cleanup when Tk/mainloop itself failed.
-
-    The scheduled and synchronous shutdown attempts are intentionally isolated:
-    a broken ``root.after`` must never suppress the synchronous cleanup path.
-    """
     lifecycle = getattr(ui, "runtime_lifecycle", None) if ui is not None else None
     if lifecycle is None:
         return
@@ -65,6 +79,10 @@ def main(argv=None):
         print("Esta versión está preparada específicamente para Windows.")
         return 1
 
+    continue_startup, recovery_code = _startup_recovery_gate(argv)
+    if not continue_startup:
+        return int(recovery_code)
+
     args = _arguments(argv)
     instance_lock, command_mailbox, secondary_code = _claim_instance()
     if instance_lock is None:
@@ -74,6 +92,9 @@ def main(argv=None):
     ui = None
     exit_code = 0
     try:
+        # Tk and the assistant stack are intentionally imported only after the
+        # persistent recovery gate has allowed normal startup.
+        import tkinter as tk
         from assistant.core_runtime import install_core_runtime
         install_core_runtime()
         from assistant.config import load_config
@@ -85,20 +106,16 @@ def main(argv=None):
             load_config(),
             instance_lock=instance_lock,
             command_mailbox=command_mailbox,
-            start_hidden=bool(args.background and not args.post_update),
+            start_hidden=bool(args.background and not args.post_update and not args.post_recovery),
         )
         try:
             root.mainloop()
         except BaseException:
-            # A Tk/runtime error is a real shutdown, never a hide-to-tray action.
             _cleanup_runtime_error(ui)
             exit_code = 1
             raise
         return exit_code
     finally:
-        # The ownership lock deliberately outlives Tk destruction and every
-        # lifecycle cleanup step. The updater additionally waits for the owning
-        # process handle, so releasing here can never by itself authorize writes.
         try:
             instance_lock.release()
         except Exception:
@@ -113,6 +130,7 @@ def report_startup_error(exc: BaseException):
     except Exception:
         pass
     try:
+        import tkinter as tk
         err_root = tk.Tk()
         err_root.withdraw()
         from tkinter import messagebox
