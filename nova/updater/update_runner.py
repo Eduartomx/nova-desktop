@@ -65,6 +65,42 @@ def _strong_remaining_pids(root: Path) -> list[int]:
         return []
 
 
+def _append_log_best_effort(log: Path, text: str) -> None:
+    try:
+        log.parent.mkdir(parents=True, exist_ok=True)
+        with open(log, "a", encoding="utf-8", errors="replace") as stream:
+            stream.write(str(text))
+    except Exception:
+        pass
+
+
+def _read_version_best_effort(root: Path, fallback: str, log: Path, label: str) -> str:
+    try:
+        return read_version(root)
+    except Exception as exc:
+        _append_log_best_effort(log, f"\n[WARN VERSION {label}] {type(exc).__name__}: {exc}\n")
+        return fallback
+
+
+def _write_status_best_effort(root: Path, **kwargs) -> None:
+    try:
+        write_status(root, **kwargs)
+    except Exception as exc:
+        log = kwargs.get("log")
+        if log is not None:
+            _append_log_best_effort(Path(log), f"\n[WARN ESTADO] {type(exc).__name__}: {exc}\n")
+
+
+def _launch_recovery_once(root: Path, log: Path) -> tuple[bool, str]:
+    try:
+        launched, detail = launch_nova(root)
+    except Exception as exc:
+        launched, detail = False, f"{type(exc).__name__}: {exc}"
+    if not launched:
+        _append_log_best_effort(log, "\n[ERROR REINICIO] " + str(detail or "fallo desconocido") + "\n")
+    return bool(launched), str(detail or "")
+
+
 def main(argv=None, *, supervisor_lock_factory=None) -> int:
     parser = argparse.ArgumentParser(description="Supervisa una actualización de Nova y relanza la aplicación.")
     parser.add_argument("--parent-pid", type=int, default=0)
