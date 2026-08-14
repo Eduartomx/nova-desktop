@@ -66,7 +66,12 @@ class UpdaterTransactionTests(unittest.TestCase):
     def patch_install(self, root: Path, managed: Path):
         return mock.patch.multiple(nova_updater, ROOT=root, MANAGED_PATH=managed)
 
-    def test_validation_failure_restores_tree_byte_for_byte(self):
+    def latest_backup(self, backups: Path) -> Path:
+        rows = sorted(path for path in backups.iterdir() if path.is_dir())
+        self.assertTrue(rows)
+        return rows[-1]
+
+    def test_validation_failure_restores_tree_byte_for_byte_without_dependency_uncertainty(self):
         _base, root, stage, backups, managed, original, new = self.fixture()
         before = snapshot_tree(root)
         previous = set(original)
@@ -81,6 +86,11 @@ class UpdaterTransactionTests(unittest.TestCase):
         self.assertNotIn("assistant/created.py", after)
         self.assertEqual((root / "assistant/modified.py").read_bytes(), original["assistant/modified.py"])
         self.assertEqual((root / "assistant/deleted.py").read_bytes(), original["assistant/deleted.py"])
+        status = json.loads((self.latest_backup(backups) / "rollback_status.json").read_text(encoding="utf-8"))
+        self.assertTrue(status["files_rollback_ok"])
+        self.assertFalse(status["dependencies_may_have_changed"])
+        self.assertFalse(status["recovery_required"])
+        self.assertFalse((root / "data" / "update_recovery.json").exists())
 
     def test_injected_failure_after_real_copies_rolls_back_without_touching_unchanged(self):
         _base, root, stage, backups, managed, original, new = self.fixture()
@@ -105,7 +115,7 @@ class UpdaterTransactionTests(unittest.TestCase):
             with mock.patch.object(nova_updater, "_atomic_replace_from", side_effect=fail_after_copy):
                 with self.assertRaisesRegex(RuntimeError, "injected"):
                     nova_updater.apply_transaction(stage, manifest)
-            self.assertTrue((root / "assistant/created.py").is_file(), "failure must happen after a real created file was copied")
+            self.assertTrue((root / "assistant/created.py").is_file())
             self.assertEqual((root / "assistant/unchanged.py").read_bytes(), original["assistant/unchanged.py"])
             nova_updater.restore_backup(backup)
         self.assertEqual(snapshot_tree(root), before)
@@ -122,18 +132,56 @@ class UpdaterTransactionTests(unittest.TestCase):
             nova_updater.restore_backup(backup)
         self.assertEqual(managed.read_bytes(), managed_before)
 
-    def test_dependency_install_failure_is_rolled_back_without_running_pip(self):
+    def test_pip_failure_after_start_restores_files_but_marks_dependency_recovery_required(self):
         _base, root, stage, backups, managed, original, new = self.fixture()
         write_file(stage, "requirements.txt", b"package-new==2\n")
         before = snapshot_tree(root)
         with self.patch_install(root, managed), \
              mock.patch.object(nova_updater, "_install_requirements", side_effect=RuntimeError("simulated pip failure")) as install, \
              mock.patch.object(nova_updater, "validate_install") as validate:
-            with self.assertRaisesRegex(RuntimeError, "simulated pip failure"):
+            with self.assertRaisesRegex(RuntimeError, "entorno Python puede haber cambiado"):
                 nova_updater.execute_transaction(stage, list(new), set(original), "v-new", "old", "new", backup_root=backups)
         install.assert_called_once_with()
         validate.assert_not_called()
         self.assertEqual(snapshot_tree(root), before)
+        backup = self.latest_backup(backups)
+        status = json.loads((backup / "rollback_status.json").read_text(encoding="utf-8"))
+        self.assertTrue(status["files_rollback_ok"])
+        self.assertTrue(status["dependencies_may_have_changed"])
+        self.assertTrue(status["recovery_required"])
+        self.assertIn("requirements.txt no garantiza", status["message"])
+        recovery = json.loads((root / "data" / "update_recovery.json").read_text(encoding="utf-8"))
+        self.assertTrue(recovery["recovery_required"])
+        self.assertTrue(backup.is_dir())
+
+    def test_successful_pip_then_validation_failure_marks_dependency_uncertainty(self):
+        _base, root, stage, backups, managed, original, new = self.fixture()
+        write_file(stage, "requirements.txt", b"package-new==2\n")
+        before = snapshot_tree(root)
+        with self.patch_install(root, managed), \
+             mock.patch.object(nova_updater, "_install_requirements", return_value=None) as install, \
+             mock.patch.object(nova_updater, "validate_install", return_value=(False, "post-pip validation failed")):
+            with self.assertRaisesRegex(RuntimeError, "entorno Python puede haber cambiado"):
+                nova_updater.execute_transaction(stage, list(new), set(original), "v-new", "old", "new", backup_root=backups)
+        install.assert_called_once_with()
+        self.assertEqual(snapshot_tree(root), before)
+        status = json.loads((self.latest_backup(backups) / "rollback_status.json").read_text(encoding="utf-8"))
+        self.assertTrue(status["files_rollback_ok"])
+        self.assertTrue(status["dependencies_may_have_changed"])
+        self.assertTrue(status["recovery_required"])
+
+    def test_rollback_without_requirements_change_never_marks_dependency_uncertainty(self):
+        _base, root, stage, backups, managed, original, new = self.fixture()
+        with self.patch_install(root, managed), \
+             mock.patch.object(nova_updater, "_install_requirements") as install, \
+             mock.patch.object(nova_updater, "validate_install", return_value=(False, "validation failed")):
+            with self.assertRaisesRegex(RuntimeError, "validation failed"):
+                nova_updater.execute_transaction(stage, list(new), set(original), "v-new", "old", "new", backup_root=backups)
+        install.assert_not_called()
+        status = json.loads((self.latest_backup(backups) / "rollback_status.json").read_text(encoding="utf-8"))
+        self.assertTrue(status["files_rollback_ok"])
+        self.assertFalse(status["dependencies_may_have_changed"])
+        self.assertFalse(status["recovery_required"])
 
     def test_restore_failure_is_explicit_and_backup_is_preserved(self):
         _base, root, stage, backups, managed, original, new = self.fixture()
@@ -147,6 +195,8 @@ class UpdaterTransactionTests(unittest.TestCase):
             self.assertTrue(backup.is_dir())
             status = json.loads((backup / "rollback_status.json").read_text(encoding="utf-8"))
             self.assertFalse(status["ok"])
+            self.assertFalse(status["files_rollback_ok"])
+            self.assertTrue(status["recovery_required"])
             self.assertTrue(status["errors"])
             failure = json.loads((root / "data" / "update_rollback_failure.json").read_text(encoding="utf-8"))
             self.assertFalse(failure["ok"])
