@@ -20,15 +20,7 @@ except ImportError:
 
 
 def _lexical_relative(base: Path, target: Path) -> Path:
-    """Return target relative to base without following either path's symlinks.
-
-    This deliberately happens before ``resolve()``. On Windows a temporary path
-    may be expressed through an 8.3 alias while ``Path.resolve()`` expands only
-    one side to its long form; comparing those two lexical spellings directly
-    would reject a legitimate in-root backup. ``commonpath`` + ``normcase``
-    keeps the containment comparison case-insensitive on Windows without
-    treating symlink resolution as proof of safety.
-    """
+    """Return target relative to base without following either path's symlinks."""
     base_text = os.path.abspath(os.fspath(base))
     target_text = os.path.abspath(os.fspath(target))
     try:
@@ -46,13 +38,32 @@ def _lexical_relative(base: Path, target: Path) -> Path:
     return rel
 
 
+def _relative_to_authorized_root(raw_base: Path, target: Path) -> tuple[Path, Path]:
+    """Normalize Windows short/long aliases while preserving an authorized root.
+
+    The normal path is compared lexically before resolving anything. If Windows
+    has already canonicalized ``target`` (for example, a previous validation
+    expanded an 8.3 temporary-directory alias), the fallback compares it only
+    against the canonical form of the *same* already-validated root. An
+    external path still fails both comparisons, and symlink components are
+    checked separately before the target is trusted.
+    """
+    raw_base = Path(raw_base)
+    canonical_base = raw_base.resolve(strict=True)
+    target = Path(target)
+    try:
+        rel = _lexical_relative(raw_base, target)
+    except RecoveryJournalError:
+        rel = _lexical_relative(canonical_base, target)
+    return canonical_base, rel
+
+
 def _reject_symlink_chain(base: Path, target: Path) -> Path:
     """Reject symlink hops and return the canonical target below base."""
     raw_base = Path(base)
     if not raw_base.exists() or raw_base.is_symlink():
         raise RecoveryJournalError("authorized_root_unavailable_or_symlink")
-    rel = _lexical_relative(raw_base, Path(target))
-    canonical_base = raw_base.resolve(strict=True)
+    canonical_base, rel = _relative_to_authorized_root(raw_base, Path(target))
     current = canonical_base
     for part in rel.parts:
         current /= part
@@ -82,8 +93,7 @@ def validate_backup_path(root: Path, backup: Path, *, backup_root: Path | None =
     raw_base = Path(backup_root) if backup_root is not None else backup_root_path(root)
     if not raw_base.is_dir() or raw_base.is_symlink():
         raise RecoveryJournalError("authorized_backup_root_unavailable")
-    rel = _lexical_relative(raw_base, Path(backup))
-    base = raw_base.resolve(strict=True)
+    base, rel = _relative_to_authorized_root(raw_base, Path(backup))
     candidate = base / rel
     # Walk every component before resolving the candidate so a symlink can
     # never be used to make an external directory appear authorized.
