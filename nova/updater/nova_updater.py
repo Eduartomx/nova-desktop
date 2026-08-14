@@ -4,6 +4,7 @@ import argparse
 from datetime import datetime, timezone
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -19,6 +20,9 @@ APP_NAME = "Nova"
 UPDATER_VERSION = "2.2-resident-transactional"
 USER_AGENT = f"Nova-Updater/{UPDATER_VERSION}"
 TRANSACTION_CATEGORIES = ("modified_existing", "deleted_existing", "created_new", "unchanged")
+PIP_INSTALL_TIMEOUT_SECONDS = 15 * 60.0
+PIP_INSTALL_TIMEOUT_MAX_SECONDS = 60 * 60.0
+PIP_TERMINATE_GRACE_SECONDS = 10.0
 
 
 def find_nova_root() -> Path:
@@ -331,12 +335,26 @@ def apply_transaction(stage: Path, manifest: dict[str, list[str]]) -> None:
             target.unlink()
 
 
-def _dependency_recovery_message(backup: Path) -> str:
-    return (
-        "Los archivos administrados fueron restaurados, pero pip llegó a iniciarse y el entorno Python puede haber cambiado. "
-        f"Conserva el backup en {backup} y revisa la instalación/.venv antes de reintentar. "
-        "Volver a ejecutar requirements.txt no garantiza eliminar paquetes adicionales ni restaurar exactamente el entorno anterior."
-    )
+def _clean_recovery_detail(detail: str) -> str:
+    return str(detail or "").replace("\r", " ").replace("\n", " ").strip()[:1600]
+
+
+def _dependency_recovery_message(backup: Path, *, files_rollback_ok: bool = True, detail: str = "") -> str:
+    if files_rollback_ok:
+        message = (
+            "Los archivos administrados fueron restaurados, pero pip llegó a iniciarse y el entorno Python puede haber cambiado. "
+            f"Conserva el backup en {backup} y revisa la instalación/.venv antes de reintentar. "
+        )
+    else:
+        message = (
+            "El rollback de archivos quedó incompleto y pip llegó a iniciarse, por lo que también existe incertidumbre sobre el entorno Python. "
+            f"Conserva el backup en {backup} y realiza recuperación manual antes de reintentar. "
+        )
+    message += "Volver a ejecutar requirements.txt no garantiza eliminar paquetes adicionales ni restaurar exactamente el entorno anterior."
+    clean_detail = _clean_recovery_detail(detail)
+    if clean_detail:
+        message += " Detalle de la actualización: " + clean_detail
+    return message
 
 
 def _recovery_status_path() -> Path:
@@ -349,12 +367,20 @@ def _write_rollback_status(
     files_rollback_ok: bool,
     dependencies_may_have_changed: bool = False,
     errors: list[str] | None = None,
+    recovery_detail: str = "",
 ) -> dict:
     recovery_required = (not bool(files_rollback_ok)) or bool(dependencies_may_have_changed)
     if dependencies_may_have_changed:
-        message = _dependency_recovery_message(backup)
+        message = _dependency_recovery_message(
+            backup,
+            files_rollback_ok=files_rollback_ok,
+            detail=recovery_detail,
+        )
     elif not files_rollback_ok:
         message = f"El rollback de archivos quedó incompleto. Conserva el backup en {backup} para recuperación manual."
+        clean_detail = _clean_recovery_detail(recovery_detail)
+        if clean_detail:
+            message += " Detalle de la actualización: " + clean_detail
     else:
         message = "Los archivos administrados fueron restaurados correctamente."
     payload = {
@@ -365,6 +391,7 @@ def _write_rollback_status(
         "errors": list(errors or []),
         "backup": str(backup),
         "message": message,
+        "recovery_detail": _clean_recovery_detail(recovery_detail),
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
     _atomic_write_json(backup / "rollback_status.json", payload)
@@ -389,7 +416,12 @@ def _write_rollback_status(
     return payload
 
 
-def restore_backup(backup: Path, *, dependencies_may_have_changed: bool = False) -> dict:
+def restore_backup(
+    backup: Path,
+    *,
+    dependencies_may_have_changed: bool = False,
+    recovery_detail: str = "",
+) -> dict:
     backup = Path(backup)
     meta_path = backup / "backup.json"
     if not meta_path.is_file():
@@ -449,6 +481,7 @@ def restore_backup(backup: Path, *, dependencies_may_have_changed: bool = False)
             files_rollback_ok=not errors,
             dependencies_may_have_changed=dependencies_may_have_changed,
             errors=errors,
+            recovery_detail=recovery_detail,
         )
     except Exception as exc:
         errors.append(f"rollback_status:{type(exc).__name__}:{exc}")
@@ -461,6 +494,7 @@ def restore_backup(backup: Path, *, dependencies_may_have_changed: bool = False)
         "recovery_required": bool(dependencies_may_have_changed),
         "errors": [],
         "backup": str(backup),
+        "recovery_detail": _clean_recovery_detail(recovery_detail),
     }
 
 
@@ -481,13 +515,64 @@ def validate_install() -> tuple[bool, str]:
     return True, "Sintaxis Python OK"
 
 
-def _install_requirements() -> None:
+def _normalize_pip_timeout(timeout_seconds=None) -> float:
+    if timeout_seconds is None:
+        return float(PIP_INSTALL_TIMEOUT_SECONDS)
+    try:
+        value = float(timeout_seconds)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("pip timeout debe ser un número de segundos positivo") from exc
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError("pip timeout debe ser un número de segundos positivo")
+    return min(value, float(PIP_INSTALL_TIMEOUT_MAX_SECONDS))
+
+
+def _terminate_timed_out_pip(proc) -> str:
+    notes = []
+    try:
+        proc.terminate()
+    except Exception as exc:
+        notes.append(f"terminate:{type(exc).__name__}:{exc}")
+    try:
+        proc.wait(timeout=PIP_TERMINATE_GRACE_SECONDS)
+        return " | ".join(notes)
+    except subprocess.TimeoutExpired:
+        notes.append("terminate_timeout")
+    except Exception as exc:
+        notes.append(f"wait_after_terminate:{type(exc).__name__}:{exc}")
+
+    try:
+        proc.kill()
+    except Exception as exc:
+        notes.append(f"kill:{type(exc).__name__}:{exc}")
+    try:
+        proc.wait(timeout=PIP_TERMINATE_GRACE_SECONDS)
+    except Exception as exc:
+        notes.append(f"wait_after_kill:{type(exc).__name__}:{exc}")
+    return " | ".join(notes)
+
+
+def _install_requirements(timeout_seconds=None) -> None:
     req = ROOT / "requirements.txt"
     if not req.exists():
         return
-    print("Actualizando dependencias Python...")
-    r = subprocess.run([sys.executable, "-m", "pip", "install", "-r", str(req)])
-    if r.returncode != 0:
+    timeout = _normalize_pip_timeout(timeout_seconds)
+    cmd = [sys.executable, "-m", "pip", "install", "-r", str(req)]
+    print(f"Actualizando dependencias Python (timeout {timeout:g}s)...")
+    proc = subprocess.Popen(cmd)
+    try:
+        return_code = int(proc.wait(timeout=timeout))
+    except subprocess.TimeoutExpired as exc:
+        termination_detail = _terminate_timed_out_pip(proc)
+        message = (
+            f"pip install -r requirements.txt excedió el timeout de {timeout:g} segundos; "
+            "el proceso directo de pip fue detenido y esperado. El entorno Python puede haber cambiado; "
+            "se requiere recuperación antes de reintentar."
+        )
+        if termination_detail:
+            message += " Detalle de terminación: " + termination_detail
+        raise RuntimeError(message) from exc
+    if return_code != 0:
         raise RuntimeError("pip install -r requirements.txt falló")
 
 
@@ -500,6 +585,7 @@ def execute_transaction(
     new_version: str,
     *,
     backup_root: Path | None = None,
+    pip_timeout_seconds=None,
 ) -> tuple[Path | None, dict[str, list[str]]]:
     manifest = build_transaction(stage, new_files, previous)
     touched = manifest["modified_existing"] + manifest["deleted_existing"] + manifest["created_new"]
@@ -515,7 +601,10 @@ def execute_transaction(
         apply_transaction(stage, manifest)
         if requirements_changed:
             dependencies_started = True
-            _install_requirements()
+            if pip_timeout_seconds is None:
+                _install_requirements()
+            else:
+                _install_requirements(timeout_seconds=pip_timeout_seconds)
         ok, detail = validate_install()
         if not ok:
             raise RuntimeError(detail)
@@ -525,7 +614,11 @@ def execute_transaction(
     except Exception as update_error:
         print("La actualización falló; restaurando transacción...")
         try:
-            restore_backup(backup, dependencies_may_have_changed=dependencies_started)
+            restore_backup(
+                backup,
+                dependencies_may_have_changed=dependencies_started,
+                recovery_detail=str(update_error),
+            )
         except Exception as rollback_error:
             raise RuntimeError(
                 f"actualización falló ({update_error}); rollback incompleto ({rollback_error}); "
@@ -534,7 +627,7 @@ def execute_transaction(
         if dependencies_started:
             raise RuntimeError(
                 f"actualización falló ({update_error}); archivos administrados restaurados; "
-                + _dependency_recovery_message(backup)
+                + _dependency_recovery_message(backup, files_rollback_ok=True, detail=str(update_error))
             ) from update_error
         raise
 
