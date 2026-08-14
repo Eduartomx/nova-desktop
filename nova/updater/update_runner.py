@@ -38,13 +38,22 @@ def console_python(root: Path) -> Path:
     return current
 
 
-class ProcessCapture:
-    """Stable reference to a runtime process captured before shutdown request."""
+class _FILETIME(ctypes.Structure):
+    _fields_ = [("dwLowDateTime", wintypes.DWORD), ("dwHighDateTime", wintypes.DWORD)]
 
-    def __init__(self, pid: int, handle=None, *, already_terminated=False):
+
+def _filetime_value(value: _FILETIME) -> int:
+    return (int(value.dwHighDateTime) << 32) | int(value.dwLowDateTime)
+
+
+class ProcessCapture:
+    """Stable reference to a process captured before shutdown coordination."""
+
+    def __init__(self, pid: int, handle=None, *, already_terminated=False, creation_time: int = 0):
         self.pid = int(pid)
         self.handle = handle
         self.already_terminated = bool(already_terminated)
+        self.creation_time = int(creation_time or 0)
 
     @classmethod
     def open(cls, pid: int):
@@ -53,16 +62,32 @@ class ProcessCapture:
             raise ValueError("invalid pid")
         if os.name != "nt":
             try:
-                os.kill(pid, 0)
-            except (ProcessLookupError, OSError):
-                return cls(pid, already_terminated=True)
-            return cls(pid)
+                import psutil
+                process = psutil.Process(pid)
+                creation = int(float(process.create_time()) * 1_000_000)
+                if not process.is_running():
+                    return cls(pid, already_terminated=True, creation_time=creation)
+                return cls(pid, creation_time=creation)
+            except Exception as exc:
+                try:
+                    os.kill(pid, 0)
+                except (ProcessLookupError, OSError):
+                    return cls(pid, already_terminated=True)
+                raise exc
 
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
         kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
         kernel32.OpenProcess.restype = wintypes.HANDLE
         kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
         kernel32.WaitForSingleObject.restype = wintypes.DWORD
+        kernel32.GetProcessTimes.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(_FILETIME),
+            ctypes.POINTER(_FILETIME),
+            ctypes.POINTER(_FILETIME),
+            ctypes.POINTER(_FILETIME),
+        ]
+        kernel32.GetProcessTimes.restype = wintypes.BOOL
         kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
         kernel32.CloseHandle.restype = wintypes.BOOL
 
@@ -71,12 +96,23 @@ class ProcessCapture:
         handle = kernel32.OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
         if not handle:
             error = ctypes.get_last_error()
-            if error == 87:
+            if error == 87:  # ERROR_INVALID_PARAMETER: process no longer exists.
                 return cls(pid, already_terminated=True)
             raise ctypes.WinError(error)
-        capture = cls(pid, handle)
+        created = _FILETIME()
+        exited = _FILETIME()
+        kernel = _FILETIME()
+        user = _FILETIME()
+        if not kernel32.GetProcessTimes(handle, ctypes.byref(created), ctypes.byref(exited), ctypes.byref(kernel), ctypes.byref(user)):
+            error = ctypes.get_last_error()
+            kernel32.CloseHandle(handle)
+            raise ctypes.WinError(error)
+        capture = cls(pid, handle, creation_time=_filetime_value(created))
         capture._kernel32 = kernel32
         return capture
+
+    def matches_creation_time(self, expected: int) -> bool:
+        return int(expected or 0) > 0 and self.creation_time > 0 and self.creation_time == int(expected)
 
     def wait(self, timeout: float) -> bool:
         if self.already_terminated:
@@ -128,6 +164,7 @@ class ShutdownCoordination:
     owner_pid: int = 0
     owner_id: str = ""
     owner_role: str = "runtime"
+    owner_process_creation_time: int = 0
     command_sent: bool = False
     process_terminated: bool = False
     lock_acquired: bool = False
@@ -159,22 +196,48 @@ def _runtime_components(root: Path, *, lock_factory=None, guard_factory=None, ma
     return lock_factory, guard_factory, mailbox
 
 
-def _probe_lock(lock_factory) -> bool:
-    probe = lock_factory()
-    if not probe.acquire():
-        return False
-    probe.release()
-    return True
+def _try_guard(guard_factory):
+    guard = guard_factory()
+    if guard.acquire():
+        return guard
+    return None
 
 
 def _take_guard(guard_factory, deadline: float):
     event = threading.Event()
     while time.monotonic() <= deadline:
-        guard = guard_factory()
-        if guard.acquire():
+        guard = _try_guard(guard_factory)
+        if guard is not None:
             return guard
         event.wait(min(0.05, max(0.0, deadline - time.monotonic())))
     return None
+
+
+def _owner_values(owner: dict | None) -> tuple[int, str, str, int]:
+    owner = owner or {}
+    return (
+        int(owner.get("pid") or 0),
+        str(owner.get("owner_id") or ""),
+        str(owner.get("role") or "runtime"),
+        int(owner.get("process_creation_time") or 0),
+    )
+
+
+def _owner_unchanged(observer, *, pid: int, owner_id: str, creation_time: int, role: str) -> bool:
+    verify = observer.read_owner()
+    v_pid, v_owner_id, v_role, v_creation = _owner_values(verify)
+    return v_pid == pid and v_owner_id == owner_id and v_role == role and v_creation == creation_time
+
+
+def _wait_matching_process(captured, expected_creation: int, deadline: float) -> tuple[bool, str]:
+    if getattr(captured, "already_terminated", False):
+        return True, "terminated"
+    if not captured.matches_creation_time(expected_creation):
+        return True, "identity_mismatch"
+    remaining = max(0.0, deadline - time.monotonic())
+    if not captured.wait(remaining):
+        return False, "timeout"
+    return True, "terminated"
 
 
 def coordinate_runtime_shutdown(
@@ -187,7 +250,12 @@ def coordinate_runtime_shutdown(
     mailbox=None,
     process_factory=None,
 ) -> ShutdownCoordination:
-    """Return only with the old process dead and an updater guard held."""
+    """Return only with the previous matching process dead and a guard held.
+
+    The first lock operation is a real guard acquisition, not a probe followed by
+    release. If the lock is free, stale metadata cannot race a new runtime into
+    the file-replacement window.
+    """
     injected_lock_factory = lock_factory
     if injected_lock_factory is not None and guard_factory is None:
         guard_factory = injected_lock_factory
@@ -199,69 +267,122 @@ def coordinate_runtime_shutdown(
     )
     process_factory = process_factory or ProcessCapture.open
     deadline = time.monotonic() + max(0.0, float(timeout))
-
-    lock_free_at_capture = _probe_lock(observer_factory)
     observer = observer_factory()
-    owner = observer.read_owner()
-    if not owner:
-        if not lock_free_at_capture:
-            return ShutdownCoordination(False, "runtime_owner_metadata_unavailable")
-        guard = _take_guard(guard_factory, deadline)
-        if guard is None:
-            return ShutdownCoordination(False, "runtime_guard_timeout")
-        return ShutdownCoordination(True, process_terminated=True, lock_acquired=True, guard=guard, owner_role="none")
+    owner_snapshot = observer.read_owner()
+    owner_pid, owner_id, owner_role, owner_creation = _owner_values(owner_snapshot)
 
-    owner_pid = int(owner.get("pid") or 0)
-    owner_id = str(owner.get("owner_id") or "")
-    owner_role = str(owner.get("role") or "runtime")
-    if owner_role == "updater":
-        return ShutdownCoordination(False, "update_already_in_progress", owner_pid=owner_pid, owner_id=owner_id, owner_role=owner_role)
-    if expected_pid and owner_pid != int(expected_pid):
-        return ShutdownCoordination(False, "runtime_owner_pid_mismatch", owner_pid=owner_pid, owner_id=owner_id, owner_role=owner_role)
+    # Prefer acquiring and retaining the actual updater guard immediately. If it
+    # succeeds, the kernel says no runtime/updater currently owns the session.
+    guard = _try_guard(guard_factory)
+    if guard is not None:
+        process_terminated = True
+        if owner_pid > 0 and owner_creation > 0:
+            if expected_pid and owner_pid != int(expected_pid):
+                guard.release()
+                return ShutdownCoordination(False, "runtime_owner_pid_mismatch", owner_pid=owner_pid, owner_id=owner_id, owner_role=owner_role, owner_process_creation_time=owner_creation)
+            try:
+                captured = process_factory(owner_pid)
+            except Exception as exc:
+                guard.release()
+                return ShutdownCoordination(False, f"owner_process_capture_failed:{type(exc).__name__}", owner_pid=owner_pid, owner_id=owner_id, owner_role=owner_role, owner_process_creation_time=owner_creation)
+            try:
+                matched, reason = _wait_matching_process(captured, owner_creation, deadline)
+                if reason == "identity_mismatch":
+                    # PID was reused; the old metadata is stale. Never wait for
+                    # or command the unrelated process.
+                    process_terminated = True
+                elif not matched:
+                    guard.release()
+                    return ShutdownCoordination(False, "owner_process_timeout", owner_pid=owner_pid, owner_id=owner_id, owner_role=owner_role, owner_process_creation_time=owner_creation, lock_acquired=True)
+                else:
+                    process_terminated = True
+            finally:
+                try:
+                    captured.close()
+                except Exception:
+                    pass
+        # Metadata without process_creation_time is legacy. Because the kernel
+        # lock was acquired and retained, it is safe to replace that stale
+        # metadata without waiting on a PID that cannot be strongly identified.
+        return ShutdownCoordination(
+            True,
+            owner_pid=owner_pid,
+            owner_id=owner_id,
+            owner_role=owner_role if owner_snapshot else "none",
+            owner_process_creation_time=owner_creation,
+            process_terminated=process_terminated,
+            lock_acquired=True,
+            guard=guard,
+        )
 
-    try:
-        captured = process_factory(owner_pid)
-    except Exception as exc:
-        return ShutdownCoordination(False, f"owner_process_capture_failed:{type(exc).__name__}", owner_pid=owner_pid, owner_id=owner_id, owner_role=owner_role, lock_acquired=lock_free_at_capture)
+    # Lock is occupied. Do not send or wait on a PID unless owner metadata has a
+    # strong creation-time identity and still describes the same generation.
+    event = threading.Event()
+    last_identity_error = "runtime_owner_metadata_unavailable"
+    while time.monotonic() <= deadline:
+        owner = observer.read_owner()
+        owner_pid, owner_id, owner_role, owner_creation = _owner_values(owner)
+        if not owner or owner_pid <= 0 or not owner_id:
+            last_identity_error = "runtime_owner_metadata_unavailable"
+        elif owner_creation <= 0:
+            last_identity_error = "runtime_owner_identity_unavailable"
+        elif owner_role not in {"runtime", "updater"}:
+            last_identity_error = "runtime_owner_role_invalid"
+        elif expected_pid and owner_pid != int(expected_pid):
+            return ShutdownCoordination(False, "runtime_owner_pid_mismatch", owner_pid=owner_pid, owner_id=owner_id, owner_role=owner_role, owner_process_creation_time=owner_creation)
+        else:
+            try:
+                captured = process_factory(owner_pid)
+            except Exception as exc:
+                return ShutdownCoordination(False, f"owner_process_capture_failed:{type(exc).__name__}", owner_pid=owner_pid, owner_id=owner_id, owner_role=owner_role, owner_process_creation_time=owner_creation)
+            try:
+                if getattr(captured, "already_terminated", False):
+                    last_identity_error = "runtime_owner_stale_while_locked"
+                elif not captured.matches_creation_time(owner_creation):
+                    last_identity_error = "runtime_owner_identity_mismatch"
+                elif not _owner_unchanged(observer, pid=owner_pid, owner_id=owner_id, creation_time=owner_creation, role=owner_role):
+                    last_identity_error = "runtime_owner_changed_during_capture"
+                else:
+                    command_sent = False
+                    if owner_role == "runtime":
+                        command_sent = bool(mailbox.send("shutdown_for_update", target_owner_id=owner_id))
+                        if not command_sent:
+                            return ShutdownCoordination(False, "shutdown_command_delivery_failed", owner_pid=owner_pid, owner_id=owner_id, owner_role=owner_role, owner_process_creation_time=owner_creation)
+                    remaining = max(0.0, deadline - time.monotonic())
+                    try:
+                        process_terminated = bool(captured.wait(remaining))
+                    except Exception as exc:
+                        return ShutdownCoordination(False, f"owner_process_wait_failed:{type(exc).__name__}", owner_pid=owner_pid, owner_id=owner_id, owner_role=owner_role, owner_process_creation_time=owner_creation, command_sent=command_sent)
+                    if not process_terminated:
+                        return ShutdownCoordination(False, "owner_process_timeout", owner_pid=owner_pid, owner_id=owner_id, owner_role=owner_role, owner_process_creation_time=owner_creation, command_sent=command_sent)
+                    guard = _take_guard(guard_factory, deadline)
+                    if guard is None:
+                        return ShutdownCoordination(False, "runtime_lock_timeout_after_process_exit", owner_pid=owner_pid, owner_id=owner_id, owner_role=owner_role, owner_process_creation_time=owner_creation, command_sent=command_sent, process_terminated=True)
+                    return ShutdownCoordination(
+                        True,
+                        owner_pid=owner_pid,
+                        owner_id=owner_id,
+                        owner_role=owner_role,
+                        owner_process_creation_time=owner_creation,
+                        command_sent=command_sent,
+                        process_terminated=True,
+                        lock_acquired=True,
+                        guard=guard,
+                    )
+            finally:
+                try:
+                    captured.close()
+                except Exception:
+                    pass
 
-    command_sent = False
-    try:
-        verify = observer.read_owner()
-        if verify:
-            if int(verify.get("pid") or 0) != owner_pid or str(verify.get("owner_id") or "") != owner_id:
-                return ShutdownCoordination(False, "runtime_owner_changed_during_capture", owner_pid=owner_pid, owner_id=owner_id, owner_role=owner_role)
+        # Metadata may briefly lag a new kernel owner. Retry guard acquisition
+        # and metadata together; never command the stale PID.
+        guard = _try_guard(guard_factory)
+        if guard is not None:
+            return ShutdownCoordination(True, owner_pid=owner_pid, owner_id=owner_id, owner_role=owner_role if owner else "none", owner_process_creation_time=owner_creation, process_terminated=True, lock_acquired=True, guard=guard)
+        event.wait(min(0.05, max(0.0, deadline - time.monotonic())))
 
-        if not lock_free_at_capture and not getattr(captured, "already_terminated", False):
-            command_sent = bool(mailbox.send("shutdown_for_update", target_owner_id=owner_id))
-            if not command_sent:
-                return ShutdownCoordination(False, "shutdown_command_delivery_failed", owner_pid=owner_pid, owner_id=owner_id, owner_role=owner_role)
-
-        remaining = max(0.0, deadline - time.monotonic())
-        try:
-            process_terminated = bool(captured.wait(remaining))
-        except Exception as exc:
-            return ShutdownCoordination(False, f"owner_process_wait_failed:{type(exc).__name__}", owner_pid=owner_pid, owner_id=owner_id, owner_role=owner_role, command_sent=command_sent)
-        if not process_terminated:
-            return ShutdownCoordination(False, "owner_process_timeout", owner_pid=owner_pid, owner_id=owner_id, owner_role=owner_role, command_sent=command_sent, lock_acquired=lock_free_at_capture)
-    finally:
-        try:
-            captured.close()
-        except Exception:
-            pass
-
-    guard = _take_guard(guard_factory, deadline)
-    if guard is None:
-        return ShutdownCoordination(False, "runtime_lock_timeout_after_process_exit", owner_pid=owner_pid, owner_id=owner_id, owner_role=owner_role, command_sent=command_sent, process_terminated=True)
-    return ShutdownCoordination(
-        True,
-        owner_pid=owner_pid,
-        owner_id=owner_id,
-        owner_role=owner_role,
-        command_sent=command_sent,
-        process_terminated=True,
-        lock_acquired=True,
-        guard=guard,
-    )
+    return ShutdownCoordination(False, last_identity_error, owner_pid=owner_pid, owner_id=owner_id, owner_role=owner_role, owner_process_creation_time=owner_creation)
 
 
 def request_runtime_shutdown(root: Path, timeout: float = 20.0, *, lock_factory=None, guard_factory=None, mailbox=None, process_factory=None) -> bool:
@@ -351,9 +472,8 @@ def main(argv=None) -> int:
         error = runner_error or ("" if ok else f"El updater terminó con código {rc}. Revisa {log}.")
         write_status(root, ok=ok, before=before, after=after, log=log, error=error)
     finally:
-        # Keep the updater guard for the entire file replacement/validation
-        # transaction. Release it only immediately before starting the one
-        # visible post-update runtime.
+        # The updater guard covers the complete update/rollback transaction and
+        # is released only immediately before the one visible post-update launch.
         coordination.release_guard()
 
     launched, launch_detail = launch_nova(root)
