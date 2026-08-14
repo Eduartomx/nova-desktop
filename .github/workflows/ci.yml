@@ -27,18 +27,22 @@ jobs:
         env:
           PYTHONPATH: nova
         run: python -m unittest discover -s tests -v
-      - name: Resident concurrency repeat
+      - name: Resident process IPC regression
+        env:
+          PYTHONPATH: nova
+        run: python -m unittest -v tests.test_resident_process_ipc tests.test_resident_hardening tests.test_update_runner tests.test_updater_resident
+      - name: Resident stability repeat
         env:
           PYTHONPATH: nova
         run: |
-          python -m unittest -v tests.test_ui_padding_safety tests.test_update_runner tests.test_fast_routing_latency
-          python -m unittest -v tests.test_ui_padding_safety tests.test_update_runner tests.test_fast_routing_latency
-          python -m unittest -v tests.test_ui_padding_safety tests.test_update_runner tests.test_fast_routing_latency
+          python -m unittest -v tests.test_resident_lifecycle_contract tests.test_update_runner tests.test_windows_session
+          python -m unittest -v tests.test_resident_lifecycle_contract tests.test_update_runner tests.test_windows_session
+          python -m unittest -v tests.test_resident_lifecycle_contract tests.test_update_runner tests.test_windows_session
 
   windows-smoke:
     name: Windows reliability smoke / Python 3.11
     runs-on: windows-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -50,25 +54,37 @@ jobs:
         run: python -m pip install --disable-pip-version-check psutil pillow pystray requests beautifulsoup4
       - name: Compile all Nova source on Windows
         run: python -m compileall -q nova
-      - name: Resident lifecycle, instance, autostart and tray mocks
+      - name: Resident lifecycle contract
         env:
           PYTHONPATH: nova
-        run: python -m unittest discover -s tests -p "test_ui_padding_safety.py" -v
-      - name: Resident routes and bootstrap ordering
+        run: python -m unittest -v tests.test_resident_lifecycle_contract
+      - name: Resident ownership IPC and tray hardening
+        env:
+          PYTHONPATH: nova
+        run: python -m unittest -v tests.test_resident_hardening
+      - name: Real multiprocess lock IPC and termination
+        env:
+          PYTHONPATH: nova
+        run: python -m unittest -v tests.test_resident_process_ipc
+      - name: Resident updater paths
+        env:
+          PYTHONPATH: nova
+        run: python -m unittest -v tests.test_update_runner tests.test_updater_resident
+      - name: Windows session shutdown
+        env:
+          PYTHONPATH: nova
+        run: python -m unittest -v tests.test_windows_session
+      - name: Resident bootstrap ordering
         env:
           PYTHONPATH: nova
         run: python -m unittest -v tests.test_fast_routing_latency tests.test_core_consolidation
-      - name: Resident updater lifecycle
-        env:
-          PYTHONPATH: nova
-        run: python -m unittest discover -s tests -p "test_update_runner.py" -v
-      - name: Repeat Resident Mode race-sensitive tests
+      - name: Resident stability repeat
         env:
           PYTHONPATH: nova
         run: |
-          python -m unittest -v tests.test_ui_padding_safety tests.test_update_runner
-          python -m unittest -v tests.test_ui_padding_safety tests.test_update_runner
-          python -m unittest -v tests.test_ui_padding_safety tests.test_update_runner
+          python -m unittest -v tests.test_resident_lifecycle_contract tests.test_update_runner tests.test_windows_session
+          python -m unittest -v tests.test_resident_lifecycle_contract tests.test_update_runner tests.test_windows_session
+          python -m unittest -v tests.test_resident_lifecycle_contract tests.test_update_runner tests.test_windows_session
       - name: Gaming Awareness regression suite
         env:
           PYTHONPATH: nova
