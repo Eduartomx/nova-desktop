@@ -120,7 +120,18 @@ jobs:
       - name: Windows full test suite
         env:
           PYTHONPATH: nova
-        run: python -m unittest discover -s tests -v
+        shell: pwsh
+        run: |
+          $lines = @(& python -m unittest discover -s tests -v 2>&1 | ForEach-Object { "$_" })
+          $code = $LASTEXITCODE
+          $lines | ForEach-Object { Write-Host $_ }
+          if ($code -ne 0) {
+            $start = [Math]::Max(0, $lines.Count - 100)
+            $tail = $lines[$start..($lines.Count - 1)] -join "`n"
+            $escaped = $tail.Replace('%','%25').Replace("`r",'%0D').Replace("`n",'%0A')
+            Write-Host "::error title=Windows unittest failure::$escaped"
+            exit $code
+          }
       - name: Tray and resident ownership hardening
         env:
           PYTHONPATH: nova
