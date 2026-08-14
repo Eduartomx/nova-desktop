@@ -21,7 +21,8 @@ ALLOWED_COMMANDS = {"show", "shutdown_for_update", "status"}
 class InstanceCommandMailbox:
     def __init__(self, directory: Path, *, owner_id: str = "", max_age_seconds: float = 15.0):
         raw = Path(directory)
-        if raw.suffix or raw.name.endswith(".command"):
+        self.legacy_path = raw if (raw.suffix or raw.name.endswith(".command")) else None
+        if self.legacy_path is not None:
             raw = raw.parent / "commands"
         self.directory = raw
         # Production senders always pass the current target explicitly. A local
@@ -88,6 +89,15 @@ class InstanceCommandMailbox:
 
     def consume(self, *, owner_id: str | None = None) -> dict[str, Any] | None:
         target_owner = self._validate_owner_id(owner_id or self.owner_id)
+        if self.legacy_path is not None and self.legacy_path.exists():
+            # v0.9.9 pre-hardening used one untargeted mailbox file. Never
+            # interpret it after owner-targeting was introduced: delete it and
+            # surface an invalid message instead of risking cross-generation use.
+            try:
+                self.legacy_path.unlink(missing_ok=True)
+            except OSError:
+                return {"ok": False, "error": "claim_failed"}
+            return {"ok": False, "error": "invalid_message"}
         try: paths = sorted(self.directory.glob("*.json"))
         except OSError: return None
         first_error = None
@@ -113,8 +123,15 @@ class InstanceCommandMailbox:
     def purge_foreign(self, *, owner_id: str | None = None) -> int:
         target_owner = self._validate_owner_id(owner_id or self.owner_id)
         removed = 0
+        if self.legacy_path is not None:
+            try:
+                if self.legacy_path.exists():
+                    self.legacy_path.unlink(missing_ok=True)
+                    removed += 1
+            except OSError:
+                pass
         try: paths = list(self.directory.glob("*.json"))
-        except OSError: return 0
+        except OSError: return removed
         for path in paths:
             data, _error = self._read_message(path)
             if data is None or data.get("target_owner_id") != target_owner:
@@ -124,6 +141,8 @@ class InstanceCommandMailbox:
 
     def clear(self) -> None:
         try:
+            if self.legacy_path is not None:
+                self.legacy_path.unlink(missing_ok=True)
             for path in self.directory.glob("*.json"): path.unlink(missing_ok=True)
         except OSError:
             pass
