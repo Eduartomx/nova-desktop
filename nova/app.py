@@ -41,6 +41,25 @@ def _claim_instance():
     return None, mailbox, 0
 
 
+def _cleanup_runtime_error(ui) -> None:
+    """Best-effort cleanup when Tk/mainloop itself failed.
+
+    The scheduled and synchronous shutdown attempts are intentionally isolated:
+    a broken ``root.after`` must never suppress the synchronous cleanup path.
+    """
+    lifecycle = getattr(ui, "runtime_lifecycle", None) if ui is not None else None
+    if lifecycle is None:
+        return
+    try:
+        lifecycle.request_shutdown("runtime_error")
+    except Exception:
+        pass
+    try:
+        lifecycle.perform_shutdown_now()
+    except Exception:
+        pass
+
+
 def main(argv=None):
     if sys.platform != "win32":
         print("Esta versión está preparada específicamente para Windows.")
@@ -72,13 +91,7 @@ def main(argv=None):
             root.mainloop()
         except BaseException:
             # A Tk/runtime error is a real shutdown, never a hide-to-tray action.
-            try:
-                lifecycle = getattr(ui, "runtime_lifecycle", None)
-                if lifecycle is not None:
-                    lifecycle.request_shutdown("runtime_error")
-                    lifecycle.perform_shutdown_now()
-            except Exception:
-                pass
+            _cleanup_runtime_error(ui)
             exit_code = 1
             raise
         return exit_code
