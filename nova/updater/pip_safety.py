@@ -1,16 +1,20 @@
 from __future__ import annotations
 
-"""Compatibility façade for pip containment and strong POSIX identities.
+"""Compatibility surface for pip containment and strong POSIX identities.
 
-Windows behavior is delegated unchanged to ``pip_safety_legacy``. On Linux the
-only change is that persisted process identities use the same exact /proc
-start-time representation as the stdlib recovery gate, avoiding float rounding
-mismatches across serialization/restart.
+Production Windows containment remains the native Job Object implementation in
+``pip_safety_legacy``.  The import-time guard below exists solely to make the
+historical updater implementation non-executable as a standalone script: its
+normal package import path is unaffected.
 """
 
 import os
 from pathlib import Path
 import sys
+
+if __name__ == "pip_safety" and Path(sys.argv[0]).name.casefold() == "nova_updater_legacy.py":
+    print("[ERROR] nova_updater_legacy.py es import-only; usa updater/update_runner.py.")
+    raise SystemExit(4)
 
 try:
     from . import pip_safety_legacy as _legacy
@@ -32,9 +36,8 @@ class PsutilProcessTree(_legacy.PsutilProcessTree):
                 stat = (Path("/proc") / str(target) / "stat").read_text(encoding="utf-8")
             except FileNotFoundError:
                 return None
-            # Fields after the executable name begin at process state (#3).
             tail = stat[stat.rfind(")") + 2:].split()
-            ticks = int(tail[19])  # starttime, field 22
+            ticks = int(tail[19])
             btime = next(
                 int(line.split()[1])
                 for line in Path("/proc/stat").read_text(encoding="utf-8").splitlines()
