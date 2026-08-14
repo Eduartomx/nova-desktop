@@ -18,17 +18,52 @@ except ImportError:
         safe_rel, validate_journal,
     )
 
-def _reject_symlink_chain(base: Path, target: Path) -> None:
-    base = Path(base).resolve(strict=True)
+
+def _lexical_relative(base: Path, target: Path) -> Path:
+    """Return target relative to base without following either path's symlinks.
+
+    This deliberately happens before ``resolve()``. On Windows a temporary path
+    may be expressed through an 8.3 alias while ``Path.resolve()`` expands only
+    one side to its long form; comparing those two lexical spellings directly
+    would reject a legitimate in-root backup. ``commonpath`` + ``normcase``
+    keeps the containment comparison case-insensitive on Windows without
+    treating symlink resolution as proof of safety.
+    """
+    base_text = os.path.abspath(os.fspath(base))
+    target_text = os.path.abspath(os.fspath(target))
     try:
-        rel = Path(target).relative_to(base)
+        common = os.path.commonpath([base_text, target_text])
     except ValueError as exc:
         raise RecoveryJournalError("path_outside_authorized_root") from exc
-    current = base
+    if os.path.normcase(common) != os.path.normcase(base_text):
+        raise RecoveryJournalError("path_outside_authorized_root")
+    rel_text = os.path.relpath(target_text, base_text)
+    if rel_text in ("", "."):
+        return Path()
+    rel = Path(rel_text)
+    if rel.is_absolute() or ".." in rel.parts:
+        raise RecoveryJournalError("path_outside_authorized_root")
+    return rel
+
+
+def _reject_symlink_chain(base: Path, target: Path) -> Path:
+    """Reject symlink hops and return the canonical target below base."""
+    raw_base = Path(base)
+    if not raw_base.exists() or raw_base.is_symlink():
+        raise RecoveryJournalError("authorized_root_unavailable_or_symlink")
+    rel = _lexical_relative(raw_base, Path(target))
+    canonical_base = raw_base.resolve(strict=True)
+    current = canonical_base
     for part in rel.parts:
         current /= part
         if current.exists() and current.is_symlink():
             raise RecoveryJournalError("unsafe_symlink_in_recovery_path")
+    resolved = (canonical_base / rel).resolve(strict=False)
+    try:
+        resolved.relative_to(canonical_base)
+    except ValueError as exc:
+        raise RecoveryJournalError("path_resolves_outside_authorized_root") from exc
+    return resolved
 
 
 def _manifest_lists(meta: dict[str, Any]) -> dict[str, list[str]]:
@@ -44,13 +79,18 @@ def _manifest_lists(meta: dict[str, Any]) -> dict[str, list[str]]:
 
 
 def validate_backup_path(root: Path, backup: Path, *, backup_root: Path | None = None) -> Path:
-    base = Path(backup_root) if backup_root is not None else backup_root_path(root)
-    if not base.is_dir() or base.is_symlink():
+    raw_base = Path(backup_root) if backup_root is not None else backup_root_path(root)
+    if not raw_base.is_dir() or raw_base.is_symlink():
         raise RecoveryJournalError("authorized_backup_root_unavailable")
-    base = base.resolve(strict=True)
-    candidate = Path(backup)
-    _reject_symlink_chain(base, candidate)
-    resolved = candidate.resolve(strict=True)
+    rel = _lexical_relative(raw_base, Path(backup))
+    base = raw_base.resolve(strict=True)
+    candidate = base / rel
+    # Walk every component before resolving the candidate so a symlink can
+    # never be used to make an external directory appear authorized.
+    resolved = _reject_symlink_chain(base, candidate)
+    if not resolved.exists():
+        raise RecoveryJournalError("backup_missing")
+    resolved = resolved.resolve(strict=True)
     try:
         resolved.relative_to(base)
     except ValueError as exc:
@@ -80,8 +120,11 @@ def resolve_backup(root: Path, payload: dict[str, Any], *, backup_root: Path | N
 
 
 def _install_target(root: Path, rel: str) -> Path:
-    base = Path(root).resolve(strict=True)
+    raw_base = Path(root)
+    if not raw_base.exists() or raw_base.is_symlink():
+        raise RecoveryJournalError("install_root_unavailable_or_symlink")
     path = safe_rel(rel)
+    base = raw_base.resolve(strict=True)
     target = base / path
     current = base
     for part in path.parts:
