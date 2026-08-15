@@ -60,7 +60,7 @@ class PublicUpdaterGateTests(unittest.TestCase):
             for module in (
                 "recovery_journal.py", "recovery_attempts.py", "recovery_files.py",
                 "recovery_environment.py", "recovery_state.py", "recovery_locking.py",
-                "recovery_bootstrap.py",
+                "recovery_handoff.py", "recovery_bootstrap.py",
             ):
                 (root / "updater" / module).write_bytes((source / module).read_bytes())
             old_bytes = (root / "requirements.txt").read_bytes()
@@ -79,8 +79,8 @@ class PublicUpdaterGateTests(unittest.TestCase):
             self.assertEqual((root / "requirements.txt").read_bytes(), old_bytes)
             journal = load_journal(root, backup_root=backups)
             self.assertIsNotNone(journal)
-            self.assertEqual(journal["state"], "cleared")
-            self.assertFalse(journal["recovery_required"])
+            self.assertEqual(journal["state"], "rollback_validation_completed")
+            self.assertTrue(journal["recovery_required"])
             self.assertFalse(journal["dependencies_may_have_changed"])
 
 
@@ -109,7 +109,6 @@ class SupervisorRecoveryGateTests(unittest.TestCase):
     def test_abnormal_engine_exit_with_active_journal_returns_seven_and_never_launches(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td); (root / "data" / "updater_backups").mkdir(parents=True); (root / "updater").mkdir()
-            # Build a minimal valid active journal + backup.
             backup = root / "data" / "updater_backups" / "a"; (backup / "files").mkdir(parents=True); (backup / "control").mkdir()
             (backup / "control" / "managed_files.json").write_text('{"files":[]}', encoding="utf-8")
             (backup / "backup.json").write_text(json.dumps({"schema":2,"from":"x","to":"y","modified_existing":[],"deleted_existing":[],"created_new":[],"unchanged":[],"managed_files":{"path":"updater/managed_files.json","existed":True,"backup":"control/managed_files.json"}}), encoding="utf-8")
@@ -139,7 +138,7 @@ class RecoveryStateTransitionTests(unittest.TestCase):
         self.assertTrue(result.pending); self.assertEqual(result.exit_code, 7)
         self.assertEqual(after["state"], "waiting_for_processes"); self.assertEqual(after["generation"], before["generation"] + 1)
 
-    def test_post_recovery_launch_failure_requarantines_validated_state(self):
+    def test_post_recovery_helper_spawn_failure_keeps_validated_quarantine(self):
         with tempfile.TemporaryDirectory() as td:
             fx = RecoveryFixture(Path(td)); journal = fx.transaction()
             journal = transition_journal(fx.root, journal, "files_applying", backup_root=fx.backup_root, files_may_have_changed=True)
@@ -152,7 +151,7 @@ class RecoveryStateTransitionTests(unittest.TestCase):
         self.assertTrue(result.pending); self.assertTrue(result.recovered); self.assertFalse(result.launched)
         self.assertEqual(current["state"], "rollback_validation_completed"); self.assertTrue(current["recovery_required"])
 
-    def test_retry_from_validated_state_skips_rollback_and_launches_once(self):
+    def test_retry_from_validated_state_skips_rollback_and_spawns_one_helper(self):
         with tempfile.TemporaryDirectory() as td:
             fx = RecoveryFixture(Path(td)); journal = fx.transaction()
             journal = transition_journal(fx.root, journal, "files_applying", backup_root=fx.backup_root, files_may_have_changed=True)
@@ -162,11 +161,11 @@ class RecoveryStateTransitionTests(unittest.TestCase):
             second = recover_pending(
                 fx.root, backup_root=fx.backup_root, restore_func=restore,
                 validator=lambda *_args: (True, "validated"),
-                launcher=lambda command, **kwargs: launches.append(command), launch_after_success=True,
+                launcher=lambda command, **kwargs: launches.append(command) or object(), launch_after_success=True,
             )
             current = load_journal(fx.root, backup_root=fx.backup_root)
         restore.assert_not_called(); self.assertTrue(second.recovered); self.assertTrue(second.launched)
-        self.assertEqual(len(launches), 1); self.assertEqual(current["state"], "cleared")
+        self.assertEqual(len(launches), 1); self.assertIn("--handoff-launch", launches[0]); self.assertEqual(current["state"], "cleared")
 
 
 if __name__ == "__main__":
