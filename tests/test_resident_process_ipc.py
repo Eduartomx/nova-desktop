@@ -50,6 +50,19 @@ def _wait_for_owner(path: Path, timeout: float = 3.0) -> dict:
     return {}
 
 
+def _wait_for_mutex_available(path: Path, timeout: float = 5.0) -> bool:
+    """Wait until Windows has actually released the kernel byte-range lock."""
+    deadline = time.monotonic() + timeout
+    event = threading.Event()
+    while time.monotonic() < deadline:
+        lock = create_supervisor_mutex(path=path)
+        if lock.acquire():
+            lock.release()
+            return True
+        event.wait(0.02)
+    return False
+
+
 OWNER_SCRIPT = r'''
 import sys, threading, time
 from pathlib import Path
@@ -372,9 +385,10 @@ class ResidentProcessIPCTests(unittest.TestCase):
                 self.assertFalse(competing.acquire(), "mutex allowed two live supervisor owners")
                 proc.terminate()
                 proc.wait(timeout=5)
-                recovered = create_supervisor_mutex(path=mutex)
-                self.assertTrue(recovered.acquire(), "kernel mutex remained stuck after owner process died")
-                recovered.release()
+                self.assertTrue(
+                    _wait_for_mutex_available(mutex, 5.0),
+                    "kernel mutex did not become available after owner process died",
+                )
             finally:
                 if proc.poll() is None:
                     proc.terminate()
