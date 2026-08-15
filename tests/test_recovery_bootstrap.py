@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+import shutil
 import tempfile
 import unittest
 from unittest import mock
@@ -17,8 +18,18 @@ from updater.recovery_state import (
     evaluate_remaining_processes,
     journal_path,
     load_journal,
+    prepare_stable_recovery_runtime,
     resolve_backup,
     transition_journal,
+)
+
+
+REPO = Path(__file__).resolve().parents[1]
+NOVA = REPO / "nova"
+STABLE_MODULES = (
+    "recovery_journal.py", "recovery_attempts.py", "recovery_files.py",
+    "recovery_environment.py", "recovery_state.py", "recovery_locking.py",
+    "recovery_handoff.py", "recovery_bootstrap.py",
 )
 
 
@@ -36,6 +47,8 @@ class RecoveryFixture:
         (self.root / "app.py").write_text("VALUE=1\n", encoding="utf-8")
         (self.root / "updater" / "nova_updater.py").write_text("VALUE=1\n", encoding="utf-8")
         (self.root / "updater" / "update_runner.py").write_text("VALUE=1\n", encoding="utf-8")
+        for name in STABLE_MODULES:
+            shutil.copy2(NOVA / "updater" / name, self.root / "updater" / name)
         (self.root / "modified.txt").write_text("new-modified", encoding="utf-8")
         (self.root / "created.txt").write_text("new-created", encoding="utf-8")
         (self.root / "updater" / "managed_files.json").write_text('{"files":["created.txt"]}', encoding="utf-8")
@@ -60,6 +73,7 @@ class RecoveryFixture:
                 "backup": "control/managed_files.json",
             },
         }), encoding="utf-8")
+        prepare_stable_recovery_runtime(self.root)
 
     def quarantine(self, remaining=None, **kwargs):
         return create_quarantine_journal(
@@ -187,7 +201,7 @@ class RecoveryStateMachineTests(unittest.TestCase):
 
 
 class RecoveryFlowTests(unittest.TestCase):
-    def test_incomplete_transaction_restores_exact_files_and_launches_once(self):
+    def test_incomplete_transaction_restores_exact_files_and_schedules_one_handoff_helper(self):
         with tempfile.TemporaryDirectory() as td:
             fx = RecoveryFixture(Path(td))
             journal = fx.transaction()
@@ -206,13 +220,16 @@ class RecoveryFlowTests(unittest.TestCase):
                 fx.root,
                 backup_root=fx.backup_root,
                 validator=lambda *_args: (True, "validated"),
-                launcher=lambda command, **kwargs: launches.append((command, kwargs)),
+                launcher=lambda command, **kwargs: launches.append((command, kwargs)) or object(),
                 launch_after_success=True,
             )
             self.assertTrue(result.recovered)
             self.assertTrue(result.launched)
             self.assertEqual(len(launches), 1)
-            self.assertEqual(launches[0][0][-1], "--post-recovery")
+            command = launches[0][0]
+            self.assertIn("--handoff-launch", command)
+            self.assertIn("--handoff-mode", command)
+            self.assertIn("post-recovery", command)
             self.assertEqual(_sha(fx.root / "modified.txt"), expected_modified)
             self.assertEqual(_sha(fx.root / "deleted.txt"), expected_deleted)
             self.assertFalse((fx.root / "created.txt").exists())
