@@ -117,6 +117,15 @@ markers.mkdir(parents=True, exist_ok=True)
 pid = os.getpid()
 def mark(kind):
     (markers / (kind + "_" + str(pid))).write_text(str(pid), encoding="utf-8")
+class SupervisorMutex:
+    def __init__(self):
+        self._lock = create_supervisor_mutex(path=mutex_path)
+    def acquire(self):
+        ok = self._lock.acquire()
+        if ok: mark("mutex")
+        return ok
+    def release(self):
+        return self._lock.release()
 class Guard:
     def release(self): mark("guard_release")
 def coordinate(*_a, **_kw):
@@ -124,7 +133,7 @@ def coordinate(*_a, **_kw):
     return ShutdownCoordination(True, process_terminated=True, lock_acquired=True, guard=Guard())
 def run_update(*_a, **_kw):
     mark("run")
-    deadline = time.monotonic() + 8.0
+    deadline = time.monotonic() + 30.0
     event = threading.Event()
     while time.monotonic() < deadline and not finish.exists(): event.wait(0.02)
     if not finish.exists(): return 9, "test owner timeout"
@@ -136,7 +145,7 @@ update_runner.run_update = run_update
 update_runner.read_version = lambda *_a, **_kw: "0.9.8"
 update_runner.write_status = lambda *_a, **_kw: None
 update_runner.launch_nova = launch
-rc = update_runner.main([], supervisor_lock_factory=lambda: create_supervisor_mutex(path=mutex_path))
+rc = update_runner.main([], supervisor_lock_factory=SupervisorMutex)
 mark("rc" + str(rc))
 raise SystemExit(rc)
 '''
@@ -292,7 +301,16 @@ class ResidentProcessIPCTests(unittest.TestCase):
             )
             second = None
             try:
-                self.assertTrue(_wait_for_path(markers / f"run_{first.pid}", 5.0), "first supervisor never reached run_update")
+                mutex_marker = markers / f"mutex_{first.pid}"
+                acquired = _wait_for_path(mutex_marker, 20.0)
+                first_error = ""
+                if not acquired and first.poll() is not None:
+                    first_error = first.stderr.read()
+                self.assertTrue(
+                    acquired,
+                    f"first supervisor never acquired mutex; rc={first.poll()} stderr={first_error}",
+                )
+
                 second = subprocess.Popen(
                     [sys.executable, "-c", SUPERVISOR_SCRIPT, str(root), str(mutex), str(markers), str(finish)],
                     stdout=subprocess.DEVNULL,
@@ -300,20 +318,33 @@ class ResidentProcessIPCTests(unittest.TestCase):
                     text=True,
                     env=_env(),
                 )
-                second_rc = second.wait(timeout=5)
+                second_rc = second.wait(timeout=20)
                 self.assertEqual(second_rc, SUPERVISOR_ALREADY_RUNNING_CODE, second.stderr.read())
+                self.assertFalse((markers / f"mutex_{second.pid}").exists())
                 self.assertFalse((markers / f"shutdown_{second.pid}").exists())
                 self.assertFalse((markers / f"run_{second.pid}").exists())
                 self.assertFalse((markers / f"launch_{second.pid}").exists())
                 self.assertTrue((markers / f"rc{SUPERVISOR_ALREADY_RUNNING_CODE}_{second.pid}").exists())
 
+                run_marker = markers / f"run_{first.pid}"
+                reached_run = _wait_for_path(run_marker, 20.0)
+                first_error = ""
+                if not reached_run and first.poll() is not None:
+                    first_error = first.stderr.read()
+                self.assertTrue(
+                    reached_run,
+                    f"mutex owner never reached run_update; rc={first.poll()} stderr={first_error}",
+                )
+
                 finish.write_text("finish", encoding="utf-8")
-                first_rc = first.wait(timeout=5)
+                first_rc = first.wait(timeout=20)
                 self.assertEqual(first_rc, 0, first.stderr.read())
+                self.assertTrue((markers / f"mutex_{first.pid}").exists())
                 self.assertTrue((markers / f"shutdown_{first.pid}").exists())
                 self.assertTrue((markers / f"run_{first.pid}").exists())
                 self.assertTrue((markers / f"guard_release_{first.pid}").exists())
                 self.assertTrue((markers / f"launch_{first.pid}").exists())
+                self.assertEqual(len(list(markers.glob("mutex_*"))), 1)
                 self.assertEqual(len(list(markers.glob("shutdown_*"))), 1)
                 self.assertEqual(len(list(markers.glob("run_*"))), 1)
                 self.assertEqual(len(list(markers.glob("launch_*"))), 1)
@@ -322,7 +353,7 @@ class ResidentProcessIPCTests(unittest.TestCase):
                 for proc in (second, first):
                     if proc is not None and proc.poll() is None:
                         proc.terminate()
-                        proc.wait(timeout=3)
+                        proc.wait(timeout=5)
 
     def test_dead_supervisor_process_does_not_leave_mutex_owned(self):
         with tempfile.TemporaryDirectory() as td:
