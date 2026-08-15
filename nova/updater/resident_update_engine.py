@@ -4,6 +4,8 @@ from __future__ import annotations
 
 The low-level dependency launcher lives in resident_engine_core; all installation
 mutation remains in this module and is reachable only through the supervisor.
+The engine never clears a validated journal: the resident supervisor owns the
+final validated launch handoff.
 """
 
 import os
@@ -38,6 +40,25 @@ except ImportError:
         restore_backup_idempotent, transition_journal, validate_backup_path,
         validate_restored_install,
     )
+
+VALIDATED_HANDOFF_STATES = {"update_validated", "rollback_validation_completed"}
+
+
+class SupervisedUpdateResult(int):
+    """Integer-compatible engine result carrying the exact durable journal snapshot."""
+
+    def __new__(
+        cls,
+        exit_code: int,
+        journal: dict[str, Any] | None = None,
+        detail: str = "",
+    ):
+        obj = int.__new__(cls, int(exit_code))
+        obj.exit_code = int(exit_code)
+        obj.journal = journal
+        obj.detail = str(detail or "")
+        return obj
+
 
 def _apply_transaction(stage: Path, manifest: dict[str, list[str]], *, crash_hook: CrashHook | None = None) -> None:
     lists = base._validated_manifest_lists(manifest)
@@ -83,7 +104,7 @@ def _rollback_after_failure(
     backup_root: Path | None,
     dependencies_may_have_changed: bool,
     crash_hook: CrashHook | None,
-) -> None:
+) -> dict[str, Any]:
     current = journal
     if current["state"] != "rollback_in_progress":
         current = transition_journal(
@@ -131,10 +152,7 @@ def _rollback_after_failure(
         validation_detail=str(detail)[:500],
     )
     _hook(crash_hook, "after_validation_before_clear", state=current["state"])
-    transition_journal(
-        root, current, "cleared", backup_root=backup_root,
-        files_rollback_attempted=True, files_rollback_ok=True,
-    )
+    return current
 
 
 def execute_transaction(
@@ -213,9 +231,8 @@ def execute_transaction(
             validation_detail=str(detail)[:500],
         )
         _hook(crash_hook, "after_update_validated_before_clear", state=journal["state"])
-        transition_journal(root, journal, "cleared", backup_root=backup_root)
         print(detail)
-        return backup, manifest
+        return backup, manifest, journal
 
     except PipTerminationUnconfirmedError as update_error:
         result = update_error.result
@@ -250,14 +267,25 @@ def execute_transaction(
         raise
 
 
+def _safe_current_journal(root: Path) -> dict[str, Any] | None:
+    try:
+        journal = load_journal(root)
+    except RecoveryJournalError:
+        return None
+    if journal is None or journal.get("state") == "cleared" or not journal.get("recovery_required"):
+        return None
+    return journal
+
+
 def run_supervised_update(
     root: Path | None = None,
     *,
     pip_timeout_seconds=None,
     crash_hook: CrashHook | None = None,
-) -> int:
+) -> SupervisedUpdateResult:
     """Run one update while the caller owns supervisor + runtime guards."""
     target_root = Path(root or getattr(base, "ROOT", Path(__file__).resolve().parents[1])).resolve()
+    last_journal: dict[str, Any] | None = None
     with _base_root(target_root):
         try:
             _ensure_no_recovery_pending(target_root)
@@ -275,18 +303,27 @@ def run_supervised_update(
             print(f"Disponible  : {latest}")
             if base.version_key(latest) <= base.version_key(current):
                 print("\nNova ya está actualizada.")
-                return 0
+                return SupervisedUpdateResult(0, None, "up_to_date")
             if notes:
                 print("\nCambios:\n" + notes[:2500])
 
             old_execute = base.execute_transaction
+
             def guarded_execute(stage, new_files, previous, tag, old_version, new_version, **kwargs):
-                return execute_transaction(
-                    stage, new_files, previous, tag, old_version, new_version,
-                    backup_root=kwargs.get("backup_root"),
-                    pip_timeout_seconds=pip_timeout_seconds if pip_timeout_seconds is not None else kwargs.get("pip_timeout_seconds"),
-                    crash_hook=crash_hook,
-                )
+                nonlocal last_journal
+                try:
+                    backup, manifest, journal = execute_transaction(
+                        stage, new_files, previous, tag, old_version, new_version,
+                        backup_root=kwargs.get("backup_root"),
+                        pip_timeout_seconds=pip_timeout_seconds if pip_timeout_seconds is not None else kwargs.get("pip_timeout_seconds"),
+                        crash_hook=crash_hook,
+                    )
+                except BaseException:
+                    last_journal = _safe_current_journal(target_root)
+                    raise
+                last_journal = journal
+                return backup, manifest
+
             base.execute_transaction = guarded_execute
             try:
                 base.sync_release(cfg, release)
@@ -295,16 +332,24 @@ def run_supervised_update(
             print("\n" + "=" * 58)
             print(f"NOVA {latest} INSTALADA DESDE GITHUB")
             print("=" * 58)
-            return 0
+            return SupervisedUpdateResult(0, last_journal, "update_validated")
         except PipTerminationUnconfirmedError as exc:
             print(f"[ERROR] {exc}")
-            return PIP_TERMINATION_UNCONFIRMED_EXIT_CODE
+            return SupervisedUpdateResult(
+                PIP_TERMINATION_UNCONFIRMED_EXIT_CODE,
+                last_journal or _safe_current_journal(target_root),
+                str(exc),
+            )
         except RecoveryRequiredError as exc:
             print(f"[RECOVERY REQUIRED] {exc}")
-            return RECOVERY_REQUIRED_EXIT_CODE
+            return SupervisedUpdateResult(
+                RECOVERY_REQUIRED_EXIT_CODE,
+                last_journal or _safe_current_journal(target_root),
+                str(exc),
+            )
         except Exception as exc:
             print(f"[ERROR] {type(exc).__name__}: {exc}")
-            return 2
+            return SupervisedUpdateResult(2, last_journal or _safe_current_journal(target_root), f"{type(exc).__name__}:{exc}")
 
 
 def main(argv=None) -> int:
