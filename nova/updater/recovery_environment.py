@@ -231,6 +231,7 @@ def prepare_stable_recovery_runtime(root: Path) -> dict[str, Any]:
     target.mkdir(parents=False, exist_ok=False)
     files: dict[str, str] = {}
     for name in (
+        "process_launch.py",
         "recovery_journal.py", "recovery_attempts.py", "recovery_files.py",
         "recovery_environment.py", "recovery_state.py", "recovery_locking.py",
         "recovery_handoff.py", "recovery_bootstrap.py",

@@ -16,7 +16,6 @@ import os
 from pathlib import Path
 import secrets
 import subprocess
-import sys
 import time
 from typing import Any, Callable
 
@@ -33,9 +32,23 @@ except ImportError:
         StaleJournalWriterError,
     )
 
+try:
+    from .process_launch import (
+        detached_hidden_creation_flags,
+        select_console_python,
+        select_gui_python,
+    )
+except ImportError:
+    from process_launch import (
+        detached_hidden_creation_flags,
+        select_console_python,
+        select_gui_python,
+    )
+
 VALIDATED_STATES = {"update_validated", "rollback_validation_completed"}
 HANDOFF_MODES = {"post-update": "--post-update", "post-recovery": "--post-recovery"}
 STABLE_RUNTIME_FILES = {
+    "process_launch.py",
     "recovery_journal.py",
     "recovery_attempts.py",
     "recovery_files.py",
@@ -176,7 +189,7 @@ def spawn_handoff_helper(
     try:
         bootstrap = stable_bootstrap_path(root)
         command = [
-            sys.executable,
+            str(select_console_python(root)),
             str(bootstrap),
             "--handoff-launch",
             "--root",
@@ -198,12 +211,11 @@ def spawn_handoff_helper(
         kwargs: dict[str, Any] = {
             "cwd": str(Path(root)),
             "close_fds": True,
+            "creationflags": detached_hidden_creation_flags(),
             "stdout": subprocess.DEVNULL,
             "stderr": subprocess.DEVNULL,
         }
-        if os.name == "nt":
-            kwargs["creationflags"] = 0x00000008 | 0x00000200
-        else:
+        if os.name != "nt":
             kwargs["start_new_session"] = True
         call(command, **kwargs)
         return True, ""
@@ -316,17 +328,16 @@ def launch_nova_after_clear(
     if flag is None:
         return False, "invalid_handoff_mode"
     try:
-        command = [sys.executable, str(Path(root) / "app.py"), flag]
+        command = [str(select_gui_python(root)), str(Path(root) / "app.py"), flag]
         call = launcher or subprocess.Popen
         kwargs: dict[str, Any] = {
             "cwd": str(Path(root)),
             "close_fds": True,
+            "creationflags": detached_hidden_creation_flags(),
             "stdout": subprocess.DEVNULL,
             "stderr": subprocess.DEVNULL,
         }
-        if os.name == "nt":
-            kwargs["creationflags"] = 0x00000008 | 0x00000200
-        else:
+        if os.name != "nt":
             kwargs["start_new_session"] = True
         call(command, **kwargs)
         return True, ""

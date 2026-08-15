@@ -58,6 +58,7 @@ class PublicUpdaterGateTests(unittest.TestCase):
             # Stable recovery bundle sources are required before file application.
             source = Path(__file__).resolve().parents[1] / "nova" / "updater"
             for module in (
+                "process_launch.py",
                 "recovery_journal.py", "recovery_attempts.py", "recovery_files.py",
                 "recovery_environment.py", "recovery_state.py", "recovery_locking.py",
                 "recovery_handoff.py", "recovery_bootstrap.py",

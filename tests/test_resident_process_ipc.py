@@ -13,6 +13,7 @@ import unittest
 from assistant.instance_commands import InstanceCommandMailbox
 from assistant.instance_lock import InstanceLock
 from assistant.update_supervisor import create_supervisor_mutex
+from updater.process_launch import hidden_supervisor_creation_flags
 from updater.update_runner import SUPERVISOR_ALREADY_RUNNING_CODE, coordinate_runtime_shutdown
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -187,6 +188,31 @@ while time.monotonic() < deadline:
 lock.release(); raise SystemExit(72)
 '''
 
+WRAPPER_SCRIPT = r'''
+import subprocess, sys
+command = [sys.executable, "-c", sys.argv[1], *sys.argv[2:]]
+child = subprocess.Popen(command)
+raise SystemExit(child.wait())
+'''
+
+HIDDEN_CHILD_SCRIPT = r'''
+import os, sys, threading
+from pathlib import Path
+threading.Event().wait(0.5)
+Path(sys.argv[1]).write_text(str(os.getpid()), encoding="utf-8")
+'''
+
+HIDDEN_PARENT_SCRIPT = r'''
+import subprocess, sys
+from updater.process_launch import hidden_supervisor_creation_flags
+subprocess.Popen(
+    [sys.executable, "-c", sys.argv[1], sys.argv[2]],
+    creationflags=hidden_supervisor_creation_flags(),
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL,
+)
+'''
+
 
 @unittest.skipUnless(os.name == "nt", "real kernel resident integration is executed on windows-latest")
 class ResidentProcessIPCTests(unittest.TestCase):
@@ -226,6 +252,67 @@ class ResidentProcessIPCTests(unittest.TestCase):
                 if result is not None: result.release_guard()
                 if owner_proc.poll() is None:
                     owner_proc.terminate(); owner_proc.wait(timeout=3)
+
+    def test_wrapper_pid_is_not_accepted_in_place_of_authoritative_runtime_owner(self):
+        with tempfile.TemporaryDirectory() as td:
+            folder = Path(td)
+            lock_path, owner_path, commands = self._paths(folder)
+            marker = folder / "shown.marker"
+            wrapper = subprocess.Popen(
+                [sys.executable, "-c", WRAPPER_SCRIPT, OWNER_SCRIPT, str(lock_path), str(owner_path), str(commands), str(marker)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                env=_env(),
+            )
+            coordinated = None
+            try:
+                owner = _wait_for_owner(owner_path, 5.0)
+                self.assertTrue(owner, f"runtime owner metadata was not published; wrapper_rc={wrapper.poll()}")
+                self.assertNotEqual(wrapper.pid, int(owner["pid"]))
+                rejected = coordinate_runtime_shutdown(
+                    NOVA_ROOT,
+                    timeout=0.2,
+                    expected_pid=wrapper.pid,
+                    lock_factory=lambda: InstanceLock(path=lock_path, owner_path=owner_path, publish_owner=False, role="observer"),
+                    guard_factory=lambda: InstanceLock(path=lock_path, owner_path=owner_path, publish_owner=False, role="updater"),
+                    mailbox=InstanceCommandMailbox(commands),
+                )
+                self.assertFalse(rejected.ok)
+                self.assertEqual(rejected.error, "runtime_owner_pid_mismatch")
+                self.assertIsNone(wrapper.poll(), "rejecting the wrapper must leave the real runtime running")
+
+                coordinated = coordinate_runtime_shutdown(
+                    NOVA_ROOT,
+                    timeout=5.0,
+                    expected_pid=int(owner["pid"]),
+                    lock_factory=lambda: InstanceLock(path=lock_path, owner_path=owner_path, publish_owner=False, role="observer"),
+                    guard_factory=lambda: InstanceLock(path=lock_path, owner_path=owner_path, publish_owner=False, role="updater"),
+                    mailbox=InstanceCommandMailbox(commands),
+                )
+                self.assertTrue(coordinated.ok, coordinated.error)
+                self.assertEqual(coordinated.owner_pid, int(owner["pid"]))
+                self.assertNotEqual(coordinated.owner_pid, wrapper.pid)
+                wrapper.wait(timeout=5)
+            finally:
+                if coordinated is not None:
+                    coordinated.release_guard()
+                if wrapper.poll() is None:
+                    wrapper.terminate(); wrapper.wait(timeout=3)
+
+    def test_hidden_supervisor_profile_survives_parent_process_exit(self):
+        with tempfile.TemporaryDirectory() as td:
+            marker = Path(td) / "child-survived.marker"
+            parent = subprocess.Popen(
+                [sys.executable, "-c", HIDDEN_PARENT_SCRIPT, HIDDEN_CHILD_SCRIPT, str(marker)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=_env(),
+            )
+            self.assertEqual(parent.wait(timeout=5), 0, parent.stderr.read())
+            self.assertTrue(_wait_for_path(marker, 5.0))
+            self.assertGreater(int(marker.read_text(encoding="utf-8")), 0)
+            self.assertEqual(hidden_supervisor_creation_flags() & 0x00000010, 0)
 
     def test_two_separate_senders_do_not_overwrite_commands(self):
         with tempfile.TemporaryDirectory() as td:

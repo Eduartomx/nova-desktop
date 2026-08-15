@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -116,6 +117,7 @@ class ResidentUpdaterTests(unittest.TestCase):
         self.assertNotIn("self.request_shutdown('update')", source)
         self.assertNotIn('self.request_shutdown("update")', source)
         self.assertNotIn("path.unlink(missing_ok=True)", source)
+        self.assertNotIn("CREATE_NEW_CONSOLE", source)
 
     def test_ui_successful_popen_tracks_process_disables_button_and_does_not_shutdown(self):
         with tempfile.TemporaryDirectory() as td:
@@ -134,6 +136,22 @@ class ResidentUpdaterTests(unittest.TestCase):
         self.assertTrue(ui.root.scheduled)
         ui.request_shutdown.assert_not_called()
         proc.wait.assert_not_called()
+
+    def test_ui_supervisor_uses_hidden_profile_and_persists_bootstrap_output(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = self._root_fixture(td)
+            ui = self._ui_fixture()
+            proc = _Proc(None)
+            with mock.patch("assistant.ui_workspace.hidden_supervisor_creation_flags", return_value=0x08000200), \
+                 mock.patch("assistant.ui_workspace.subprocess.Popen", return_value=proc) as popen:
+                ok = _start_update_supervisor(ui, root=root)
+            self.assertTrue(ok)
+            kwargs = popen.call_args.kwargs
+            self.assertEqual(kwargs["creationflags"], 0x08000200)
+            self.assertIs(kwargs["stderr"], subprocess.STDOUT)
+            self.assertNotEqual(kwargs["stdout"], subprocess.DEVNULL)
+            self.assertTrue(Path(kwargs["stdout"].name).is_relative_to(root / "data" / "updater_logs"))
+            self.assertTrue(Path(kwargs["stdout"].name).is_file())
 
     def test_rapid_double_click_starts_only_one_supervisor(self):
         with tempfile.TemporaryDirectory() as td:
@@ -202,6 +220,22 @@ class ResidentUpdaterTests(unittest.TestCase):
         self.assertEqual(ui.update_button.state, "normal")
         self.assertIn("ya existe una actualización en curso", ui.status_var.values[-1].lower())
         proc.wait.assert_not_called()
+
+    def test_supervisor_return_six_and_seven_preserve_contract_meanings(self):
+        cases = {
+            6: "terminación de pip no confirmada",
+            7: "recuperación requerida o en curso",
+        }
+        for rc, expected in cases.items():
+            with self.subTest(rc=rc):
+                ui = self._ui_fixture()
+                proc = _Proc(rc)
+                ui._update_supervisor_active = True
+                ui._update_supervisor_process = proc
+                _poll_update_supervisor(ui, root=Path(tempfile.gettempdir()), consume_status=mock.Mock(return_value=False))
+                self.assertIn(expected, ui.status_var.values[-1].lower())
+                self.assertFalse(ui._update_supervisor_active)
+                proc.wait.assert_not_called()
 
     def test_result_callback_runs_in_same_session_after_supervisor_exits(self):
         ui = self._ui_fixture()

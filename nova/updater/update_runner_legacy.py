@@ -14,6 +14,19 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+try:
+    from .process_launch import (
+        detached_hidden_creation_flags,
+        select_console_python,
+        select_gui_python,
+    )
+except ImportError:
+    from process_launch import (
+        detached_hidden_creation_flags,
+        select_console_python,
+        select_gui_python,
+    )
+
 SUPERVISOR_ALREADY_RUNNING_CODE = 5
 PIP_TERMINATION_UNCONFIRMED_CODE = 6
 
@@ -30,15 +43,8 @@ def read_version(root: Path) -> str:
 
 
 def console_python(root: Path) -> Path:
-    candidate = root / ".venv" / "Scripts" / "python.exe"
-    if candidate.exists():
-        return candidate
-    current = Path(sys.executable)
-    if current.name.casefold() == "pythonw.exe":
-        sibling = current.with_name("python.exe")
-        if sibling.exists():
-            return sibling
-    return current
+    """Compatibility facade for callers of the legacy runner API."""
+    return select_console_python(root)
 
 
 class _FILETIME(ctypes.Structure):
@@ -706,18 +712,14 @@ def write_status(
 
 def launch_nova(root: Path) -> tuple[bool, str]:
     try:
-        pyw = root / ".venv" / "Scripts" / "pythonw.exe"
-        py = pyw if pyw.exists() else console_python(root)
+        py = select_gui_python(root)
         app = root / "app.py"
         if not app.exists():
             return False, f"No existe {app}"
-        flags = 0
-        if os.name == "nt":
-            flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
         subprocess.Popen(
             [str(py), str(app), "--post-update"],
             cwd=str(root),
-            creationflags=flags,
+            creationflags=detached_hidden_creation_flags(),
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )

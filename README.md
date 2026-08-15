@@ -197,6 +197,7 @@ data/recovery_runtime/
   active.json
   generations/<generation>/
     manifest.json
+    process_launch.py
     recovery_bootstrap.py
     recovery_handoff.py
     recovery_state.py
@@ -207,7 +208,9 @@ data/recovery_runtime/
     recovery_locking.py
 ```
 
-Cada generación se escribe completa, se verifica por SHA-256 y solo después se reemplaza atómicamente `active.json`. La generación conocida como buena anterior no se sobreescribe en sitio. `recovery_handoff.py` forma parte del conjunto exacto hash-validado; una copia alterada impide crear el helper.
+Cada generación se escribe completa, se verifica por SHA-256 y solo después se reemplaza atómicamente `active.json`. La generación conocida como buena anterior no se sobreescribe en sitio. `process_launch.py` y `recovery_handoff.py` forman parte del conjunto exacto hash-validado; una copia alterada impide crear el helper.
+
+La selección de intérprete se centraliza en `process_launch.py`: los procesos internos usan el Python de consola del entorno sin abrir ventana, mientras el relanzamiento final prefiere `pythonw.exe` del mismo entorno. La UI inicia el supervisor con `CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP`, conserva `poll()` no bloqueante y escribe la salida temprana en `data/updater_logs`.
 
 En `app.py` el orden es **recovery gate antes de `_claim_instance`**. Se intenta primero el bootstrap administrado; si su import/ejecución falla y existe journal, se carga únicamente la generación estable cuyo manifest y archivos coinciden con sus hashes. Si ambas copias fallan, `app.py` usa `MessageBoxW` directamente en Windows y sale con 7, sin depender de stderr/pythonw, sin reclamar instancia y sin importar Tk completo, Agent ni módulos normales del asistente.
 

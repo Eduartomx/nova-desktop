@@ -72,6 +72,7 @@ def _stable_runtime_paths(root: Path) -> tuple[Path, dict]:
         raise RuntimeError("stable_recovery_manifest_invalid")
     files = manifest.get("files")
     expected_files = {
+        "process_launch.py",
         "recovery_journal.py", "recovery_attempts.py", "recovery_files.py", "recovery_environment.py",
         "recovery_state.py", "recovery_locking.py", "recovery_handoff.py", "recovery_bootstrap.py",
     }
@@ -92,6 +93,7 @@ def _load_stable_recovery_bootstrap(root: Path):
     state_path = generation_dir / "recovery_state.py"
     bootstrap_path = generation_dir / "recovery_bootstrap.py"
     module_names = (
+        "process_launch",
         "recovery_journal", "recovery_attempts", "recovery_files", "recovery_environment",
         "recovery_state", "recovery_locking", "recovery_handoff", "recovery_bootstrap",
     )

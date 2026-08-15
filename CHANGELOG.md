@@ -9,6 +9,8 @@
 - Añade `update_supervisor.lock` y fija el orden validado `supervisor mutex → runtime/recovery guard → motor/recovery deja estado validado → helper estable → release guard → CAS a cleared → helper relanza → release supervisor mutex`.
 - Un segundo supervisor devuelve código `5` sin cerrar Nova, tocar `update_last.json`, ejecutar updater/pip ni relanzar.
 - La UI evita doble clic, conserva el `Popen` del supervisor y usa `root.after()` + `poll()` sin `wait()` en Tk.
+- La UI elimina `CREATE_NEW_CONSOLE`: el supervisor usa `CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP` y redirige su salida temprana a `data/updater_logs` sin abrir consola o pestaña visible.
+- `process_launch.py` centraliza la selección de Python de consola/GUI sin resolver el venv al intérprete base; los dos caminos de relanzamiento final prefieren `pythonw.exe` del mismo entorno y conservan fallback oculto.
 - `update_runner.py` sigue siendo la única autoridad que solicita `shutdown_for_update` y ejecuta el motor interno **en el mismo proceso** mientras conserva supervisor mutex + runtime guard.
 - `--yes` deja de ser autorización interna. `resident_update_engine.py` ejecutado directamente devuelve error seguro antes de GitHub/staging/mutación/pip.
 - `nova_updater_legacy.py` queda bloqueado como entrypoint directo antes de sus side effects; el código legacy permanece solo como implementación importable de compatibilidad.
@@ -38,7 +40,7 @@
 - Una discrepancia de dependencias transiciona a `dependency_repair_required`, conserva cuarentena + backup y bloquea el relanzamiento.
 - El snapshot valida compatibilidad, pero **no implementa rollback bit-a-bit de `.venv`** y no convierte el `requirements.txt` no fijado en un lockfile reproducible.
 - Antes de aplicar archivos se prepara `data/recovery_runtime/`: generaciones stdlib-only inmutables con manifest y SHA-256; `active.json` se reemplaza solo después de verificar la generación nueva, conservando la copia buena anterior.
-- El bundle estable incluye `recovery_handoff.py` y `app.py` exige el conjunto exacto de archivos/hash; modificar el helper invalida la generación completa.
+- El bundle estable incluye `process_launch.py` y `recovery_handoff.py`; `app.py` exige el conjunto exacto de archivos/hash y una alteración invalida la generación completa.
 - Si el proceso muere entre `transaction_prepared` y la creación del bundle estable, recovery solo puede reconstruirlo automáticamente mientras `files_may_have_changed=false`, cuando el árbol administrado todavía es el previo a la actualización.
 - `app.py` ejecuta recovery antes de `_claim_instance`, Tk, core, Agent y UI. Si el bootstrap administrado falla con journal activo, intenta la generación estable validada por hash.
 - Si bootstrap administrado y estable fallan, Windows muestra `MessageBoxW` desde `app.py` y sale con `7`; `pythonw.exe` no depende de stderr como único canal.

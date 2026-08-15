@@ -30,6 +30,7 @@ class RecoveryHandoffTests(unittest.TestCase):
     def _validated_fixture(self, td: str):
         fx = RecoveryFixture(Path(td))
         for name in (
+            "process_launch.py",
             "recovery_journal.py", "recovery_attempts.py", "recovery_files.py",
             "recovery_environment.py", "recovery_state.py", "recovery_locking.py",
             "recovery_handoff.py", "recovery_bootstrap.py",
@@ -114,19 +115,24 @@ class RecoveryHandoffTests(unittest.TestCase):
             token = "b" * 32
             cleared = self._clear(fx, journal, token=token)
             calls = []
-            ok, detail = launch_nova_after_clear(
-                fx.root,
-                journal["attempt_id"],
-                journal["generation"],
-                journal["state"],
-                token,
-                "post-update",
-                launcher=lambda command, **kwargs: calls.append((list(command), kwargs)) or object(),
-            )
+            gui = fx.root / "external" / "Scripts" / "pythonw.exe"
+            with mock.patch("updater.recovery_handoff.select_gui_python", return_value=gui), \
+                 mock.patch("updater.recovery_handoff.detached_hidden_creation_flags", return_value=0x208):
+                ok, detail = launch_nova_after_clear(
+                    fx.root,
+                    journal["attempt_id"],
+                    journal["generation"],
+                    journal["state"],
+                    token,
+                    "post-update",
+                    launcher=lambda command, **kwargs: calls.append((list(command), kwargs)) or object(),
+                )
             self.assertTrue(ok, detail)
             self.assertEqual(len(calls), 1)
+            self.assertEqual(Path(calls[0][0][0]), gui)
             self.assertEqual(Path(calls[0][0][1]), fx.root / "app.py")
             self.assertIn("--post-update", calls[0][0])
+            self.assertEqual(calls[0][1]["creationflags"], 0x208)
 
             wrong_calls = []
             wrong, wrong_detail = launch_nova_after_clear(
@@ -142,6 +148,27 @@ class RecoveryHandoffTests(unittest.TestCase):
             self.assertEqual(wrong_detail, "handoff_cleared_generation_mismatch")
             self.assertEqual(wrong_calls, [])
             self.assertEqual(cleared["generation"], journal["generation"] + 1)
+
+    def test_handoff_helper_uses_selected_console_interpreter(self):
+        with tempfile.TemporaryDirectory() as td:
+            fx, journal = self._validated_fixture(td)
+            console = fx.root / "external" / "Scripts" / "python.exe"
+            calls = []
+            with mock.patch("updater.recovery_handoff.select_console_python", return_value=console), \
+                 mock.patch("updater.recovery_handoff.detached_hidden_creation_flags", return_value=0x208):
+                ok, detail = spawn_handoff_helper(
+                    fx.root,
+                    journal["attempt_id"],
+                    journal["generation"],
+                    journal["state"],
+                    "h" * 32,
+                    "post-update",
+                    launcher=lambda command, **kwargs: calls.append((list(command), kwargs)) or object(),
+                )
+            self.assertTrue(ok, detail)
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(Path(calls[0][0][0]), console)
+            self.assertEqual(calls[0][1]["creationflags"], 0x208)
 
     def test_helper_spawn_failure_keeps_validated_quarantine_and_guard(self):
         with tempfile.TemporaryDirectory() as td:

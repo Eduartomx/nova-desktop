@@ -20,6 +20,7 @@ class StableRecoveryBootstrapTests(unittest.TestCase):
         (root / "data").mkdir()
         source = Path(__file__).resolve().parents[1] / "nova" / "updater"
         for name in (
+            "process_launch.py",
             "recovery_journal.py", "recovery_attempts.py", "recovery_files.py",
             "recovery_environment.py", "recovery_state.py", "recovery_locking.py",
             "recovery_handoff.py", "recovery_bootstrap.py",
@@ -35,6 +36,7 @@ class StableRecoveryBootstrapTests(unittest.TestCase):
             second = prepare_stable_recovery_runtime(root)
             runtime = root / "data" / "recovery_runtime"
             self.assertNotEqual(first["generation"], second["generation"])
+            self.assertTrue((runtime / "generations" / first["generation"] / "process_launch.py").is_file())
             self.assertTrue((runtime / "generations" / first["generation"] / "recovery_bootstrap.py").is_file())
             self.assertTrue((runtime / "generations" / second["generation"] / "recovery_handoff.py").is_file())
             active = json.loads((runtime / "active.json").read_text(encoding="utf-8"))
@@ -48,6 +50,15 @@ class StableRecoveryBootstrapTests(unittest.TestCase):
             manifest = prepare_stable_recovery_runtime(root)
             target = root / "data" / "recovery_runtime" / "generations" / manifest["generation"]
             (target / "recovery_handoff.py").write_text("tampered", encoding="utf-8")
+            with self.assertRaises(RuntimeError):
+                app._load_stable_recovery_bootstrap(root)
+
+    def test_missing_process_launch_module_invalidates_stable_generation(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = self._root(td)
+            manifest = prepare_stable_recovery_runtime(root)
+            target = root / "data" / "recovery_runtime" / "generations" / manifest["generation"]
+            (target / "process_launch.py").unlink()
             with self.assertRaises(RuntimeError):
                 app._load_stable_recovery_bootstrap(root)
 

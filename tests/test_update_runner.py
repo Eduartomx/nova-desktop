@@ -190,6 +190,36 @@ class UpdateRunnerTests(unittest.TestCase):
         self.assertTrue(result.lock_acquired)
         result.release_guard()
 
+    def test_owner_change_during_native_capture_is_rejected_without_command(self):
+        shared = _SharedLock(holder="runtime")
+        initial = dict(shared.owner)
+        changed = dict(initial, owner_id="b" * 32)
+
+        class Observer:
+            def __init__(self):
+                self.reads = 0
+
+            def read_owner(self):
+                self.reads += 1
+                return dict(initial if self.reads <= 2 else changed)
+
+        observer = Observer()
+        mailbox = _Mailbox()
+        process = _Process(shared, terminates=False)
+        with patch("updater.update_runner_legacy.time.monotonic", side_effect=[0.0, 0.0, 1.0, 1.0]):
+            result = coordinate_runtime_shutdown(
+                Path(tempfile.gettempdir()),
+                timeout=0.0,
+                lock_factory=lambda: observer,
+                guard_factory=self.lock_factory(shared),
+                mailbox=mailbox,
+                process_factory=lambda pid: process,
+            )
+        self.assertFalse(result.ok)
+        self.assertEqual(result.error, "runtime_owner_changed_during_capture")
+        self.assertEqual(mailbox.calls, [])
+        self.assertEqual(process.wait_calls, 0)
+
     def test_stale_runtime_metadata_with_free_lock_is_recovered(self):
         shared = _SharedLock(holder=None, role="runtime")
         process = _Process(shared, already_terminated=True)
@@ -360,13 +390,18 @@ class UpdateRunnerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             (root / "app.py").write_text("# test\n", encoding="utf-8")
-            with patch("updater.update_runner.subprocess.Popen") as popen:
+            gui = root / "external" / "Scripts" / "pythonw.exe"
+            with patch("updater.update_runner_legacy.select_gui_python", return_value=gui), \
+                 patch("updater.update_runner_legacy.detached_hidden_creation_flags", return_value=0x208), \
+                 patch("updater.update_runner.subprocess.Popen") as popen:
                 ok, _detail = launch_nova(root)
             self.assertTrue(ok)
             popen.assert_called_once()
             command = popen.call_args.args[0]
+            self.assertEqual(Path(command[0]), gui)
             self.assertEqual(command[-1], "--post-update")
             self.assertNotIn("--background", command)
+            self.assertEqual(popen.call_args.kwargs["creationflags"], 0x208)
 
     def _run_main_case(
         self,

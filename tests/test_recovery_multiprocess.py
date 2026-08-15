@@ -22,6 +22,7 @@ from updater.recovery_state import (
 REPO = Path(__file__).resolve().parents[1]
 NOVA = REPO / "nova"
 STABLE_MODULES = (
+    "process_launch.py",
     "recovery_journal.py", "recovery_attempts.py", "recovery_files.py",
     "recovery_environment.py", "recovery_state.py", "recovery_locking.py",
     "recovery_handoff.py", "recovery_bootstrap.py",

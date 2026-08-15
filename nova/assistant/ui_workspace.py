@@ -3,11 +3,12 @@ from __future__ import annotations
 import json
 import os
 import subprocess
-import sys
 import threading
+import time
 from pathlib import Path
 
 from .doctor import NovaDoctor
+from updater.process_launch import hidden_supervisor_creation_flags, select_console_python
 
 SUPERVISOR_ALREADY_RUNNING_CODE = 5
 PIP_TERMINATION_UNCONFIRMED_CODE = 6
@@ -133,10 +134,7 @@ def _start_update_supervisor(ui, *, root: Path | None = None, popen=None, show_e
     """Start one resident-aware updater without initiating local shutdown."""
     root = Path(root) if root is not None else Path(__file__).resolve().parent.parent
     runner = root / 'updater' / 'update_runner.py'
-    py = root / '.venv' / 'Scripts' / 'python.exe'
-    if not py.exists():
-        current = Path(sys.executable)
-        py = current.with_name('python.exe') if current.name.casefold() == 'pythonw.exe' and current.with_name('python.exe').exists() else current
+    py = select_console_python(root)
 
     existing = getattr(ui, '_update_supervisor_process', None)
     if bool(getattr(ui, '_update_supervisor_active', False)):
@@ -173,14 +171,27 @@ def _start_update_supervisor(ui, *, root: Path | None = None, popen=None, show_e
     except Exception:
         pass
 
+    bootstrap_log = root / 'data' / 'updater_logs' / 'update_supervisor_bootstrap_error.log'
     try:
         launcher = popen or subprocess.Popen
-        proc = launcher(
-            [str(py), str(runner), '--parent-pid', str(os.getpid())],
-            cwd=str(root),
-            creationflags=getattr(subprocess, 'CREATE_NEW_CONSOLE', 0),
-        )
+        logs = root / 'data' / 'updater_logs'
+        logs.mkdir(parents=True, exist_ok=True)
+        bootstrap_log = logs / f'update_supervisor_bootstrap_{time.strftime("%Y%m%d_%H%M%S")}_{os.getpid()}.log'
+        with open(bootstrap_log, 'a', encoding='utf-8', errors='replace') as stream:
+            proc = launcher(
+                [str(py), str(runner), '--parent-pid', str(os.getpid())],
+                cwd=str(root),
+                creationflags=hidden_supervisor_creation_flags(),
+                stdout=stream,
+                stderr=subprocess.STDOUT,
+            )
     except Exception as exc:
+        try:
+            bootstrap_log.parent.mkdir(parents=True, exist_ok=True)
+            with open(bootstrap_log, 'a', encoding='utf-8', errors='replace') as stream:
+                stream.write(f'No pude iniciar el supervisor: {type(exc).__name__}: {exc}\n')
+        except Exception:
+            pass
         report_error(str(exc))
         return False
 

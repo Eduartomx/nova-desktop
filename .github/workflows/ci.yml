@@ -28,6 +28,8 @@ jobs:
           PYTHONPATH: nova
         run: |
           python -m unittest -v \
+            tests.test_process_launch \
+            tests.test_updater_resident \
             tests.test_recovery_handoff \
             tests.test_recovery_terminal_state \
             tests.test_update_runner \
@@ -114,7 +116,7 @@ jobs:
       - name: Validated recovery handoff focal gate
         env:
           PYTHONPATH: nova
-        run: python -m unittest -v tests.test_recovery_handoff tests.test_recovery_terminal_state tests.test_update_runner tests.test_recovery_bootstrap tests.test_stable_recovery_bootstrap tests.test_update_crash_recovery tests.test_recovery_multiprocess
+        run: python -m unittest -v tests.test_process_launch tests.test_updater_resident tests.test_recovery_handoff tests.test_recovery_terminal_state tests.test_update_runner tests.test_recovery_bootstrap tests.test_stable_recovery_bootstrap tests.test_update_crash_recovery tests.test_recovery_multiprocess tests.test_resident_process_ipc
       - name: Pre-mutation stable recovery gap
         env:
           PYTHONPATH: nova
