@@ -37,7 +37,7 @@ class UpdateCrashRecoveryTests(unittest.TestCase):
         for module in (
             "recovery_journal.py", "recovery_attempts.py", "recovery_files.py",
             "recovery_environment.py", "recovery_state.py", "recovery_locking.py",
-            "recovery_bootstrap.py",
+            "recovery_handoff.py", "recovery_bootstrap.py",
         ):
             shutil.copy2(NOVA / "updater" / module, root / "updater" / module)
         (root / "app.py").write_text("VALUE=1\n", encoding="utf-8")
