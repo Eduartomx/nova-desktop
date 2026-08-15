@@ -5,11 +5,9 @@ from __future__ import annotations
 import argparse
 import ctypes
 from ctypes import wintypes
-import hashlib
 import json
 import os
 from pathlib import Path
-import subprocess
 import sys
 from typing import Any
 
@@ -29,6 +27,11 @@ try:
         transition_journal,
         validate_restored_install,
     )
+    from .recovery_handoff import (
+        VALIDATED_STATES,
+        launch_nova_after_clear,
+        perform_validated_handoff,
+    )
 except ImportError:
     from recovery_state import (
         RECOVERY_REQUIRED_EXIT_CODE,
@@ -45,6 +48,11 @@ except ImportError:
         transition_journal,
         validate_restored_install,
     )
+    from recovery_handoff import (
+        VALIDATED_STATES,
+        launch_nova_after_clear,
+        perform_validated_handoff,
+    )
 
 ROLLBACK_ENTRY_STATES = {
     "transaction_prepared",
@@ -58,20 +66,10 @@ ROLLBACK_ENTRY_STATES = {
     "rollback_in_progress",
 }
 
-
 try:
     from .recovery_locking import _runtime_guard, _supervisor_lock
 except ImportError:
     from recovery_locking import _runtime_guard, _supervisor_lock
-
-def _launch_post_recovery(root: Path, launcher=None) -> tuple[bool, str]:
-    command = [sys.executable, str(Path(root) / "app.py"), "--post-recovery"]
-    try:
-        launch = launcher or subprocess.Popen
-        launch(command, cwd=str(root), close_fds=True)
-        return True, ""
-    except Exception as exc:
-        return False, f"post_recovery_launch_failed:{type(exc).__name__}"
 
 
 def _call_validator(validator, root: Path, journal: dict[str, Any], backup: Path) -> tuple[bool, str]:
@@ -85,11 +83,7 @@ def _call_validator(validator, root: Path, journal: dict[str, Any], backup: Path
 
 def _is_dependency_validation_error(detail: str) -> bool:
     text = str(detail or "")
-    prefixes = (
-        "dependency_",
-        "critical_import_",
-    )
-    return text.startswith(prefixes)
+    return text.startswith(("dependency_", "critical_import_"))
 
 
 def recover_pending(
@@ -105,6 +99,8 @@ def recover_pending(
     lock_factories=None,
     progress_hook=None,
     persist_waiting_state: bool = True,
+    handoff_crash_hook=None,
+    handoff_timeout_seconds: float = 20.0,
 ) -> RecoveryResult:
     root = Path(root)
     try:
@@ -117,14 +113,32 @@ def recover_pending(
     supervisor = None
     runtime = None
     factories = lock_factories or {}
+
+    def release_runtime_once() -> None:
+        nonlocal runtime
+        guard = runtime
+        runtime = None
+        if guard is not None:
+            guard.release()
+
     try:
         if not supervisor_already_held:
             supervisor = (factories.get("supervisor") or _supervisor_lock)()
             if not supervisor.acquire():
-                return RecoveryResult(True, RECOVERY_REQUIRED_EXIT_CODE, str(initial.get("state") or "recovery"), "recovery supervisor already active")
+                return RecoveryResult(
+                    True,
+                    RECOVERY_REQUIRED_EXIT_CODE,
+                    str(initial.get("state") or "recovery"),
+                    "recovery supervisor already active",
+                )
         runtime = (factories.get("runtime") or _runtime_guard)()
         if not runtime.acquire():
-            return RecoveryResult(True, RECOVERY_REQUIRED_EXIT_CODE, str(initial.get("state") or "recovery"), "runtime/recovery guard is busy")
+            return RecoveryResult(
+                True,
+                RECOVERY_REQUIRED_EXIT_CODE,
+                str(initial.get("state") or "recovery"),
+                "runtime/recovery guard is busy",
+            )
 
         journal = load_journal(root, backup_root=backup_root)
         if journal is None or journal.get("state") == "cleared" or not journal.get("recovery_required"):
@@ -132,32 +146,50 @@ def recover_pending(
 
         blocking, inspect_errors = evaluate_remaining_processes(journal, inspector=inspector)
         if journal.get("identity_verification_required"):
-            return RecoveryResult(True, RECOVERY_REQUIRED_EXIT_CODE, str(journal["state"]), "legacy process identity cannot be verified automatically")
+            return RecoveryResult(
+                True,
+                RECOVERY_REQUIRED_EXIT_CODE,
+                str(journal["state"]),
+                "legacy process identity cannot be verified automatically",
+            )
         if blocking or inspect_errors:
             if persist_waiting_state and journal["state"] == "pip_termination_unconfirmed":
                 journal = transition_journal(
-                    root, journal, "waiting_for_processes", backup_root=backup_root,
+                    root,
+                    journal,
+                    "waiting_for_processes",
+                    backup_root=backup_root,
                     errors=(list(journal.get("errors") or []) + list(inspect_errors))[-128:],
                 )
             elif persist_waiting_state and inspect_errors:
                 journal = append_journal_error(root, journal, inspect_errors[-1], backup_root=backup_root)
-            return RecoveryResult(True, RECOVERY_REQUIRED_EXIT_CODE, "waiting_for_processes", "waiting for strong process identities")
+            return RecoveryResult(
+                True,
+                RECOVERY_REQUIRED_EXIT_CODE,
+                "waiting_for_processes",
+                "waiting for strong process identities",
+            )
 
         backup = resolve_backup(root, journal, backup_root=backup_root)
         state = str(journal["state"])
 
         if state == "dependency_repair_required":
-            return RecoveryResult(True, RECOVERY_REQUIRED_EXIT_CODE, state, "dependency repair required before Nova can start")
-
-        if state == "update_validated":
-            journal = transition_journal(root, journal, "cleared", backup_root=backup_root)
-            state = "cleared"
+            return RecoveryResult(
+                True,
+                RECOVERY_REQUIRED_EXIT_CODE,
+                state,
+                "dependency repair required before Nova can start",
+            )
 
         if state in ROLLBACK_ENTRY_STATES:
             if state != "rollback_in_progress":
                 journal = transition_journal(
-                    root, journal, "rollback_in_progress", backup_root=backup_root,
-                    remaining_processes=[], files_rollback_attempted=True,
+                    root,
+                    journal,
+                    "rollback_in_progress",
+                    backup_root=backup_root,
+                    remaining_processes=[],
+                    files_rollback_attempted=True,
                 )
             try:
                 if restore_func is None:
@@ -168,13 +200,22 @@ def recover_pending(
                     except TypeError:
                         restore_func(root, backup)
             except Exception as exc:
-                journal = append_journal_error(root, journal, f"rollback_failed:{type(exc).__name__}:{exc}", backup_root=backup_root)
+                journal = append_journal_error(
+                    root,
+                    journal,
+                    f"rollback_failed:{type(exc).__name__}:{exc}",
+                    backup_root=backup_root,
+                )
                 return RecoveryResult(True, RECOVERY_REQUIRED_EXIT_CODE, "rollback_in_progress", "rollback failed")
             if progress_hook is not None:
                 progress_hook("after_restore_before_validation", journal)
             journal = transition_journal(
-                root, journal, "rollback_completed", backup_root=backup_root,
-                files_rollback_attempted=True, files_rollback_ok=True,
+                root,
+                journal,
+                "rollback_completed",
+                backup_root=backup_root,
+                files_rollback_attempted=True,
+                files_rollback_ok=True,
             )
             state = "rollback_completed"
 
@@ -190,63 +231,135 @@ def recover_pending(
             if not valid:
                 if journal.get("dependencies_may_have_changed") and _is_dependency_validation_error(detail):
                     journal = transition_journal(
-                        root, journal, "dependency_repair_required", backup_root=backup_root,
+                        root,
+                        journal,
+                        "dependency_repair_required",
+                        backup_root=backup_root,
                         errors=(list(journal.get("errors") or []) + [_sanitize(detail, 500)])[-128:],
                     )
-                    return RecoveryResult(True, RECOVERY_REQUIRED_EXIT_CODE, "dependency_repair_required", _sanitize(detail))
+                    return RecoveryResult(
+                        True,
+                        RECOVERY_REQUIRED_EXIT_CODE,
+                        "dependency_repair_required",
+                        _sanitize(detail),
+                    )
                 journal = append_journal_error(root, journal, detail, backup_root=backup_root)
-                return RecoveryResult(True, RECOVERY_REQUIRED_EXIT_CODE, "rollback_validation_in_progress", _sanitize(detail))
+                return RecoveryResult(
+                    True,
+                    RECOVERY_REQUIRED_EXIT_CODE,
+                    "rollback_validation_in_progress",
+                    _sanitize(detail),
+                )
             journal = transition_journal(
-                root, journal, "rollback_validation_completed", backup_root=backup_root,
+                root,
+                journal,
+                "rollback_validation_completed",
+                backup_root=backup_root,
                 validation_detail=_sanitize(detail, 500),
             )
             state = "rollback_validation_completed"
             if progress_hook is not None:
                 progress_hook("after_validation_before_clear", journal)
 
-        if state == "rollback_validation_completed":
-            journal = transition_journal(
-                root, journal, "cleared", backup_root=backup_root,
-                files_rollback_attempted=True, files_rollback_ok=True,
+        if state not in VALIDATED_STATES:
+            return RecoveryResult(
+                True,
+                RECOVERY_REQUIRED_EXIT_CODE,
+                state,
+                "recovery state requires manual inspection",
             )
-            state = "cleared"
-
-        if state != "cleared":
-            return RecoveryResult(True, RECOVERY_REQUIRED_EXIT_CODE, state, "recovery state requires manual inspection")
 
         if not launch_after_success:
-            return RecoveryResult(False, 0, "cleared", "recovery completed", recovered=True, launched=False, continue_startup=True)
-
-        runtime.release()
-        runtime = None
-        launched, launch_error = _launch_post_recovery(root, launcher=launcher)
-        if not launched:
             try:
-                current = load_journal(root, backup_root=backup_root)
-                if current is not None and current.get("state") == "cleared":
-                    transition_journal(
-                        root, current, "rollback_validation_completed", backup_root=backup_root,
-                        recovery_required=True,
-                        errors=(list(current.get("errors") or []) + [launch_error])[-128:],
-                    )
-            except Exception:
-                pass
-            return RecoveryResult(True, RECOVERY_REQUIRED_EXIT_CODE, "rollback_validation_completed", launch_error, recovered=True, launched=False)
-        return RecoveryResult(False, 0, "cleared", "recovery completed", recovered=True, launched=True, continue_startup=False)
+                release_runtime_once()
+            except Exception as exc:
+                return RecoveryResult(
+                    True,
+                    RECOVERY_REQUIRED_EXIT_CODE,
+                    state,
+                    f"runtime_guard_release_failed:{type(exc).__name__}",
+                    recovered=True,
+                    launched=False,
+                    continue_startup=False,
+                )
+            try:
+                journal = transition_journal(
+                    root,
+                    journal,
+                    "cleared",
+                    backup_root=backup_root,
+                    files_rollback_attempted=bool(journal.get("files_rollback_attempted")),
+                    files_rollback_ok=journal.get("files_rollback_ok"),
+                )
+            except RecoveryJournalError as exc:
+                return RecoveryResult(
+                    True,
+                    RECOVERY_REQUIRED_EXIT_CODE,
+                    state,
+                    _sanitize(exc),
+                    recovered=True,
+                    launched=False,
+                    continue_startup=False,
+                )
+            return RecoveryResult(
+                False,
+                0,
+                "cleared",
+                "recovery completed without launch",
+                recovered=True,
+                launched=False,
+                continue_startup=True,
+            )
+
+        mode = "post-update" if state == "update_validated" else "post-recovery"
+        handoff = perform_validated_handoff(
+            root,
+            journal,
+            mode,
+            release_guard=release_runtime_once,
+            helper_launcher=launcher,
+            crash_hook=handoff_crash_hook,
+            timeout_seconds=handoff_timeout_seconds,
+            backup_root=backup_root,
+        )
+        if not handoff.ok:
+            return RecoveryResult(
+                True,
+                RECOVERY_REQUIRED_EXIT_CODE,
+                handoff.state or state,
+                handoff.detail,
+                recovered=True,
+                launched=False,
+                continue_startup=False,
+            )
+        return RecoveryResult(
+            False,
+            0,
+            "cleared",
+            "recovery handoff scheduled",
+            recovered=True,
+            launched=True,
+            continue_startup=False,
+        )
     except RecoveryJournalError as exc:
         return RecoveryResult(True, RECOVERY_REQUIRED_EXIT_CODE, "invalid", _sanitize(exc))
     except Exception as exc:
         try:
             current = load_journal(root, backup_root=backup_root)
             if current is not None and current.get("state") != "cleared":
-                append_journal_error(root, current, f"recovery_exception:{type(exc).__name__}:{exc}", backup_root=backup_root)
+                append_journal_error(
+                    root,
+                    current,
+                    f"recovery_exception:{type(exc).__name__}:{exc}",
+                    backup_root=backup_root,
+                )
         except Exception:
             pass
         return RecoveryResult(True, RECOVERY_REQUIRED_EXIT_CODE, "failed", f"recovery_failed:{type(exc).__name__}")
     finally:
         if runtime is not None:
             try:
-                runtime.release()
+                release_runtime_once()
             except Exception:
                 pass
         if supervisor is not None:
@@ -339,9 +452,32 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="Nova persistent recovery bootstrap")
     parser.add_argument("--status", action="store_true")
     parser.add_argument("--recover", action="store_true")
+    parser.add_argument("--handoff-launch", action="store_true")
     parser.add_argument("--root", default="")
+    parser.add_argument("--attempt-id", default="")
+    parser.add_argument("--expected-generation", type=int, default=0)
+    parser.add_argument("--expected-state", default="")
+    parser.add_argument("--handoff-token", default="")
+    parser.add_argument("--handoff-mode", default="")
+    parser.add_argument("--handoff-timeout", type=float, default=20.0)
     args = parser.parse_args(argv)
     root = Path(args.root).resolve() if args.root else Path(__file__).resolve().parents[1]
+
+    if args.handoff_launch:
+        ok, detail = launch_nova_after_clear(
+            root,
+            args.attempt_id,
+            args.expected_generation,
+            args.expected_state,
+            args.handoff_token,
+            args.handoff_mode,
+            timeout_seconds=args.handoff_timeout,
+        )
+        if not ok:
+            print(f"HANDOFF_BLOCKED {detail}", file=sys.stderr)
+            return RECOVERY_REQUIRED_EXIT_CODE
+        return 0
+
     try:
         journal = load_journal(root)
     except RecoveryJournalError as exc:
