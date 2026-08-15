@@ -73,7 +73,7 @@ def _stable_runtime_paths(root: Path) -> tuple[Path, dict]:
     files = manifest.get("files")
     expected_files = {
         "recovery_journal.py", "recovery_attempts.py", "recovery_files.py", "recovery_environment.py",
-        "recovery_state.py", "recovery_locking.py", "recovery_bootstrap.py",
+        "recovery_state.py", "recovery_locking.py", "recovery_handoff.py", "recovery_bootstrap.py",
     }
     if not isinstance(files, dict) or set(files) != expected_files:
         raise RuntimeError("stable_recovery_files_invalid")
@@ -93,7 +93,7 @@ def _load_stable_recovery_bootstrap(root: Path):
     bootstrap_path = generation_dir / "recovery_bootstrap.py"
     module_names = (
         "recovery_journal", "recovery_attempts", "recovery_files", "recovery_environment",
-        "recovery_state", "recovery_locking", "recovery_bootstrap",
+        "recovery_state", "recovery_locking", "recovery_handoff", "recovery_bootstrap",
     )
     old_modules = {name: sys.modules.get(name) for name in module_names}
     old_path = list(sys.path)
