@@ -4,6 +4,7 @@ import json
 import multiprocessing
 import os
 from pathlib import Path
+import shutil
 import tempfile
 import unittest
 
@@ -12,8 +13,18 @@ from updater.recovery_state import (
     StaleJournalWriterError,
     create_transaction_journal,
     load_journal,
+    prepare_stable_recovery_runtime,
     restore_backup_idempotent,
     transition_journal,
+)
+
+
+REPO = Path(__file__).resolve().parents[1]
+NOVA = REPO / "nova"
+STABLE_MODULES = (
+    "recovery_journal.py", "recovery_attempts.py", "recovery_files.py",
+    "recovery_environment.py", "recovery_state.py", "recovery_locking.py",
+    "recovery_handoff.py", "recovery_bootstrap.py",
 )
 
 
@@ -71,6 +82,8 @@ class RecoveryMultiprocessTests(unittest.TestCase):
         (root / "app.py").write_text("VALUE=1\n", encoding="utf-8")
         (root / "updater" / "nova_updater.py").write_text("VALUE=1\n", encoding="utf-8")
         (root / "updater" / "update_runner.py").write_text("VALUE=1\n", encoding="utf-8")
+        for name in STABLE_MODULES:
+            shutil.copy2(NOVA / "updater" / name, root / "updater" / name)
         (root / "updater" / "managed_files.json").write_text('{"files":["f.txt"]}', encoding="utf-8")
         (backup / "control" / "managed_files.json").write_text('{"files":["f.txt"]}', encoding="utf-8")
         (root / "f.txt").write_text("new", encoding="utf-8")
@@ -80,11 +93,12 @@ class RecoveryMultiprocessTests(unittest.TestCase):
             "modified_existing": ["f.txt"], "deleted_existing": [], "created_new": [], "unchanged": [],
             "managed_files": {"path": "updater/managed_files.json", "existed": True, "backup": "control/managed_files.json"},
         }), encoding="utf-8")
+        prepare_stable_recovery_runtime(root)
         journal = create_transaction_journal(root, backup, backup_root=backup_root)
         journal = transition_journal(root, journal, "files_applying", backup_root=backup_root, files_may_have_changed=True)
         return root, backup_root, journal
 
-    def test_two_real_processes_only_one_restores_validates_and_launches(self):
+    def test_two_real_processes_only_one_restores_validates_and_spawns_handoff(self):
         with tempfile.TemporaryDirectory() as td:
             root, backup_root, stale = self._fixture(td)
             lock_dir = Path(td) / "locks"; lock_dir.mkdir()
@@ -94,9 +108,6 @@ class RecoveryMultiprocessTests(unittest.TestCase):
             first = ctx.Process(target=_recovery_worker, args=(str(root), str(backup_root), str(lock_dir), entered, release, results, str(launch_log), True))
             first.start()
             self.assertTrue(entered.wait(15), "first recovery did not enter restore")
-            # Keep these semaphore-backed objects referenced by the parent until
-            # the spawned child has rebuilt them. Creating them inline lets the
-            # resource tracker unlink them before spawn completes on Linux.
             second_entered = ctx.Event(); second_release = ctx.Event()
             second = ctx.Process(target=_recovery_worker, args=(str(root), str(backup_root), str(lock_dir), second_entered, second_release, results, str(launch_log), False))
             second.start(); second.join(15)
