@@ -22,7 +22,7 @@ class StableRecoveryBootstrapTests(unittest.TestCase):
         for name in (
             "recovery_journal.py", "recovery_attempts.py", "recovery_files.py",
             "recovery_environment.py", "recovery_state.py", "recovery_locking.py",
-            "recovery_bootstrap.py",
+            "recovery_handoff.py", "recovery_bootstrap.py",
         ):
             shutil.copy2(source / name, root / "updater" / name)
         (root / "app.py").write_text("# fixture\n", encoding="utf-8")
@@ -36,6 +36,7 @@ class StableRecoveryBootstrapTests(unittest.TestCase):
             runtime = root / "data" / "recovery_runtime"
             self.assertNotEqual(first["generation"], second["generation"])
             self.assertTrue((runtime / "generations" / first["generation"] / "recovery_bootstrap.py").is_file())
+            self.assertTrue((runtime / "generations" / second["generation"] / "recovery_handoff.py").is_file())
             active = json.loads((runtime / "active.json").read_text(encoding="utf-8"))
             self.assertEqual(active["generation"], second["generation"])
             stable = app._load_stable_recovery_bootstrap(root)
@@ -46,7 +47,7 @@ class StableRecoveryBootstrapTests(unittest.TestCase):
             root = self._root(td)
             manifest = prepare_stable_recovery_runtime(root)
             target = root / "data" / "recovery_runtime" / "generations" / manifest["generation"]
-            (target / "recovery_state.py").write_text("tampered", encoding="utf-8")
+            (target / "recovery_handoff.py").write_text("tampered", encoding="utf-8")
             with self.assertRaises(RuntimeError):
                 app._load_stable_recovery_bootstrap(root)
 
