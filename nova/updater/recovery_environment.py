@@ -27,6 +27,7 @@ except ImportError:
     )
     from recovery_files import _reject_symlink_chain, validate_backup_path
 
+
 def _normalized_distribution_name(name: str) -> str:
     return re.sub(r"[-_.]+", "-", str(name or "").strip()).lower()
 
@@ -142,7 +143,13 @@ def _validate_python_files(root: Path) -> tuple[bool, str]:
     return True, "restored_files_validated"
 
 
-def _run_critical_imports(modules: list[str], *, python_executable: str | Path | None = None, timeout: float = 20.0, runner=None) -> tuple[bool, str]:
+def _run_critical_imports(
+    modules: list[str],
+    *,
+    python_executable: str | Path | None = None,
+    timeout: float = 20.0,
+    runner=None,
+) -> tuple[bool, str]:
     modules = [str(x) for x in modules if str(x).strip()]
     if not modules:
         return True, "critical_imports_not_required"
@@ -226,7 +233,7 @@ def prepare_stable_recovery_runtime(root: Path) -> dict[str, Any]:
     for name in (
         "recovery_journal.py", "recovery_attempts.py", "recovery_files.py",
         "recovery_environment.py", "recovery_state.py", "recovery_locking.py",
-        "recovery_bootstrap.py",
+        "recovery_handoff.py", "recovery_bootstrap.py",
     ):
         src = source_dir / name
         if not src.is_file() or src.is_symlink():
