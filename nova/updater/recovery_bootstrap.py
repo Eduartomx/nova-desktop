@@ -22,6 +22,7 @@ try:
         create_rollback_recovery_journal,
         evaluate_remaining_processes,
         load_journal,
+        prepare_stable_recovery_runtime,
         resolve_backup,
         restore_backup_idempotent,
         transition_journal,
@@ -31,6 +32,7 @@ try:
         VALIDATED_STATES,
         launch_nova_after_clear,
         perform_validated_handoff,
+        stable_bootstrap_path,
     )
 except ImportError:
     from recovery_state import (
@@ -43,6 +45,7 @@ except ImportError:
         create_rollback_recovery_journal,
         evaluate_remaining_processes,
         load_journal,
+        prepare_stable_recovery_runtime,
         resolve_backup,
         restore_backup_idempotent,
         transition_journal,
@@ -52,6 +55,7 @@ except ImportError:
         VALIDATED_STATES,
         launch_nova_after_clear,
         perform_validated_handoff,
+        stable_bootstrap_path,
     )
 
 ROLLBACK_ENTRY_STATES = {
@@ -84,6 +88,26 @@ def _call_validator(validator, root: Path, journal: dict[str, Any], backup: Path
 def _is_dependency_validation_error(detail: str) -> bool:
     text = str(detail or "")
     return text.startswith(("dependency_", "critical_import_"))
+
+
+def _ensure_pre_mutation_stable_runtime(root: Path, journal: dict[str, Any]) -> None:
+    """Repair only the safe gap before the first managed-file mutation.
+
+    A crash can occur after ``transaction_prepared`` but before the engine has
+    published the stable recovery bundle.  In that exact state the source tree
+    is still the pre-update tree, so regenerating the stdlib-only bundle is safe.
+    Once ``files_may_have_changed`` is true we never rebuild from managed files.
+    """
+    if str(journal.get("state") or "") != "transaction_prepared":
+        return
+    if bool(journal.get("files_may_have_changed")) or bool(journal.get("dependencies_may_have_changed")):
+        return
+    try:
+        stable_bootstrap_path(root)
+        return
+    except RecoveryJournalError:
+        prepare_stable_recovery_runtime(root)
+    stable_bootstrap_path(root)
 
 
 def recover_pending(
@@ -143,6 +167,17 @@ def recover_pending(
         journal = load_journal(root, backup_root=backup_root)
         if journal is None or journal.get("state") == "cleared" or not journal.get("recovery_required"):
             return RecoveryResult(False, 0, "cleared", "", continue_startup=True)
+
+        if launch_after_success:
+            try:
+                _ensure_pre_mutation_stable_runtime(root, journal)
+            except RecoveryJournalError as exc:
+                return RecoveryResult(
+                    True,
+                    RECOVERY_REQUIRED_EXIT_CODE,
+                    str(journal.get("state") or "transaction_prepared"),
+                    f"stable_recovery_prepare_failed:{_sanitize(exc)}",
+                )
 
         blocking, inspect_errors = evaluate_remaining_processes(journal, inspector=inspector)
         if journal.get("identity_verification_required"):
