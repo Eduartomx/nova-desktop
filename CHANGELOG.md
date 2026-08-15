@@ -6,24 +6,26 @@
 - X usa `withdraw()` solo con bandeja confirmada; una bandeja degradada nunca debe dejar Nova invisible sin mecanismo de recuperación.
 - El lock físico de instancia permanece adquirido hasta salir de `mainloop()`; `owner.json` identifica generaciones con PID + creation time + `owner_id` y el scope Windows usa usuario + Session ID sin persistir el SID en claro.
 - IPC residente usa archivos atómicos dirigidos a `target_owner_id`; solo acepta `show`, `shutdown_for_update` y `status`.
-- Añade `update_supervisor.lock` y fija el orden `supervisor mutex → runtime/recovery guard → update/recovery → release runtime guard → launch → release supervisor mutex`.
+- Añade `update_supervisor.lock` y fija el orden validado `supervisor mutex → runtime/recovery guard → motor/recovery deja estado validado → helper estable → release guard → CAS a cleared → helper relanza → release supervisor mutex`.
 - Un segundo supervisor devuelve código `5` sin cerrar Nova, tocar `update_last.json`, ejecutar updater/pip ni relanzar.
 - La UI evita doble clic, conserva el `Popen` del supervisor y usa `root.after()` + `poll()` sin `wait()` en Tk.
-- `update_runner.py` sigue siendo la única autoridad que solicita `shutdown_for_update` y ahora ejecuta el motor interno **en el mismo proceso** mientras conserva supervisor mutex + runtime guard.
+- `update_runner.py` sigue siendo la única autoridad que solicita `shutdown_for_update` y ejecuta el motor interno **en el mismo proceso** mientras conserva supervisor mutex + runtime guard.
 - `--yes` deja de ser autorización interna. `resident_update_engine.py` ejecutado directamente devuelve error seguro antes de GitHub/staging/mutación/pip.
 - `nova_updater_legacy.py` queda bloqueado como entrypoint directo antes de sus side effects; el código legacy permanece solo como implementación importable de compatibilidad.
 - El backup se crea y valida **antes** de toda mutación y, acto seguido, se publica de forma durable `update_recovery.json` con `schema_version=2` y estado `transaction_prepared`.
 - No se reemplaza/elimina ningún archivo, no se modifica `managed_files.json` y no se inicia pip antes de que exista ese journal durable.
 - `files_may_have_changed=true` se publica antes del primer reemplazo/eliminación; `dependencies_may_have_changed=true` se publica en `dependencies_starting` antes de permitir que pip ejecute código.
 - El supervisor inspecciona el journal tras cualquier salida del motor. Un rc inesperado con intento activo/corrupto devuelve `7` y **no relanza Nova**; la decisión ya no depende únicamente del código de retorno.
+- El motor no ejecuta el clear terminal: un update correcto termina en `update_validated` y un rollback correcto en `rollback_validation_completed`; el supervisor/recovery coordinator realiza el handoff final.
 - El journal schema 2 exige `attempt_id`, `generation` monotónica y un grafo explícito de transiciones.
 - Estados schema 2: `transaction_prepared`, `files_applying`, `files_applied`, `dependencies_starting`, `dependencies_running`, `update_validation_in_progress`, `update_validated`, `pip_termination_unconfirmed`, `waiting_for_processes`, `rollback_in_progress`, `rollback_completed`, `rollback_validation_in_progress`, `rollback_validation_completed`, `dependency_repair_required` y `cleared`.
+- `cleared` es terminal y no admite transiciones salientes, ni siquiera `cleared → cleared`; ningún fallo posterior de launch puede reabrir el journal.
 - Cada transición obtiene un lock del SO, relee el journal y aplica compare-and-swap sobre `attempt_id + generation`; escritores obsoletos no pueden sobrescribir otro intento ni estados más avanzados.
 - Journals schema 1 conocidos se migran explícitamente; JSON truncado, schema/estado desconocido o migración no demostrable fallan cerrados.
 - Las escrituras de journal usan temporal + `flush` + `fsync` cuando corresponde + `os.replace`; errores persistidos se sanitizan.
 - El restaurador de archivos se separa completamente de la publicación del journal: `rollback_in_progress` se publica **antes** de restaurar y el restaurador puro nunca borra ni sustituye el estado activo.
 - Rollback idempotente restaura modificados/eliminados, elimina únicamente `created_new`, restaura `managed_files.json` y revalida traversal/symlink/rutas autorizadas en cada reanudación.
-- Un crash a mitad de rollback puede reanudarse repitiendo la restauración; la cuarentena se limpia solo después de `rollback_validation_completed` satisfactorio.
+- Un crash a mitad de rollback puede reanudarse repitiendo la restauración; el motor deja el estado en `rollback_validation_completed` y el clear solo se autoriza durante el handoff final.
 - En Windows pip usa Job Object autoritativo con `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`: `CreateProcessW(CREATE_SUSPENDED) → AssignProcessToJobObject → ResumeThread`.
 - Si el Job no puede establecerse mientras pip sigue suspendido, pip no se considera iniciado y no existe fallback autoritativo a `psutil`.
 - Las estructuras, constantes, firmas ctypes y handles de Job/process/thread se gestionan explícitamente; jobs anidados se tratan de forma fail-closed.
@@ -36,15 +38,22 @@
 - Una discrepancia de dependencias transiciona a `dependency_repair_required`, conserva cuarentena + backup y bloquea el relanzamiento.
 - El snapshot valida compatibilidad, pero **no implementa rollback bit-a-bit de `.venv`** y no convierte el `requirements.txt` no fijado en un lockfile reproducible.
 - Antes de aplicar archivos se prepara `data/recovery_runtime/`: generaciones stdlib-only inmutables con manifest y SHA-256; `active.json` se reemplaza solo después de verificar la generación nueva, conservando la copia buena anterior.
+- El bundle estable incluye `recovery_handoff.py` y `app.py` exige el conjunto exacto de archivos/hash; modificar el helper invalida la generación completa.
+- Si el proceso muere entre `transaction_prepared` y la creación del bundle estable, recovery solo puede reconstruirlo automáticamente mientras `files_may_have_changed=false`, cuando el árbol administrado todavía es el previo a la actualización.
 - `app.py` ejecuta recovery antes de `_claim_instance`, Tk, core, Agent y UI. Si el bootstrap administrado falla con journal activo, intenta la generación estable validada por hash.
 - Si bootstrap administrado y estable fallan, Windows muestra `MessageBoxW` desde `app.py` y sale con `7`; `pythonw.exe` no depende de stderr como único canal.
+- `recovery_handoff.py` es la implementación compartida para update y recovery: verifica el journal exacto, valida el bootstrap estable, inicia el helper con el intento todavía activo, libera el runtime guard y solo entonces ejecuta el CAS `validated → cleared`.
+- El helper exige `attempt_id`, generation, estado de origen, modo y token exactos. Mientras el journal sigue validado espera; otro intento, otro writer, corrupción o timeout impiden el lanzamiento.
+- Una muerte real del supervisor después del spawn pero antes del CAS conserva cuarentena y el helper expira sin lanzar. Una muerte después del CAS permite que el helper independiente relance exactamente una vez.
+- Un fallo al iniciar el helper o liberar el guard conserva el estado validado; un CAS obsoleto conserva la generación más reciente y no autoriza launch.
+- Si `Popen(app.py)` falla después del `cleared` terminal, se registra en `data/updater_logs/recovery_handoff.log`; el journal no se reabre ni se reescribe.
 - Dos recovery supervisors reales no pueden restaurar/validar/relanzar a la vez; locks del kernel + CAS hacen que solo uno avance y el otro devuelva `7`.
 - Si se mata al propietario del recovery, el lock del SO se libera y otro proceso reanuda desde el journal durable.
-- Si el launch final falla después de validar/limpiar, la generación actual se vuelve a cuarentenar en `rollback_validation_completed`; el siguiente intento reintenta launch sin repetir rollback.
-- Añade pruebas subprocess reales que matan el motor con `os._exit` después del journal, primer archivo, mitad de apply, `files_applied`, antes de pip, antes/mitad/después de rollback/validation y antes del clear.
+- Añade pruebas subprocess reales que matan el motor con `os._exit` después del journal, primer archivo, mitad de apply, `files_applied`, antes de pip, antes/mitad/después de rollback/validation y antes del handoff.
+- Añade crash tests reales del handoff después del spawn y después del CAS, además de checks de guard-before-clear, token/generation exactos, bootstrap estable alterado, CAS stale y ausencia de doble launch/double-release.
 - Windows CI mata además al updater mientras un proceso está contenido por el Job Object y exige que ningún hijo sobreviva; esa prueba nativa falla CI si se reporta como skipped.
 - Añade pruebas de snapshot de dependencias, entrypoints directos inertes, bootstrap estable/tamper, CAS stale-writer, recovery multiproceso real y reanudación tras muerte del dueño del lock.
-- CI mantiene suite completa Ubuntu y Windows y repite las carreras Job Object/recovery multiproceso, además de lifecycle, IPC, session shutdown, Gaming Awareness, Instant Wake/hotkeys y core.
+- CI ejecuta primero un gate focal de handoff/terminal/update-runner/recovery/crash/multiprocess tanto en Ubuntu como Windows, seguido de las suites completas y las carreras Job Object/recovery repetidas.
 - Nova Doctor conserva diagnóstico del supervisor por mutex de kernel, último resultado y recovery/quarantine pendiente; no se exponen comandos completos, tokens, prompts ni contenido de archivos.
 - Autostart continúa bajo HKCU, sin administrador y desactivado por defecto; no elimina una entrada perteneciente a otra instalación.
 - `WM_QUERYENDSESSION`/`WM_ENDSESSION` continúan integrados al shutdown real para logoff/apagado de Windows.
