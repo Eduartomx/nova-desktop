@@ -49,7 +49,8 @@ ACTIVE_STATES = {
 ALL_STATES = ACTIVE_STATES | {"cleared"}
 
 # Explicit state graph. Same-state writes are only allowed where an operation
-# may append diagnostics/metadata without advancing the transaction.
+# may append diagnostics/metadata without advancing the transaction. ``cleared``
+# is terminal: even same-state writes are rejected after the final CAS.
 ALLOWED_TRANSITIONS: dict[str, set[str]] = {
     "transaction_prepared": {"transaction_prepared", "files_applying", "rollback_in_progress"},
     "files_applying": {"files_applying", "files_applied", "rollback_in_progress"},
@@ -67,9 +68,7 @@ ALLOWED_TRANSITIONS: dict[str, set[str]] = {
     },
     "rollback_validation_completed": {"rollback_validation_completed", "cleared"},
     "dependency_repair_required": {"dependency_repair_required"},
-    # A launch failure may re-quarantine a *current* cleared generation. CAS
-    # prevents an older payload from performing this transition.
-    "cleared": {"cleared", "rollback_validation_completed"},
+    "cleared": set(),
 }
 
 CRITICAL_IMPORTS_BY_DISTRIBUTION = {
