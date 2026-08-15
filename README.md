@@ -57,22 +57,25 @@ Está desactivado por defecto y usa `HKCU\Software\Microsoft\Windows\CurrentVers
 
 ## Updater residente seguro
 
-`update_runner.py` adquiere primero `update_supervisor.lock`, antes de leer el runtime o enviar `shutdown_for_update`. El orden normal obligatorio es:
+`update_runner.py` adquiere primero `update_supervisor.lock`, antes de leer el runtime o enviar `shutdown_for_update`. Para una transacción que llega a un estado validado, el orden obligatorio es:
 
 ```text
 supervisor mutex
-→ coordinación/guard del runtime
-→ transacción o recovery
-→ liberación del guard del runtime
-→ intento acotado de launch
-→ liberación del supervisor mutex
+→ coordinación + runtime/recovery guard
+→ transacción/recovery deja journal validado activo
+→ verificar attempt_id + generation + estado
+→ iniciar helper desde bootstrap estable hash-validado
+→ liberar runtime/recovery guard
+→ CAS del intento exacto a cleared
+→ helper observa ese cleared y relanza Nova una sola vez
+→ liberar supervisor mutex
 ```
 
 El orden inverso no se usa. Si UI, `ACTUALIZAR_NOVA.cmd` o ejecución directa intentan iniciar simultáneamente otro supervisor, solo uno puede poseer el mutex. El segundo no envía `shutdown_for_update`, no ejecuta el updater, no modifica `update_last.json`, no relanza Nova y termina con código **5 — actualización ya en curso**.
 
 La UI no inicia un cierre local al pulsar **Actualizar**. Guarda la referencia al supervisor, marca `_update_supervisor_active`, deshabilita el botón y rechaza dobles pulsaciones mientras ese proceso siga vivo. El seguimiento usa `poll()` mediante `root.after()` y nunca bloquea Tk con `wait()`.
 
-El supervisor sigue siendo la única autoridad que envía `shutdown_for_update`; ese comando llega a `RuntimeLifecycleManager`, que lo traduce a `request_shutdown("update")`. Después de una coordinación correcta, el guard del runtime permanece adquirido durante staging, journal, reemplazo, dependencias, validación y rollback.
+El supervisor sigue siendo la única autoridad que envía `shutdown_for_update`; ese comando llega a `RuntimeLifecycleManager`, que lo traduce a `request_shutdown("update")`. Después de una coordinación correcta, el guard del runtime permanece adquirido durante staging, journal, reemplazo, dependencias, validación y rollback; solo el handoff validado lo consume antes del CAS terminal.
 
 ### Motor interno sin entrypoint privilegiado
 
@@ -82,7 +85,7 @@ El motor de actualización ya no se autoriza con `--yes`. `update_runner.py`, mi
 
 ### Journal antes de toda mutación
 
-La transacción ahora publica un journal durable inmediatamente después de crear y validar el backup y **antes** de reemplazar/eliminar un archivo, modificar `managed_files.json`, ejecutar pip o validar la nueva instalación.
+La transacción publica un journal durable inmediatamente después de crear y validar el backup y **antes** de reemplazar/eliminar un archivo, modificar `managed_files.json`, ejecutar pip o validar la nueva instalación.
 
 Orden esencial:
 
@@ -98,11 +101,14 @@ crear + validar backup
    (dependencies_may_have_changed=true ANTES de ejecutar pip)
 → dependencies_running
 → update_validation_in_progress
-→ update_validated
+→ update_validated  (el motor termina aquí)
+→ handoff del supervisor
 → cleared
 ```
 
 Una muerte anterior a la creación del backup/journal no implica mutación de la instalación. Una muerte posterior a `transaction_prepared` deja una barrera persistente y el supervisor no decide relanzar Nova únicamente por el código de salida del motor: vuelve a inspeccionar el journal durable.
+
+Existe además una recuperación específica para el único hueco previo a mutación: si el proceso muere después de `transaction_prepared` pero antes de publicar `data/recovery_runtime/`, y `files_may_have_changed=false`, el bootstrap puede reconstruir de forma segura la generación estable desde la fuente todavía intacta. Una vez que los archivos pueden haber cambiado, esa reconstrucción desde el árbol administrado queda prohibida.
 
 ### Máquina de estados schema 2 + CAS
 
@@ -127,6 +133,8 @@ rollback_validation_completed
 dependency_repair_required
 cleared
 ```
+
+`cleared` es **terminal**: no admite transición a recovery ni siquiera una escritura `cleared → cleared`. Un fallo posterior de `Popen` se registra fuera del journal y no puede reabrir la transacción terminal.
 
 El grafo de transiciones es explícito; no se aceptan saltos arbitrarios. Las escrituras usan temporal + `flush` + `fsync` cuando corresponde + `os.replace`. Journals schema 1 conocidos se migran de forma explícita; JSON truncado, esquema desconocido o estados no migrables fallan cerrados.
 
@@ -190,6 +198,7 @@ data/recovery_runtime/
   generations/<generation>/
     manifest.json
     recovery_bootstrap.py
+    recovery_handoff.py
     recovery_state.py
     recovery_journal.py
     recovery_attempts.py
@@ -198,43 +207,46 @@ data/recovery_runtime/
     recovery_locking.py
 ```
 
-Cada generación se escribe completa, se verifica por SHA-256 y solo después se reemplaza atómicamente `active.json`. La generación conocida como buena anterior no se sobreescribe en sitio.
+Cada generación se escribe completa, se verifica por SHA-256 y solo después se reemplaza atómicamente `active.json`. La generación conocida como buena anterior no se sobreescribe en sitio. `recovery_handoff.py` forma parte del conjunto exacto hash-validado; una copia alterada impide crear el helper.
 
 En `app.py` el orden es **recovery gate antes de `_claim_instance`**. Se intenta primero el bootstrap administrado; si su import/ejecución falla y existe journal, se carga únicamente la generación estable cuyo manifest y archivos coinciden con sus hashes. Si ambas copias fallan, `app.py` usa `MessageBoxW` directamente en Windows y sale con 7, sin depender de stderr/pythonw, sin reclamar instancia y sin importar Tk completo, Agent ni módulos normales del asistente.
 
-### Recuperación reanudable e idempotente
+### Handoff validado y recuperación reanudable
 
-Cuando las identidades pendientes dejan de estar vivas, solo un proceso puede recuperar:
+Tanto un update correcto como un recovery correcto usan el mismo mecanismo compartido en `recovery_handoff.py`. El motor nunca limpia el journal: termina en `update_validated` o `rollback_validation_completed`.
+
+El handoff realiza:
 
 ```text
-supervisor mutex
-→ runtime/recovery guard
-→ recargar journal + CAS
-→ validar backup/manifest
-→ rollback_in_progress
-→ restauración pura e idempotente
-→ rollback_completed
-→ rollback_validation_in_progress
-→ validar archivos + dependencias cuando corresponde
-→ rollback_validation_completed
-→ cleared
-→ release runtime/recovery guard
-→ un solo launch --post-recovery
-→ release supervisor mutex
+supervisor mutex retenido
+→ runtime/recovery guard retenido
+→ releer journal y verificar attempt_id + generation + estado validado
+→ validar por SHA el bootstrap estable completo
+→ Popen del helper estable mientras el journal sigue activo
+→ crash hook de prueba, si existe
+→ liberar runtime/recovery guard
+→ CAS exacto validated → cleared con token de handoff
+→ helper observa cleared del mismo attempt/generation/token
+→ helper ejecuta app.py --post-update o --post-recovery exactamente una vez
+→ liberar supervisor mutex
 ```
 
-El restaurador nuevo **no administra ni borra journals**. Restaura modificados/eliminados, elimina solo `created_new`, restaura `managed_files.json` y vuelve a validar traversal/symlinks en cada reanudación. Una muerte a mitad del rollback permite repetirlo de forma segura.
+El helper no acepta otro `attempt_id`, otra generación, otro estado, otro token ni un journal corrupto. Mientras el estado validado sigue activo, espera de forma acotada y **no lanza Nova**.
 
-Si falla rollback o validación, journal y backup permanecen. Si el launch final falla después de validar/limpiar, el intento actual se vuelve a cuarentenar en `rollback_validation_completed`; el siguiente recovery reintenta el launch sin repetir innecesariamente el rollback.
+Si el helper no puede crearse, no se libera/limpia el intento. Si falla la liberación del guard, no existe CAS a `cleared`. Si un escritor vuelve obsoleta la generación antes del CAS, el clear falla y el helper queda sin autorización. Si el supervisor muere después de crear el helper pero antes del CAS, la cuarentena queda activa y el helper expira sin lanzar. Si muere después del CAS, el helper independiente ya autorizado puede relanzar Nova.
+
+Después de `cleared`, el journal es terminal. Si el `Popen` final de Nova falla, el helper registra el fallo en `data/updater_logs/recovery_handoff.log`; no reescribe ni reabre `update_recovery.json`.
+
+El restaurador **no administra ni borra journals**. Restaura modificados/eliminados, elimina solo `created_new`, restaura `managed_files.json` y vuelve a validar traversal/symlinks en cada reanudación. Una muerte a mitad del rollback permite repetirlo de forma segura.
 
 ### Códigos principales
 
 - `0`: operación correspondiente completada.
-- `3`: update correcto pero falló el relanzamiento normal heredado.
+- `3`: camino sin transacción durable completado pero falló su relanzamiento heredado.
 - `4`: coordinación no verificable o entrypoint interno directo bloqueado.
 - `5`: otro supervisor ya está activo.
 - `6`: pip pudo ejecutar y su terminación no pudo confirmarse.
-- `7`: recuperación obligatoria/activa/corrupta o motor terminó con intento durable todavía activo.
+- `7`: recuperación obligatoria/activa/corrupta, handoff no autorizado o motor terminó con intento durable todavía activo.
 
 ## Atajos
 
@@ -262,10 +274,13 @@ Resident Mode y recovery no añaden screenshots, captura de teclado, memoria de 
 
 ## Pruebas
 
-Ubuntu ejecuta `compileall`, suite completa y suites explícitas de updater/recovery. Windows ejecuta además Job Object real, carrera root→child repetida, muerte abrupta del updater con proceso dentro del Job sin permitir `skip`, crash reales mediante `os._exit` en fronteras transaccionales, dos recovery supervisors en procesos reales, muerte del dueño del lock y reanudación, lifecycle, IPC, session shutdown, Gaming Awareness, Instant Wake/hotkeys y core.
+Ubuntu y Windows ejecutan primero el gate focal del handoff (`test_recovery_handoff`, terminal state, update runner, bootstrap, stable bootstrap, crash recovery y multiprocess), luego `compileall`/suite completa y las regresiones explícitas. Windows ejecuta además Job Object real, carrera root→child repetida, muerte abrupta del updater con proceso dentro del Job sin permitir `skip`, crash reales mediante `os._exit`, dos recovery supervisors en procesos reales, muerte del dueño del lock y reanudación, lifecycle, IPC, session shutdown, Gaming Awareness, Instant Wake/hotkeys y core.
 
-Las pruebas nuevas se concentran en:
+Las pruebas de recovery/handoff incluyen:
 
+- `tests/test_recovery_handoff.py`
+- `tests/test_recovery_terminal_state.py`
+- `tests/test_recovery_pre_mutation_bootstrap.py`
 - `tests/test_recovery_bootstrap.py`
 - `tests/test_recovery_update_gate.py`
 - `tests/test_pip_job_object.py`
@@ -294,8 +309,9 @@ Si el bootstrap administrado no funciona, el aviso nativo de `app.py` muestra el
 - El rollback cubre archivos administrados y valida el entorno; no crea un snapshot bit-a-bit de `.venv`.
 - Daño de disco/I/O, corrupción fuera del conjunto administrado o cambios externos concurrentes pueden requerir reparación manual.
 - El snapshot exacto detecta diferencias de distribuciones/versiones, pero no convierte un `requirements.txt` no fijado en un entorno reproducible.
+- Después de un `cleared` terminal, un fallo del proceso final de Nova queda registrado pero no puede reabrir automáticamente la transacción; requiere diagnóstico/reintento normal del usuario.
 - Ante cualquier identidad, journal, backup, manifest, hash o validación que no pueda demostrarse, la política es mantener la cuarentena en lugar de asumir éxito.
 
 ## Validación manual pendiente
 
-Antes de aprobar v0.9.9 deben probarse en una **instalación/fixture descartable de Windows 11**, no dañando la instalación principal: actualización normal; doble clic; timeout de pip confirmado; terminación no confirmada simulada; persistencia de cuarentena tras reiniciar Nova/Windows; bloqueo de startup/update; desaparición de identidades fuertes; recovery reanudado; snapshot de dependencias; bootstrap estable; restauración/validación; un solo `--post-recovery`; y fallo simulado de recovery conservando journal/backup.
+Antes de aprobar v0.9.9 deben probarse en una **instalación/fixture descartable de Windows 11**, no dañando la instalación principal: actualización normal; doble clic; timeout de pip confirmado; terminación no confirmada simulada; persistencia de cuarentena tras reiniciar Nova/Windows; bloqueo de startup/update; desaparición de identidades fuertes; recovery reanudado; snapshot de dependencias; bootstrap estable; handoff post-update/post-recovery; muerte del supervisor antes/después del CAS; restauración/validación; un solo relanzamiento; y fallo simulado de recovery conservando journal/backup.
