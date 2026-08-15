@@ -23,6 +23,22 @@ jobs:
         run: python -m pip install --disable-pip-version-check psutil pillow pystray requests beautifulsoup4
       - name: Compile source
         run: python -m compileall -q nova
+      - name: Validated recovery handoff focal gate
+        env:
+          PYTHONPATH: nova
+        run: |
+          python -m unittest -v \
+            tests.test_recovery_handoff \
+            tests.test_recovery_terminal_state \
+            tests.test_update_runner \
+            tests.test_recovery_bootstrap \
+            tests.test_stable_recovery_bootstrap \
+            tests.test_update_crash_recovery \
+            tests.test_recovery_multiprocess
+      - name: Pre-mutation stable recovery gap
+        env:
+          PYTHONPATH: nova
+        run: python -m unittest -v tests.test_recovery_pre_mutation_bootstrap
       - name: Nova full test suite
         env:
           PYTHONPATH: nova
@@ -95,6 +111,14 @@ jobs:
         run: python -m pip install --disable-pip-version-check psutil pillow pystray requests beautifulsoup4
       - name: Compile all Nova source on Windows
         run: python -m compileall -q nova
+      - name: Validated recovery handoff focal gate
+        env:
+          PYTHONPATH: nova
+        run: python -m unittest -v tests.test_recovery_handoff tests.test_recovery_terminal_state tests.test_update_runner tests.test_recovery_bootstrap tests.test_stable_recovery_bootstrap tests.test_update_crash_recovery tests.test_recovery_multiprocess
+      - name: Pre-mutation stable recovery gap
+        env:
+          PYTHONPATH: nova
+        run: python -m unittest -v tests.test_recovery_pre_mutation_bootstrap
       - name: Recovery bootstrap unit suite
         env:
           PYTHONPATH: nova
