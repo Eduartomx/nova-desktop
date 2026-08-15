@@ -6,7 +6,9 @@ GitHub (`Eduartomx/nova-desktop`) es la fuente de verdad. El updater estable sin
 
 ## Estado
 
-La base publicada es **v0.9.8 — Gaming Reliability**. La rama de desarrollo prepara **v0.9.9 — Resident Mode & Runtime Lifecycle**; no debe publicarse hasta validación manual y aprobación explícita.
+La versión estable preparada para publicación es **v0.9.9 — Resident Mode & Runtime Lifecycle**. La implementación y el hardening del Resident Runtime están completados.
+
+Nova v0.9.9 finalizó correctamente las suites completas de Ubuntu y Windows y una validación manual controlada r17 en Windows 11 del lifecycle residente, la actualización sin consola visible, la identidad autoritativa del runtime y el handoff transaccional.
 
 ### v0.9.8 — Gaming Reliability
 
