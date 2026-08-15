@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import tempfile
 import unittest
 from pathlib import Path
@@ -7,6 +8,14 @@ from pathlib import Path
 from assistant.agent_anomaly import anomaly_direct_intent
 from assistant.anomaly import AnomalyDetector
 from assistant.config import DEFAULT_CONFIG
+
+
+class _CollectingTemporaryDirectory(tempfile.TemporaryDirectory):
+    """Collect transient sqlite connection cycles before Windows removes the fixture."""
+
+    def cleanup(self):
+        gc.collect()
+        super().cleanup()
 
 
 class FakeEngine:
@@ -50,7 +59,7 @@ class AnomalyDetectionTests(unittest.TestCase):
         }
 
     def test_learns_baseline_then_emits_sustained_system_anomaly(self):
-        with tempfile.TemporaryDirectory() as td:
+        with _CollectingTemporaryDirectory() as td:
             engine = FakeEngine(self._state())
             detector = AnomalyDetector(
                 engine,
@@ -78,7 +87,7 @@ class AnomalyDetectionTests(unittest.TestCase):
             self.assertTrue(any(x["event_type"] == "system_cpu_anomaly" for x in second["events"]))
 
     def test_gaming_context_treats_high_cpu_as_expected_until_extreme(self):
-        with tempfile.TemporaryDirectory() as td:
+        with _CollectingTemporaryDirectory() as td:
             engine = FakeEngine(self._state(cpu=70, memory=55, process="javaw.exe", app_kind="game"))
             detector = AnomalyDetector(
                 engine,
@@ -94,7 +103,7 @@ class AnomalyDetectionTests(unittest.TestCase):
             self.assertFalse(any(x["event_type"] == "system_cpu_anomaly" for x in result["events"]))
 
     def test_new_heavy_process_is_detected_and_user_can_mark_expected(self):
-        with tempfile.TemporaryDirectory() as td:
+        with _CollectingTemporaryDirectory() as td:
             engine = FakeEngine(self._state())
             normal = [{"pid": 10, "name": "msedge.exe", "cpu_percent": 3, "memory_percent": 4}]
             heavy = normal + [{"pid": 20, "name": "mystery.exe", "cpu_percent": 60, "memory_percent": 11}]
@@ -121,7 +130,7 @@ class AnomalyDetectionTests(unittest.TestCase):
             self.assertFalse(any(x["event_type"] == "process_resource_anomaly" for x in detector.sample_once()["events"]))
 
     def test_crash_signal_escalates_when_repeated(self):
-        with tempfile.TemporaryDirectory() as td:
+        with _CollectingTemporaryDirectory() as td:
             engine = FakeEngine(self._state())
             detector = AnomalyDetector(
                 engine,
@@ -137,7 +146,7 @@ class AnomalyDetectionTests(unittest.TestCase):
             self.assertEqual(second[0]["severity"], "high")
 
     def test_privacy_status_routing_and_defaults(self):
-        with tempfile.TemporaryDirectory() as td:
+        with _CollectingTemporaryDirectory() as td:
             detector = AnomalyDetector(
                 FakeEngine(self._state()),
                 FakeIntelligence(),

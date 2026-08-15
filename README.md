@@ -1,218 +1,322 @@
 # Nova Desktop
 
-Nova es un asistente virtual local para Windows: Ollama + herramientas reales de escritorio/navegador + memoria/workspaces + percepción + Skills + verificación y escalación experta opcional.
+Nova es un asistente virtual local para Windows con Ollama, herramientas de escritorio/navegador, memoria y workspaces, Perception, Gaming Awareness, Skills, voz local y updater GitHub-native.
 
-## Estado actual
+GitHub (`Eduartomx/nova-desktop`) es la fuente de verdad. El updater estable sincroniza código desde la Release/tag publicada, valida Git blob SHA y conserva backup/rollback; no depende de ZIPs.
 
-**Nova v0.9.5 — Gaming Awareness**
+## Estado
 
-GitHub es la fuente oficial. Las Releases estables se sincronizan por tag mediante el updater nativo, con verificación de Git blob SHA, backup y rollback. No hacen falta ZIPs de Release.
+La versión estable preparada para publicación es **v0.9.9 — Resident Mode & Runtime Lifecycle**. La implementación y el hardening del Resident Runtime están completados.
 
-## Qué cambia en 0.9.5
+Nova v0.9.9 finalizó correctamente las suites completas de Ubuntu y Windows y una validación manual controlada r17 en Windows 11 del lifecycle residente, la actualización sin consola visible, la identidad autoritativa del runtime y el handoff transaccional.
 
-0.9.5 hace que Instant Wake sea consciente de juegos y de la presión de VRAM:
+### v0.9.8 — Gaming Reliability
 
-- `GamingAwarenessManager` combina Perception Engine con procesos conocidos, rutas de bibliotecas Steam/Xbox/Epic y señales de Minecraft Java;
-- usa tiempos de permanencia al entrar/salir para evitar rebotes por alt-tab o procesos breves;
-- la política `smart` libera Qwen cuando el juego está en primer plano o existe presión real de VRAM;
-- antes de liberar el modelo suspende nuevas precargas y aplica temporalmente `keep_alive=0` a las inferencias locales;
-- una inferencia activa nunca se interrumpe para descargar Qwen;
-- si Nova necesita responder mientras juegas, Qwen puede cargarse para esa consulta y volver a liberarse después;
-- al salir del juego, Nova restaura la política normal y puede precargar Qwen otra vez si Gaming Mode fue quien lo descargó;
-- Perception reduce temporalmente su polling de 1100 ms a 2500 ms durante Gaming Mode;
-- el nuevo botón **🎮 Juego** permite modo automático/forzado/desactivado, política `smart/always/never` y decidir si Qwen debe permanecer cargado;
-- Nova Doctor muestra juego detectado, razón de la política de VRAM, VRAM observada/recuperada y frecuencia efectiva de Perception.
+- valida identidad/frescura del juego;
+- excluye Wallpaper Engine como falso positivo;
+- launchers/helpers/updaters no mantienen Gaming Mode;
+- sincroniza UI mediante eventos Tk-safe;
+- protege la restauración de Qwen frente a carreras;
+- añade validación específica en Windows CI.
 
-Comandos útiles:
+### v0.9.9 — Resident Mode & Runtime Lifecycle
 
-```text
-Nova, ¿estás en modo juego?
-Nova, activa modo juego.
-Nova, desactiva modo juego.
-Nova, vuelve a modo juego automático.
-Nova, mantén Qwen cargado aunque esté jugando.
-Nova, libera Qwen cuando juegue.
-Nova, ¿por qué liberaste Qwen?
-```
+Resident Mode separa **ocultar la ventana** de **terminar Nova**. Con una bandeja confirmada como operativa, X usa `withdraw()` y Nova continúa con hotkeys, wake word, F9, Perception, Gaming Awareness y política de Qwen activas.
 
-Gaming Awareness no lee memoria del juego, no inyecta DLLs/código, no captura teclado y no usa screenshots para detectar juegos.
+Si la bandeja falla o no confirma su inicialización, Nova queda visible y X vuelve a cerrar normalmente. `--background` nunca debe dejar un proceso invisible sin icono operativo.
 
-## Qué cambia en 0.9.4
+El cierre real es idempotente. `RuntimeLifecycleManager` bloquea trabajo nuevo, detiene voz/wake, Gaming/Perception, Browser Agent, guarda estado, aplica `unload_on_exit`, detiene bandeja y hook de sesión y destruye Tk. El lock físico de instancia permanece adquirido durante esa limpieza y `app.py` lo libera únicamente al salir de `mainloop()`.
 
-0.9.4 usa las métricas obtenidas en 0.9.3 para atacar el cold start sin cambiar de modelo:
+## Una sola instancia por usuario/sesión
 
-- `LLMWarmManager` precarga Qwen localmente en segundo plano al iniciar Nova mediante una petición vacía de Ollama;
-- las inferencias normales renuevan un `keep_alive` centralizado de 20 minutos por defecto, evitando recargas innecesarias sin reservar VRAM indefinidamente;
-- Nova consulta `/api/ps` para mostrar si el modelo está cargado, la VRAM reportada por Ollama y su expiración;
-- `Nova, ¿Qwen está cargado?`, `Nova, precarga Qwen` y `Nova, libera la VRAM` son rutas locales deterministas;
-- al cerrar Nova el modelo se descarga de Ollama por defecto;
-- el atajo principal pasa a **Ctrl+Alt+N** y el de contexto a **Ctrl+Alt+Shift+N**;
-- los antiguos defaults basados en Espacio se migran automáticamente;
-- el botón **⚙ Atajos** permite validar, guardar y aplicar nuevas combinaciones globales sin reiniciar Nova.
-
-La precarga usa `messages: []`: no envía prompts, respuestas ni resultados a servicios externos.
-
-## Qué cambia en 0.9.3
-
-0.9.3 convierte la latencia de Ollama en un problema medible en vez de una única cifra agregada:
-
-- cada llamada local a `/api/chat` captura las métricas que Ollama ya devuelve: `total_duration`, `load_duration`, `prompt_eval_count`, `prompt_eval_duration`, `eval_count` y `eval_duration`;
-- Nova calcula velocidad de evaluación/generación, tokens de entrada/salida, tamaño estructural del contexto, cantidad de mensajes y cantidad de tools expuestas;
-- en NVIDIA puede tomar una muestra puntual de GPU/VRAM antes y después de la inferencia mediante `nvidia-smi`; no existe polling agresivo de GPU por esta función;
-- `data/llm_performance.db` persiste únicamente métricas técnicas. No guarda prompts, respuestas, argumentos de herramientas ni secretos;
-- Performance Profiler añade `session_id`, por lo que Nova Doctor separa **sesión actual**, **15 min**, **1 h** y **24 h** en vez de mezclar una versión recién actualizada con eventos históricos;
-- Nova clasifica causas probables como cold start, prompt/contexto pesado, generación lenta, presión de VRAM, demasiadas tools o una proporción elevada de timeouts;
-- `Nova, prueba tu rendimiento` ejecuta un benchmark local explícito y acotado con tres casos: respuesta corta, razonamiento breve y selección con tools;
-- el benchmark nunca se ejecuta automáticamente, no llama a proveedores externos y limita la generación con `num_predict`.
-
-Comandos útiles:
+Antes de cargar Agent/Tk/servicios, Nova adquiere un lock del kernel. En Windows el scope usa el SID del usuario **solo en memoria**, guarda únicamente su hash y lo combina con Windows Session ID.
 
 ```text
-Nova, prueba tu rendimiento.
-Nova, ¿por qué Ollama tarda tanto?
-Nova, rendimiento de Qwen de esta sesión.
-Nova, muestra tu rendimiento de los últimos 15 minutos.
+%LOCALAPPDATA%\Nova\runtime\scope-<scope_id>\
+  runtime.lock
+  update_supervisor.lock
+  owner.json
+  commands\
 ```
 
-## Qué cambia en 0.9.2
+`runtime.lock` protege la instancia residente. `update_supervisor.lock` es un mutex independiente para garantizar **un solo supervisor de actualización por usuario/sesión**. En ambos casos el lock del kernel es la autoridad; PID o metadata no sustituyen la exclusión.
 
-0.9.2 corrige trabajo costoso innecesario detectado por Performance Profiler:
+`owner.json` registra PID, tiempo real de creación del proceso, `owner_id`/generación aleatoria, rol (`runtime` o `updater`), scope, hash de usuario, Session ID y timestamp. Una segunda ejecución normal no construye Agent/Tk/servicios: envía `show` al `owner_id` actual y solo devuelve éxito si pudo entregar la orden.
 
-- preguntas deterministas como `Nova, ¿qué versión tienes?`, estado del sistema, top de procesos y workspace activo se resuelven antes de Semantic Memory/Ollama/Confidence/Expert;
-- el contexto de memoria pasa a modo adaptativo: la recuperación léxica SQLite es la ruta barata por defecto y los embeddings se reservan para referencias a conversaciones previas, preferencias, continuidad o proyecto;
-- si no existen recuerdos, `memory_search` no despierta Ollama para embeddings;
-- el timeout del LLM local deja de reutilizar `internet.timeout_seconds`; el valor local por defecto es 45 s para evitar abortar inferencias válidas solo porque Internet esté configurado a 12 s;
-- Fast Routing mantiene el turno en el historial local y Performance Profiler continúa midiendo su latencia, pero no genera una escalación experta innecesaria.
+## IPC residente
 
-El objetivo es que una consulta de metadatos locales se mida en milisegundos/cientos de milisegundos, mientras que Qwen se reserve para consultas que realmente necesitan generación o razonamiento.
+No se abren puertos ni servidores. Cada orden es un archivo atómico independiente con `command_id`, `target_owner_id`, `command` y `created_at`. Solo se aceptan `show`, `shutdown_for_update` y `status`.
 
-## Qué cambió en 0.9.0
+Mensajes malformados, vencidos o dirigidos a otra generación se eliminan sin ejecutarse. Archivos separados evitan que emisores concurrentes se sobrescriban.
 
-Hasta 0.8.x, `agent.py`, `tools.py`, `ui.py` y `task_engine.py` seguían siendo archivos históricos presentes en la instalación local pero no recuperables desde el repositorio. Los módulos modernos de Nova se montaban encima mediante adaptadores estables.
+## Bandeja
 
-0.9.0 elimina esa dependencia silenciosa:
+Nova usa `pystray`. `available=True` solo se establece después del callback de inicialización del backend, que hace visible el icono y confirma esa visibilidad. Excepción, icono no visible o timeout producen estado degradado.
 
-- `assistant/agent.py` pasa a ser un `LocalAgent` administrado por GitHub;
-- `assistant/tools.py` pasa a contener el contrato base de `LocalTools`;
-- `assistant/ui.py` pasa a contener la UI base administrada;
-- `assistant/task_engine.py` pasa a contener `TaskEngine`/`AutonomyEngine` administrado;
-- CI valida que un checkout limpio pueda importar el core y montar los adaptadores de dominio;
-- `architecture_status()` ya no declara archivos core locales/no administrados.
+## Inicio con Windows
 
-**Esto no significa que desaparecieron todos los adaptadores.** `agent_*`, `tools_*` y `ui_*` todavía amplían el core por dominio. La serie 0.9.x irá absorbiendo esas capas progresivamente sin mezclar migración de propiedad con una reescritura masiva de comportamiento.
+Está desactivado por defecto y usa `HKCU\Software\Microsoft\Windows\CurrentVersion\Run\NovaDesktop`. El comando usa la instalación real con `--background` y quoting seguro. Al desactivar, Nova elimina la entrada solo si coincide con esta instalación; si pertenece a otra instalación informa conflicto y no la modifica.
 
-## Capacidades preservadas durante la migración
+## Updater residente seguro
 
-### Browser Agent
+`update_runner.py` adquiere primero `update_supervisor.lock`, antes de leer el runtime o enviar `shutdown_for_update`. Para una transacción que llega a un estado validado, el orden obligatorio es:
 
-Playwright mantiene un perfil persistente local en `data/browser_profile`. Las operaciones se ejecutan en un hilo dedicado para no compartir objetos sync de Playwright entre hilos de consultas diferentes.
+```text
+supervisor mutex
+→ coordinación + runtime/recovery guard
+→ transacción/recovery deja journal validado activo
+→ verificar attempt_id + generation + estado
+→ iniciar helper desde bootstrap estable hash-validado
+→ liberar runtime/recovery guard
+→ CAS del intento exacto a cleared
+→ helper observa ese cleared y relanza Nova una sola vez
+→ liberar supervisor mutex
+```
 
-Herramientas administradas: `browser_open`, `browser_search`, `browser_read`, `browser_inspect`, `browser_click`, `browser_fill`, `browser_press`, `browser_tabs`, `browser_back`, `browser_reload`.
+El orden inverso no se usa. Si UI, `ACTUALIZAR_NOVA.cmd` o ejecución directa intentan iniciar simultáneamente otro supervisor, solo uno puede poseer el mutex. El segundo no envía `shutdown_for_update`, no ejecuta el updater, no modifica `update_last.json`, no relanza Nova y termina con código **5 — actualización ya en curso**.
 
-Las acciones web sensibles siguen sujetas a la política de seguridad. Rellenar un campo no implica permiso para enviar el formulario.
+La UI no inicia un cierre local al pulsar **Actualizar**. Guarda la referencia al supervisor, marca `_update_supervisor_active`, deshabilita el botón y rechaza dobles pulsaciones mientras ese proceso siga vivo. El seguimiento usa `poll()` mediante `root.after()` y nunca bloquea Tk con `wait()`.
 
-### Escritorio
+El supervisor sigue siendo la única autoridad que envía `shutdown_for_update`; ese comando llega a `RuntimeLifecycleManager`, que lo traduce a `request_shutdown("update")`. Después de una coordinación correcta, el guard del runtime permanece adquirido durante staging, journal, reemplazo, dependencias, validación y rollback; solo el handoff validado lo consume antes del CAS terminal.
 
-Nova conserva control estructurado por UI Automation y ventanas antes de recurrir a coordenadas:
+### Motor interno sin entrypoint privilegiado
 
-- `window_list`, `window_activate`, `window_close`, `window_move`;
-- `uia_snapshot`, `uia_click`, `uia_type`;
-- fallback `mouse_move`, `mouse_click`, `keyboard_type`, `keyboard_press`.
+El motor de actualización ya no se autoriza con `--yes`. `update_runner.py`, mientras posee el mutex del supervisor y el runtime guard, importa `resident_update_engine` y ejecuta la transacción **en el mismo proceso**.
 
-### Voz
+`python updater/resident_update_engine.py --yes` devuelve un error seguro antes de consultar GitHub, crear staging, tocar archivos o iniciar pip. El updater histórico `nova_updater_legacy.py` permanece únicamente como implementación importable de compatibilidad y su ejecución directa queda interceptada antes de sus side effects. `nova_updater.py`, la UI y los scripts `.cmd` siguen delegando al supervisor.
 
-- hotkey global: **Ctrl + Alt + N**;
-- contexto: **Ctrl + Alt + Shift + N**;
-- push-to-talk: **F9**;
-- STT local con faster-whisper;
-- TTS local;
-- wake word local mediante openWakeWord cuando el modelo configurado ya existe en el equipo.
+### Journal antes de toda mutación
 
-0.9.0 **no descarga modelos de wake word automáticamente**. Si falta, Nova sigue funcionando con F9/hotkeys.
+La transacción publica un journal durable inmediatamente después de crear y validar el backup y **antes** de reemplazar/eliminar un archivo, modificar `managed_files.json`, ejecutar pip o validar la nueva instalación.
 
-### Task Engine
+Orden esencial:
 
-El Task Engine nativo conserva Planner → Executor, persistencia en MemoryStore, pausa/reanudación/cancelación, reintentos, replanning acotado y límites de tiempo/tool-calls. Los planes no conceden permisos: los pasos siguen pasando por Agent/Tools y las reglas de seguridad.
+```text
+crear + validar backup
+→ publicar schema 2: transaction_prepared
+→ preparar bootstrap estable
+→ si requirements cambia: capturar snapshot anterior de dependencias
+→ files_applying  (files_may_have_changed=true)
+→ aplicar archivos + managed_files
+→ files_applied
+→ si corresponde: dependencies_starting
+   (dependencies_may_have_changed=true ANTES de ejecutar pip)
+→ dependencies_running
+→ update_validation_in_progress
+→ update_validated  (el motor termina aquí)
+→ handoff del supervisor
+→ cleared
+```
 
-## Evolución 0.8
+Una muerte anterior a la creación del backup/journal no implica mutación de la instalación. Una muerte posterior a `transaction_prepared` deja una barrera persistente y el supervisor no decide relanzar Nova únicamente por el código de salida del motor: vuelve a inspeccionar el journal durable.
 
-### Skills + Reliability
+Existe además una recuperación específica para el único hueco previo a mutación: si el proceso muere después de `transaction_prepared` pero antes de publicar `data/recovery_runtime/`, y `files_may_have_changed=false`, el bootstrap puede reconstruir de forma segura la generación estable desde la fuente todavía intacta. Una vez que los archivos pueden haber cambiado, esa reconstrucción desde el árbol administrado queda prohibida.
 
-Skills son playbooks declarativos, no scripts confiables. Una Skill nunca concede permisos por sí misma.
+### Máquina de estados schema 2 + CAS
 
-- **0.8.0 Skills Engine**: parámetros, pasos, verificaciones y scope global/workspace;
-- **0.8.3 Learn from Expert**: una respuesta externa solo puede convertirse en candidata; requiere verificación positiva y la Skill aprendida nace `draft`;
-- **0.8.4 Experience & Reliability**: reputación por versión (`unproven`, `learning`, `stable`, `watch`, `degraded`, `stale`) y revisión explícita ante degradación/obsolescencia.
+`data/update_recovery.json` usa `schema_version=2`, `attempt_id` obligatorio y `generation` monotónica. Cada transición ocurre bajo un lock de journal del sistema operativo, vuelve a leer el estado actual y aplica compare-and-swap sobre `attempt_id + generation`. Un escritor obsoleto no puede sobrescribir un intento distinto, un rollback más avanzado, `dependency_repair_required` ni un estado ya limpiado por otra generación.
 
-### Confidence + Expert Escalation
+Estados actuales:
 
-Confidence Engine calcula un índice heurístico de respaldo usando evidencia estructurada. **No es una probabilidad calibrada** ni la autoconfianza del LLM.
+```text
+transaction_prepared
+files_applying
+files_applied
+dependencies_starting
+dependencies_running
+update_validation_in_progress
+update_validated
+pip_termination_unconfirmed
+waiting_for_processes
+rollback_in_progress
+rollback_completed
+rollback_validation_in_progress
+rollback_validation_completed
+dependency_repair_required
+cleared
+```
 
-Expert Escalation usa por defecto:
+`cleared` es **terminal**: no admite transición a recovery ni siquiera una escritura `cleared → cleared`. Un fallo posterior de `Popen` se registra fuera del journal y no puede reabrir la transacción terminal.
 
-1. **Groq** — `openai/gpt-oss-120b`, cuando `GROQ_API_KEY` existe;
-2. **Cerebras** — `gpt-oss-120b`, como fallback cuando está disponible;
-3. **ChatGPT Assisted** — Nova prepara/sanitiza la consulta, abre ChatGPT y el usuario envía/copia la respuesta manualmente.
+El grafo de transiciones es explícito; no se aceptan saltos arbitrarios. Las escrituras usan temporal + `flush` + `fsync` cuando corresponde + `os.replace`. Journals schema 1 conocidos se migran de forma explícita; JSON truncado, esquema desconocido o estados no migrables fallan cerrados.
 
-La API de OpenAI de pago está deshabilitada por defecto. ChatGPT Web no se usa como API: Nova no pulsa Enviar, no scrapea respuestas y no monitoriza el portapapeles continuamente.
+El journal no contiene comandos completos, variables de entorno, tokens ni contenido de archivos. Los errores se sanitizan. `backup_path` y cualquier snapshot se guardan como referencias relativas autorizadas, no como rutas externas confiadas ciegamente.
 
-Las claves solo se leen desde variables de entorno; nunca deben guardarse en Skills, repositorio o conversaciones.
+### Contención autoritativa de pip en Windows
 
-## Percepción 0.7
+`pip install -r requirements.txt` conserva un timeout explícito de **15 minutos** por defecto; es inyectable para pruebas, rechaza valores no positivos/no finitos y limita valores excesivos a una hora. No usa `shell=True`.
 
-- **0.7.0 Perception Engine**: metadatos de app/ventana y sistema, sin screenshots periódicos;
-- **0.7.1 Context Intelligence**: relevancia y actividad probable;
-- **0.7.2 Workspace Auto-Detection**: asociaciones app ↔ workspace, sin autoactivación por defecto;
-- **0.7.3 Anomaly Detection**: baseline local y desviaciones sostenidas;
-- **0.7.4 Event-driven Vision**: captura solo bajo petición o evento visual permitido.
+En Windows Nova no usa `psutil.children(recursive=True)` como prueba de que todo el árbol terminó. Pip se crea **suspendido** con `CreateProcessW`; antes de ejecutar una sola instrucción se crea/configura un **Windows Job Object** con `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, se asigna el proceso con `AssignProcessToJobObject` y solo entonces se reanuda el thread principal con `ResumeThread`.
 
-## Memoria, Workspaces y continuidad
+Si la creación/configuración/asignación del Job Object falla antes de reanudar pip, pip no se considera iniciado y no existe downgrade silencioso a `psutil` como garantía. Las pruebas Windows incluyen además la muerte abrupta del updater mientras el Job contiene un proceso hijo: el hijo no puede sobrevivir al cierre del Job.
 
-MemoryStore, Workspace Intelligence, Semantic Memory y Continuity son locales. Semantic Memory usa Ollama para embeddings y mantiene búsqueda léxica como fallback. Desde 0.9.2 el contexto automático usa recuperación semántica de forma adaptativa para no pagar el coste de embeddings en preguntas simples.
+En Unix se conserva nueva sesión/grupo de procesos, señales y verificación mediante identidad fuerte.
 
-Desde 0.9.4 la UI puede precargar explícitamente el LLM principal mediante Warm Manager; esta operación es independiente de Semantic Memory y no ejecuta una consulta de usuario. Desde 0.9.5 Gaming Awareness puede suspender esa precarga temporalmente para priorizar un juego.
+### Identidades fuertes
+
+Los procesos pendientes no se representan únicamente por PID. El journal usa identidades equivalentes a:
+
+```json
+{
+  "pid": 1234,
+  "creation_time": 1720000000123456,
+  "role": "pip_root_or_descendant"
+}
+```
+
+Para considerar que un proceso registrado sigue vivo deben coincidir PID **y** tiempo de creación normalizado. Un PID reutilizado con otro `creation_time` no bloquea la recuperación y nunca se termina basándose únicamente en ese PID. Los errores de acceso/inspección se tratan de forma conservadora.
+
+### Cuarentena persistente y códigos 6/7
+
+Si pip llegó a arrancar y no puede demostrarse la terminación del contenedor/árbol, la transacción devuelve **6 — `pip_termination_unconfirmed`**. No inicia rollback concurrente, no relanza Nova y conserva backup, journal e identidades fuertes.
+
+La cuarentena sobrevive al cierre del supervisor, reinicios de Nova y reinicios de Windows. Mientras exista un intento activo —o el journal no pueda validarse— el startup y una actualización nueva quedan bloqueados con **7 — `recovery_required_or_in_progress`**.
+
+El updater gate no sobrescribe el journal mientras los procesos registrados siguen vivos. Una salida inesperada del motor tampoco habilita el relanzamiento: si al volver del motor existe un journal activo/corrupto, el supervisor devuelve 7 y conserva backup/journal.
+
+### Snapshot y validación fuerte de dependencias
+
+Si `requirements.txt` cambiará, Nova captura antes de aplicar archivos un snapshot del entorno Python anterior dentro del backup autorizado. El snapshot contiene nombres de distribuciones normalizados, **versiones exactas instaladas**, conjunto anterior, hash SHA-256 del propio snapshot, hash del `requirements.txt` anterior y la lista acotada de imports críticos aplicables.
+
+Tras restaurar archivos:
+
+- si pip nunca pudo ejecutar código, no se exige una reparación de dependencias innecesaria;
+- si pip pudo ejecutarse, el conjunto actual debe coincidir con el snapshot: una distribución añadida, eliminada o con versión distinta bloquea la limpieza;
+- el `requirements.txt` restaurado debe conservar su hash anterior;
+- imports críticos se prueban en un subprocess aislado y acotado con `python -I`;
+- recovery **no ejecuta pip** para corregir diferencias.
+
+Si la comparación/imports no permiten demostrar compatibilidad suficiente, el journal avanza a `dependency_repair_required`; conserva cuarentena y backup y no relanza Nova.
+
+Esto es deliberadamente más fuerte que comprobar `importlib.metadata.version(name)` para saber si un paquete “existe”, pero **no equivale a un rollback transaccional de `.venv`**. El proyecto no inventa versiones/hashes para un lockfile porque el `requirements.txt` actual no está completamente fijado.
+
+### Bootstrap estable de recuperación
+
+Antes de tocar archivos, el updater prepara una generación stdlib-only en:
+
+```text
+data/recovery_runtime/
+  active.json
+  generations/<generation>/
+    manifest.json
+    process_launch.py
+    recovery_bootstrap.py
+    recovery_handoff.py
+    recovery_state.py
+    recovery_journal.py
+    recovery_attempts.py
+    recovery_files.py
+    recovery_environment.py
+    recovery_locking.py
+```
+
+Cada generación se escribe completa, se verifica por SHA-256 y solo después se reemplaza atómicamente `active.json`. La generación conocida como buena anterior no se sobreescribe en sitio. `process_launch.py` y `recovery_handoff.py` forman parte del conjunto exacto hash-validado; una copia alterada impide crear el helper.
+
+La selección de intérprete se centraliza en `process_launch.py`: los procesos internos usan el Python de consola del entorno sin abrir ventana, mientras el relanzamiento final prefiere `pythonw.exe` del mismo entorno. La UI inicia el supervisor con `CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP`, conserva `poll()` no bloqueante y escribe la salida temprana en `data/updater_logs`.
+
+En `app.py` el orden es **recovery gate antes de `_claim_instance`**. Se intenta primero el bootstrap administrado; si su import/ejecución falla y existe journal, se carga únicamente la generación estable cuyo manifest y archivos coinciden con sus hashes. Si ambas copias fallan, `app.py` usa `MessageBoxW` directamente en Windows y sale con 7, sin depender de stderr/pythonw, sin reclamar instancia y sin importar Tk completo, Agent ni módulos normales del asistente.
+
+### Handoff validado y recuperación reanudable
+
+Tanto un update correcto como un recovery correcto usan el mismo mecanismo compartido en `recovery_handoff.py`. El motor nunca limpia el journal: termina en `update_validated` o `rollback_validation_completed`.
+
+El handoff realiza:
+
+```text
+supervisor mutex retenido
+→ runtime/recovery guard retenido
+→ releer journal y verificar attempt_id + generation + estado validado
+→ validar por SHA el bootstrap estable completo
+→ Popen del helper estable mientras el journal sigue activo
+→ crash hook de prueba, si existe
+→ liberar runtime/recovery guard
+→ CAS exacto validated → cleared con token de handoff
+→ helper observa cleared del mismo attempt/generation/token
+→ helper ejecuta app.py --post-update o --post-recovery exactamente una vez
+→ liberar supervisor mutex
+```
+
+El helper no acepta otro `attempt_id`, otra generación, otro estado, otro token ni un journal corrupto. Mientras el estado validado sigue activo, espera de forma acotada y **no lanza Nova**.
+
+Si el helper no puede crearse, no se libera/limpia el intento. Si falla la liberación del guard, no existe CAS a `cleared`. Si un escritor vuelve obsoleta la generación antes del CAS, el clear falla y el helper queda sin autorización. Si el supervisor muere después de crear el helper pero antes del CAS, la cuarentena queda activa y el helper expira sin lanzar. Si muere después del CAS, el helper independiente ya autorizado puede relanzar Nova.
+
+Después de `cleared`, el journal es terminal. Si el `Popen` final de Nova falla, el helper registra el fallo en `data/updater_logs/recovery_handoff.log`; no reescribe ni reabre `update_recovery.json`.
+
+El restaurador **no administra ni borra journals**. Restaura modificados/eliminados, elimina solo `created_new`, restaura `managed_files.json` y vuelve a validar traversal/symlinks en cada reanudación. Una muerte a mitad del rollback permite repetirlo de forma segura.
+
+### Códigos principales
+
+- `0`: operación correspondiente completada.
+- `3`: camino sin transacción durable completado pero falló su relanzamiento heredado.
+- `4`: coordinación no verificable o entrypoint interno directo bloqueado.
+- `5`: otro supervisor ya está activo.
+- `6`: pip pudo ejecutar y su terminación no pudo confirmarse.
+- `7`: recuperación obligatoria/activa/corrupta, handoff no autorizado o motor terminó con intento durable todavía activo.
+
+## Atajos
+
+Defaults actuales: **Ctrl + Alt + N**, **Ctrl + Alt + Shift + N** y **F9**. Resident Mode conserva hotkeys personalizados existentes.
+
+## Configuración
+
+```json
+"resident_mode": {
+  "enabled": true,
+  "close_to_tray": true,
+  "start_with_windows": false,
+  "start_hidden": false,
+  "notifications": true
+}
+```
+
+## Nova Doctor
+
+Doctor informa lifecycle, ventana visible/oculta, bandeja lista/degradada, instancia única/scope, autostart real/conflicto y estado del updater residente. El estado activo/inactivo del supervisor proviene del mutex del kernel. Si hay cuarentena, informa su estado; las identidades/PID restantes solo aparecen cuando son necesarias para diagnosticar espera de procesos.
 
 ## Privacidad
 
-No deben subirse: `config.json` real, `data/`, bases SQLite, perfil del navegador, screenshots, logs personales, `.venv/`, tokens ni API keys.
+Resident Mode y recovery no añaden screenshots, captura de teclado, memoria de juegos, telemetría externa ni servidores de red. Journal/snapshot no guardan comandos completos, variables de entorno, tokens, prompts ni contenido de archivos.
 
-Perception no captura teclado/portapapeles/screenshots periódicamente. Event-driven Vision no conserva imágenes por defecto. Confidence, Expert Escalation, Learn from Expert y Skill Reliability guardan metadatos limitados y no el contenido completo que evalúan. LLM Performance Intelligence guarda únicamente métricas técnicas, conteos y muestras puntuales de recursos; nunca persiste el texto del prompt o de la respuesta. Instant Wake usa una petición local con `messages: []` y no transmite contenido a servicios externos. Gaming Awareness solo usa metadatos de ventana/proceso, rutas de ejecutables y telemetría local de GPU; no inspecciona memoria del juego ni inyecta código.
+## Pruebas
 
-## Estructura 0.9
+Ubuntu y Windows ejecutan primero el gate focal del handoff (`test_recovery_handoff`, terminal state, update runner, bootstrap, stable bootstrap, crash recovery y multiprocess), luego `compileall`/suite completa y las regresiones explícitas. Windows ejecuta además Job Object real, carrera root→child repetida, muerte abrupta del updater con proceso dentro del Job sin permitir `skip`, crash reales mediante `os._exit`, dos recovery supervisors en procesos reales, muerte del dueño del lock y reanudación, lifecycle, IPC, session shutdown, Gaming Awareness, Instant Wake/hotkeys y core.
+
+Las pruebas de recovery/handoff incluyen:
+
+- `tests/test_recovery_handoff.py`
+- `tests/test_recovery_terminal_state.py`
+- `tests/test_recovery_pre_mutation_bootstrap.py`
+- `tests/test_recovery_bootstrap.py`
+- `tests/test_recovery_update_gate.py`
+- `tests/test_pip_job_object.py`
+- `tests/test_dependency_snapshot.py`
+- `tests/test_stable_recovery_bootstrap.py`
+- `tests/test_updater_entrypoint_guards.py`
+- `tests/test_update_crash_recovery.py`
+- `tests/test_recovery_multiprocess.py`
+
+La documentación técnica completa está en [`docs/v0.9.9-resident-runtime.md`](docs/v0.9.9-resident-runtime.md).
+
+## Recuperación manual y diagnóstico
+
+Ante cuarentena, **no borres `data/update_recovery.json`, `data/updater_backups/` ni `data/recovery_runtime/`**. Consulta el estado con:
 
 ```text
-nova/assistant/
-├─ agent.py                 # core GitHub-managed + instrumentación Ollama
-├─ agent_fast_routing.py    # rutas deterministas de baja latencia
-├─ agent_instant_wake.py    # keep_alive + comandos Warm Manager
-├─ agent_gaming.py          # comandos y contexto de Gaming Awareness
-├─ llm_performance.py       # métricas locales detalladas de inferencia
-├─ llm_benchmark.py         # benchmark explícito y acotado
-├─ llm_warm.py              # precarga/descarga/estado/política runtime de Ollama
-├─ gaming_awareness.py      # detección de juegos + política de VRAM
-├─ perception_gaming.py     # throttle temporal de Perception
-├─ hotkeys.py               # normalización y validación de atajos
-├─ config_instant_wake.py   # defaults/migración 0.9.4
-├─ config_gaming.py         # defaults/migración 0.9.5
-├─ tools.py                 # core GitHub-managed
-├─ ui.py                    # core GitHub-managed
-├─ ui_instant_wake.py       # estado LLM + editor de hotkeys
-├─ ui_gaming.py             # estado/ajustes de Gaming Awareness
-├─ task_engine.py           # core GitHub-managed
-├─ core_runtime.py          # bootstrap único
-├─ tools_desktop.py         # Browser Agent + UIA/input administrados
-├─ ui_voice_wake.py         # wake word local administrado
-├─ memory.py
-├─ perception.py
-├─ skills.py
-├─ confidence.py
-├─ expert_escalation.py
-├─ experience_reliability.py
-├─ agent_*.py               # adaptadores temporales por dominio
-├─ tools_*.py               # adaptadores/extensiones por dominio
-└─ ui_*.py                  # adaptadores/extensiones visuales
+python updater/recovery_bootstrap.py --status
 ```
 
-## Desarrollo y publicación
+Si el bootstrap administrado no funciona, el aviso nativo de `app.py` muestra el comando apuntando a la generación estable validada. La recuperación manual soportada usa el mismo bootstrap con `--recover`; borrar el journal a mano elimina la barrera fail-closed y no es un procedimiento soportado.
 
-Los PR ejecutan `compileall` y la suite completa de `unittest`. 0.9 añade smoke tests del core en checkout limpio. Al fusionar un nuevo `VERSION`, el workflow de publicación vuelve a validar la suite y crea la GitHub Release correspondiente.
+`dependency_repair_required` significa que los archivos pudieron restaurarse pero el entorno Python ya no coincide suficientemente con el snapshot anterior. Conserva el backup/journal y reconstruye o repara la `.venv` de forma explícita antes de retirar la cuarentena; recovery no intenta adivinar qué debe desinstalar o degradar con pip.
+
+## Riesgos residuales
+
+- El rollback cubre archivos administrados y valida el entorno; no crea un snapshot bit-a-bit de `.venv`.
+- Daño de disco/I/O, corrupción fuera del conjunto administrado o cambios externos concurrentes pueden requerir reparación manual.
+- El snapshot exacto detecta diferencias de distribuciones/versiones, pero no convierte un `requirements.txt` no fijado en un entorno reproducible.
+- Después de un `cleared` terminal, un fallo del proceso final de Nova queda registrado pero no puede reabrir automáticamente la transacción; requiere diagnóstico/reintento normal del usuario.
+- Ante cualquier identidad, journal, backup, manifest, hash o validación que no pueda demostrarse, la política es mantener la cuarentena en lugar de asumir éxito.
+
+## Validación manual pendiente
+
+Antes de aprobar v0.9.9 deben probarse en una **instalación/fixture descartable de Windows 11**, no dañando la instalación principal: actualización normal; doble clic; timeout de pip confirmado; terminación no confirmada simulada; persistencia de cuarentena tras reiniciar Nova/Windows; bloqueo de startup/update; desaparición de identidades fuertes; recovery reanudado; snapshot de dependencias; bootstrap estable; handoff post-update/post-recovery; muerte del supervisor antes/después del CAS; restauración/validación; un solo relanzamiento; y fallo simulado de recovery conservando journal/backup.

@@ -58,7 +58,6 @@ agent.tools.system_status = mock.Mock(return_value={
 })
 system = agent.ask("estado del sistema")
 
-# Base vacía: memory_search no debe delegar a Semantic Memory.
 memory.search_memory.reset_mock()
 empty = agent.tools.memory_search("recuerdas algo", 8)
 
@@ -101,6 +100,15 @@ print(json.dumps({
         self.assertEqual(fast_direct_intent("Nova, ¿qué versión tienes?"), "version")
         self.assertIsNone(fast_direct_intent("¿Qué versión de Python tengo?"))
         self.assertIsNone(fast_direct_intent("¿Qué versión de Ollama está instalada?"))
+
+    def test_resident_commands_are_explicit_and_deterministic(self):
+        self.assertEqual(fast_direct_intent("Nova, ¿estás ejecutándote en segundo plano?"), "resident_status")
+        self.assertEqual(fast_direct_intent("Nova, ocúltate en la bandeja"), "resident_hide")
+        self.assertEqual(fast_direct_intent("Nova, muéstrate"), "resident_show")
+        self.assertEqual(fast_direct_intent("Nova, inicia con Windows"), "resident_autostart_on")
+        self.assertEqual(fast_direct_intent("Nova, no inicies con Windows"), "resident_autostart_off")
+        self.assertIsNone(fast_direct_intent("Quizás algún día podrías iniciar con Windows"))
+        self.assertIsNone(fast_direct_intent("¿Conviene iniciar aplicaciones con Windows?"))
 
     def test_memory_semantic_context_is_adaptive(self):
         self.assertFalse(memory_query_needs_semantic("explica qué es un PID"))

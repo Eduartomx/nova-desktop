@@ -264,7 +264,6 @@ class TaskEngine:
                 new_steps = self._replan(goal, step, completed_defs, start_index=idx)
                 if new_steps:
                     replans += 1
-                    # Sustituye el paso fallido y todo lo pendiente; lo completado se conserva.
                     steps = steps[:pointer] + new_steps
                     plan = {**plan, "steps": steps, "replans": replans}
                     if task_id and self.memory is not None:
@@ -298,6 +297,22 @@ class TaskEngine:
             except Exception:
                 pass
         self.current_task_id = None
+
+        elapsed = time.monotonic() - started
+        if elapsed >= 8.0:
+            try:
+                from .runtime_lifecycle import get_current_lifecycle
+                lifecycle = get_current_lifecycle()
+                tray = getattr(lifecycle, "tray", None) if lifecycle is not None else None
+                if lifecycle is not None and lifecycle.window_hidden and tray is not None:
+                    tray.notify(
+                        "long_task_completed",
+                        "Tarea completada",
+                        "Nova terminó una tarea larga mientras estaba en segundo plano.",
+                    )
+            except Exception:
+                pass
+
         return {
             "ok": ok, "task_id": task_id, "status": status, "summary": summary,
             "plan": plan, "steps": results, "replans": replans,

@@ -2,9 +2,9 @@ from __future__ import annotations
 
 """UI base administrada por GitHub desde Nova 0.9.0.
 
-Las capas `ui_*.py` continúan añadiendo Workspaces, Doctor, Skills, Experto,
-Perception y otros paneles. Este archivo conserva el contrato estable que esas
-capas necesitan y elimina la dependencia de una UI histórica no recuperable.
+Desde v0.9.9 la visibilidad de la ventana y la vida del proceso son conceptos
+separados: el botón X puede ocultar Nova sin atravesar la cadena histórica de
+``_close``. El cierre real se delega al RuntimeLifecycleManager.
 """
 
 import queue
@@ -18,12 +18,25 @@ import tkinter as tk
 from tkinter import messagebox
 
 from .agent import LocalAgent
+from .autostart import AutostartManager
+from .runtime_lifecycle import RuntimeLifecycleManager
+from .tray_controller import TrayController
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
 class AssistantUI:
-    def __init__(self, root: tk.Tk, config: dict[str, Any] | None = None):
+    def __init__(
+        self,
+        root: tk.Tk,
+        config: dict[str, Any] | None = None,
+        *,
+        instance_lock=None,
+        command_mailbox=None,
+        start_hidden: bool = False,
+        tray_factory=None,
+        autostart_backend=None,
+    ):
         self.root = root
         self.config = config or {}
         self.name = str(self.config.get("assistant_name") or "Nova")
@@ -37,15 +50,38 @@ class AssistantUI:
         self._recording = False
         self._whisper_model = None
         self._closing = False
+        self._accepting_commands = True
+        self._command_mailbox = command_mailbox
+
+        self.autostart_manager = AutostartManager(PROJECT_ROOT, backend=autostart_backend)
+        self.runtime_lifecycle = RuntimeLifecycleManager(root, self.config, ui=self)
+        if instance_lock is not None:
+            self.runtime_lifecycle.attach_instance(instance_lock)
+        self.runtime_lifecycle.attach_autostart(self.autostart_manager)
 
         self.root.title(f"{self.name} · Asistente local")
         self.root.geometry("820x620")
         self.root.minsize(560, 420)
-        self.root.protocol("WM_DELETE_WINDOW", self._close)
 
         self._build()
         self._install_hotkeys()
+
+        resident = self.config.get("resident_mode", {}) if isinstance(self.config, dict) else {}
+        self.tray_controller = None
+        if bool(resident.get("enabled", True)):
+            self.tray_controller = TrayController(self, self.runtime_lifecycle, icon_factory=tray_factory)
+            self.tray_controller.start()
+            self.runtime_lifecycle.attach_tray(self.tray_controller)
+
+        # Importante: WM_DELETE_WINDOW nunca llama a _close. Las capas legacy
+        # pueden conservar _close para compatibilidad, pero ocultar no pasa por ellas.
+        self.root.protocol("WM_DELETE_WINDOW", self.request_window_close)
         self.root.after(100, self._poll_results)
+        if self._command_mailbox is not None:
+            self.root.after(250, self._poll_instance_commands)
+
+        hidden = bool(start_hidden or resident.get("start_hidden", False))
+        self.runtime_lifecycle.mark_running(start_hidden=hidden)
 
     def _build(self):
         header = tk.Frame(self.root, padx=12, pady=10)
@@ -68,9 +104,6 @@ class AssistantUI:
         self.send_button = tk.Button(composer, text="Enviar", command=self._send_from_entry, width=10)
         self.send_button.pack(side="left", padx=(8, 0))
 
-        # `Frame(..., padx/pady=...)` configura padding interno de Tk y solo
-        # acepta una distancia escalar. El padding asimétrico pertenece al
-        # geometry manager (`pack`), que sí admite (antes, después).
         foot = tk.Frame(self.root, padx=12)
         foot.pack(fill="x", pady=(0, 8))
         hotkey = str(self.config.get("hotkey", "<ctrl>+<alt>+<space>"))
@@ -102,6 +135,12 @@ class AssistantUI:
         self._submit_text(text)
 
     def _submit_text(self, text: str):
+        if not self._accepting_commands:
+            try:
+                self.status_var.set("Nova se está cerrando…")
+            except Exception:
+                pass
+            return
         if self.busy:
             self.status_var.set("Nova todavía está trabajando…")
             return
@@ -123,12 +162,12 @@ class AssistantUI:
 
         threading.Thread(target=worker, daemon=True, name="nova-agent-ui").start()
 
-    # Alias histórico usado por algunas UI locales.
     _send = _send_from_entry
 
     def _poll_results(self):
         if self._closing:
             return
+        completed = False
         try:
             while True:
                 kind, text = self.result_queue.get_nowait()
@@ -136,6 +175,7 @@ class AssistantUI:
                     self._append("assistant", text)
                     self.status_var.set("Listo")
                     self._speak_async(text)
+                    completed = True
                 else:
                     self._append("error", text)
                     self.status_var.set("Error")
@@ -148,13 +188,48 @@ class AssistantUI:
                     pass
         except queue.Empty:
             pass
+        if completed:
+            try:
+                self.runtime_lifecycle.notify_task_completed()
+            except Exception:
+                pass
         try:
             self.root.after(100, self._poll_results)
         except Exception:
             pass
 
-    # ---------- ventana / hotkeys ----------
+    # ---------- resident runtime / ventana ----------
+    def request_window_close(self):
+        return self.runtime_lifecycle.request_window_close()
+
+    def request_shutdown(self, reason: str = "user_exit"):
+        return self.runtime_lifecycle.request_shutdown(reason)
+
+    def _poll_instance_commands(self):
+        if self._closing:
+            return
+        mailbox = self._command_mailbox
+        if mailbox is not None:
+            try:
+                message = mailbox.consume()
+                if message and message.get("ok"):
+                    command = str(message.get("command") or "")
+                    self.runtime_lifecycle.handle_control_command(command)
+            except Exception as exc:
+                try:
+                    self.runtime_lifecycle._record_error("instance_command", exc)
+                except Exception:
+                    pass
+        try:
+            self.root.after(400, self._poll_instance_commands)
+        except Exception:
+            pass
+
     def _show_window(self):
+        lifecycle = getattr(self, "runtime_lifecycle", None)
+        if lifecycle is not None:
+            lifecycle.show_window()
+            return
         try:
             self.root.deiconify()
             self.root.lift()
@@ -193,7 +268,6 @@ class AssistantUI:
             self._hotkey_listener.daemon = True
             self._hotkey_listener.start()
 
-            # Listener separado para PTT porque necesitamos press + release.
             ptt_key = str(self.config.get("voice", {}).get("push_to_talk_hotkey", "<f9>"))
             if "f9" in ptt_key.casefold():
                 def on_press(key):
@@ -219,7 +293,7 @@ class AssistantUI:
             self._start_recording()
 
     def _start_recording(self):
-        if self._recording or self.busy or not self.config.get("voice", {}).get("enabled", True):
+        if self._recording or self.busy or not self._accepting_commands or not self.config.get("voice", {}).get("enabled", True):
             return
         try:
             import sounddevice as sd
@@ -297,6 +371,7 @@ class AssistantUI:
         voice = self.config.get("voice", {}) if isinstance(self.config, dict) else {}
         if not voice.get("tts_enabled", True) or not str(text or "").strip():
             return
+
         def worker():
             try:
                 import pyttsx3
@@ -306,24 +381,9 @@ class AssistantUI:
                 engine.stop()
             except Exception:
                 pass
+
         threading.Thread(target=worker, daemon=True, name="nova-tts").start()
 
     def _close(self):
-        if self._closing:
-            return
-        self._closing = True
-        try:
-            if self._recording:
-                self._stop_recording()
-        except Exception:
-            pass
-        for listener in (self._hotkey_listener, self._ptt_listener):
-            try:
-                if listener is not None:
-                    listener.stop()
-            except Exception:
-                pass
-        try:
-            self.root.destroy()
-        except Exception:
-            pass
+        """Compatibilidad legacy: _close significa salida real, nunca ocultar."""
+        return self.request_shutdown("legacy_close")

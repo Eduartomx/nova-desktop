@@ -71,6 +71,18 @@ def install_ui_gaming():
         except Exception:
             pass
 
+        # El adaptador Win32 es una pieza nativa; se conecta aquí porque Tk ya
+        # dispone de HWND. No modifica _close ni el camino X -> bandeja.
+        if not getattr(self, "_windows_session_hook", None):
+            try:
+                from .windows_session import WindowsSessionHook
+                hook = WindowsSessionHook(self.root, self.request_shutdown)
+                if hook.install():
+                    self._windows_session_hook = hook
+                    self.runtime_lifecycle.attach_session_hook(hook)
+            except Exception as exc:
+                self.runtime_lifecycle._record_error("windows_session_hook", exc)
+
     def _gaming_ui_tick(self):
         if getattr(self, "_closing", False):
             return

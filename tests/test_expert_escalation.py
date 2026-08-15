@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import closing
 import os
 import sqlite3
 import tempfile
@@ -91,7 +92,7 @@ class ExpertEscalationTests(unittest.TestCase):
                     b"ENV_KEY_MUST_NOT_PERSIST",
                 ):
                     self.assertNotIn(forbidden, raw)
-                with sqlite3.connect(Path(td) / "expert.db") as conn:
+                with closing(sqlite3.connect(Path(td) / "expert.db")) as conn:
                     row = conn.execute("SELECT method,provider,status,payload_chars,response_chars FROM expert_events").fetchone()
                 self.assertEqual(row[0], "free_api")
                 self.assertEqual(row[1], "cerebras")

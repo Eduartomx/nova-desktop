@@ -288,6 +288,13 @@
     ],
     "minecraft_command_markers": ["minecraft", "net.minecraft", "forge", "fabric-loader", "lwjgl"]
   },
+  "resident_mode": {
+    "enabled": true,
+    "close_to_tray": true,
+    "start_with_windows": false,
+    "start_hidden": false,
+    "notifications": true
+  },
   "hotkey": "<ctrl>+<alt>+n",
   "desktop": {
     "auto_context": true,
