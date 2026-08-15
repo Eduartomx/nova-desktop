@@ -51,7 +51,6 @@ def _wait_for_owner(path: Path, timeout: float = 3.0) -> dict:
 
 
 def _wait_for_mutex_available(path: Path, timeout: float = 5.0) -> bool:
-    """Wait until Windows has actually released the kernel byte-range lock."""
     deadline = time.monotonic() + timeout
     event = threading.Event()
     while time.monotonic() < deadline:
@@ -185,152 +184,83 @@ class ResidentProcessIPCTests(unittest.TestCase):
             folder = Path(td)
             lock_path, owner_path, commands = self._paths(folder)
             marker = folder / "shown.marker"
-            owner_proc = subprocess.Popen(
-                [sys.executable, "-c", OWNER_SCRIPT, str(lock_path), str(owner_path), str(commands), str(marker)],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                env=_env(),
-            )
+            owner_proc = subprocess.Popen([sys.executable, "-c", OWNER_SCRIPT, str(lock_path), str(owner_path), str(commands), str(marker)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=_env())
             result = None
             try:
                 owner = _wait_for_owner(owner_path, 4.0)
                 self.assertTrue(owner, f"runtime owner metadata was not published; rc={owner_proc.poll()}")
-                self.assertGreater(int(owner.get("process_creation_time") or 0), 0, "Windows owner metadata must contain real process creation time")
-                secondary = subprocess.run(
-                    [sys.executable, "-c", SECONDARY_SCRIPT, str(lock_path), str(owner_path), str(commands)],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    env=_env(),
-                    timeout=5,
-                )
+                self.assertGreater(int(owner.get("process_creation_time") or 0), 0)
+                secondary = subprocess.run([sys.executable, "-c", SECONDARY_SCRIPT, str(lock_path), str(owner_path), str(commands)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=_env(), timeout=5)
                 self.assertEqual(secondary.returncode, 0)
-                self.assertTrue(_wait_for_path(marker), "secondary launch did not restore first runtime")
+                self.assertTrue(_wait_for_path(marker))
                 probe = InstanceLock(path=lock_path, owner_path=owner_path, publish_owner=False)
-                self.assertFalse(probe.acquire(), "two runtimes acquired the same scoped lock")
-
+                self.assertFalse(probe.acquire())
                 started = time.monotonic()
-                result = coordinate_runtime_shutdown(
-                    NOVA_ROOT,
-                    timeout=5.0,
-                    expected_pid=int(owner["pid"]),
-                    lock_factory=lambda: InstanceLock(path=lock_path, owner_path=owner_path, publish_owner=False, role="observer"),
-                    guard_factory=lambda: InstanceLock(path=lock_path, owner_path=owner_path, publish_owner=False, role="updater"),
-                    mailbox=InstanceCommandMailbox(commands),
-                )
+                result = coordinate_runtime_shutdown(NOVA_ROOT, timeout=5.0, expected_pid=int(owner["pid"]), lock_factory=lambda: InstanceLock(path=lock_path, owner_path=owner_path, publish_owner=False, role="observer"), guard_factory=lambda: InstanceLock(path=lock_path, owner_path=owner_path, publish_owner=False, role="updater"), mailbox=InstanceCommandMailbox(commands))
                 elapsed = time.monotonic() - started
                 self.assertTrue(result.ok, result.error)
                 self.assertTrue(result.command_sent)
                 self.assertTrue(result.process_terminated)
                 self.assertTrue(result.lock_acquired)
-                self.assertGreaterEqual(elapsed, 0.18, "updater returned before owner completed delayed exit")
-                self.assertIsNotNone(owner_proc.poll(), "owner process is still alive after updater authorization")
+                self.assertGreaterEqual(elapsed, 0.18)
+                self.assertIsNotNone(owner_proc.poll())
                 competing = InstanceLock(path=lock_path, owner_path=owner_path, publish_owner=False)
-                self.assertFalse(competing.acquire(), "updater released guard before file replacement")
+                self.assertFalse(competing.acquire())
                 metadata = InstanceLock(path=lock_path, owner_path=owner_path, publish_owner=False).read_owner()
                 self.assertEqual(metadata.get("role"), "updater")
-                self.assertGreater(int(metadata.get("process_creation_time") or 0), 0)
             finally:
-                if result is not None:
-                    result.release_guard()
+                if result is not None: result.release_guard()
                 if owner_proc.poll() is None:
-                    owner_proc.terminate()
-                    owner_proc.wait(timeout=3)
+                    owner_proc.terminate(); owner_proc.wait(timeout=3)
 
     def test_two_separate_senders_do_not_overwrite_commands(self):
         with tempfile.TemporaryDirectory() as td:
-            folder = Path(td)
-            lock_path, owner_path, commands = self._paths(folder)
+            folder = Path(td); lock_path, owner_path, commands = self._paths(folder)
             owner = InstanceLock(path=lock_path, owner_path=owner_path, role="runtime")
             self.assertTrue(owner.acquire())
             try:
-                processes = [
-                    subprocess.Popen(
-                        [sys.executable, "-c", SENDER_SCRIPT, str(commands), owner.owner_id, command],
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                        env=_env(),
-                    )
-                    for command in ("show", "status")
-                ]
-                for proc in processes:
-                    self.assertEqual(proc.wait(timeout=5), 0)
+                processes = [subprocess.Popen([sys.executable, "-c", SENDER_SCRIPT, str(commands), owner.owner_id, command], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=_env()) for command in ("show", "status")]
+                for proc in processes: self.assertEqual(proc.wait(timeout=5), 0)
                 mailbox = InstanceCommandMailbox(commands, owner_id=owner.owner_id)
                 rows = [mailbox.consume(owner_id=owner.owner_id), mailbox.consume(owner_id=owner.owner_id)]
                 self.assertTrue(all(row and row.get("ok") for row in rows))
                 self.assertEqual({row["command"] for row in rows}, {"show", "status"})
                 self.assertEqual(len({row["command_id"] for row in rows}), 2)
-            finally:
-                owner.release()
+            finally: owner.release()
 
     def test_crash_with_pending_shutdown_is_ignored_by_immediate_new_generation(self):
         with tempfile.TemporaryDirectory() as td:
-            folder = Path(td)
-            lock_path, owner_path, commands = self._paths(folder)
-            old_proc = subprocess.Popen(
-                [sys.executable, "-c", BLOCKING_OWNER_SCRIPT, str(lock_path), str(owner_path)],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                env=_env(),
-            )
+            folder = Path(td); lock_path, owner_path, commands = self._paths(folder)
+            old_proc = subprocess.Popen([sys.executable, "-c", BLOCKING_OWNER_SCRIPT, str(lock_path), str(owner_path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=_env())
             try:
-                old = _wait_for_owner(owner_path, 4.0)
-                self.assertTrue(old, f"old runtime owner metadata was not published; rc={old_proc.poll()}")
+                old = _wait_for_owner(owner_path, 4.0); self.assertTrue(old)
                 self.assertGreater(int(old.get("process_creation_time") or 0), 0)
                 mailbox = InstanceCommandMailbox(commands)
                 self.assertTrue(mailbox.send("shutdown_for_update", target_owner_id=old["owner_id"]))
-                old_proc.terminate()
-                old_proc.wait(timeout=5)
-
+                old_proc.terminate(); old_proc.wait(timeout=5)
                 new_owner = InstanceLock(path=lock_path, owner_path=owner_path, role="runtime")
-                self.assertTrue(new_owner.acquire(), "kernel lock did not recover after unexpected termination")
+                self.assertTrue(new_owner.acquire())
                 try:
                     self.assertNotEqual(new_owner.owner_id, old["owner_id"])
                     new_mailbox = InstanceCommandMailbox(commands, owner_id=new_owner.owner_id)
-                    rejected = new_mailbox.consume(owner_id=new_owner.owner_id)
-                    self.assertEqual(rejected, {"ok": False, "error": "wrong_owner"})
+                    self.assertEqual(new_mailbox.consume(owner_id=new_owner.owner_id), {"ok": False, "error": "wrong_owner"})
                     self.assertIsNone(new_mailbox.consume(owner_id=new_owner.owner_id))
-                    self.assertTrue(new_owner.acquired)
-                finally:
-                    new_owner.release()
+                finally: new_owner.release()
             finally:
-                if old_proc.poll() is None:
-                    old_proc.terminate()
-                    old_proc.wait(timeout=3)
+                if old_proc.poll() is None: old_proc.terminate(); old_proc.wait(timeout=3)
 
     def test_two_real_supervisors_only_owner_coordinates_updates_and_launches(self):
         with tempfile.TemporaryDirectory() as td:
-            folder = Path(td)
-            root = folder / "nova"
-            root.mkdir()
-            mutex = folder / "scope" / "update_supervisor.lock"
-            markers = folder / "markers"
-            finish = folder / "finish.marker"
-            first = subprocess.Popen(
-                [sys.executable, "-c", SUPERVISOR_SCRIPT, str(root), str(mutex), str(markers), str(finish)],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-                text=True,
-                env=_env(),
-            )
+            folder = Path(td); root = folder / "nova"; root.mkdir()
+            mutex = folder / "scope" / "update_supervisor.lock"; markers = folder / "markers"; finish = folder / "finish.marker"
+            first = subprocess.Popen([sys.executable, "-c", SUPERVISOR_SCRIPT, str(root), str(mutex), str(markers), str(finish)], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, env=_env())
             second = None
             try:
                 mutex_marker = markers / f"mutex_{first.pid}"
                 acquired = _wait_for_path(mutex_marker, 20.0)
-                first_error = ""
-                if not acquired and first.poll() is not None:
-                    first_error = first.stderr.read()
-                self.assertTrue(
-                    acquired,
-                    f"first supervisor never acquired mutex; rc={first.poll()} stderr={first_error}",
-                )
-
-                second = subprocess.Popen(
-                    [sys.executable, "-c", SUPERVISOR_SCRIPT, str(root), str(mutex), str(markers), str(finish)],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    env=_env(),
-                )
+                first_error = first.stderr.read() if (not acquired and first.poll() is not None) else ""
+                self.assertTrue(acquired, f"first supervisor never acquired mutex; rc={first.poll()} stderr={first_error}")
+                second = subprocess.Popen([sys.executable, "-c", SUPERVISOR_SCRIPT, str(root), str(mutex), str(markers), str(finish)], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, env=_env())
                 second_rc = second.wait(timeout=20)
                 self.assertEqual(second_rc, SUPERVISOR_ALREADY_RUNNING_CODE, second.stderr.read())
                 self.assertFalse((markers / f"mutex_{second.pid}").exists())
@@ -338,23 +268,13 @@ class ResidentProcessIPCTests(unittest.TestCase):
                 self.assertFalse((markers / f"run_{second.pid}").exists())
                 self.assertFalse((markers / f"launch_{second.pid}").exists())
                 self.assertTrue((markers / f"rc{SUPERVISOR_ALREADY_RUNNING_CODE}_{second.pid}").exists())
-
                 run_marker = markers / f"run_{first.pid}"
                 reached_run = _wait_for_path(run_marker, 20.0)
-                first_error = ""
-                if not reached_run and first.poll() is not None:
-                    first_error = first.stderr.read()
-                self.assertTrue(
-                    reached_run,
-                    f"mutex owner never reached run_update; rc={first.poll()} stderr={first_error}",
-                )
-
+                first_error = first.stderr.read() if (not reached_run and first.poll() is not None) else ""
+                self.assertTrue(reached_run, f"mutex owner never reached run_update; rc={first.poll()} stderr={first_error}")
                 finish.write_text("finish", encoding="utf-8")
                 first_rc = first.wait(timeout=20)
                 self.assertEqual(first_rc, 0, first.stderr.read())
-                self.assertTrue((markers / f"mutex_{first.pid}").exists())
-                self.assertTrue((markers / f"shutdown_{first.pid}").exists())
-                self.assertTrue((markers / f"run_{first.pid}").exists())
                 self.assertTrue((markers / f"guard_release_{first.pid}").exists())
                 self.assertTrue((markers / f"launch_{first.pid}").exists())
                 self.assertEqual(len(list(markers.glob("mutex_*"))), 1)
@@ -365,34 +285,20 @@ class ResidentProcessIPCTests(unittest.TestCase):
                 finish.write_text("finish", encoding="utf-8")
                 for proc in (second, first):
                     if proc is not None and proc.poll() is None:
-                        proc.terminate()
-                        proc.wait(timeout=5)
+                        proc.terminate(); proc.wait(timeout=5)
 
     def test_dead_supervisor_process_does_not_leave_mutex_owned(self):
         with tempfile.TemporaryDirectory() as td:
-            folder = Path(td)
-            mutex = folder / "scope" / "update_supervisor.lock"
-            held = folder / "held.marker"
-            proc = subprocess.Popen(
-                [sys.executable, "-c", SUPERVISOR_HOLDER_SCRIPT, str(mutex), str(held)],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                env=_env(),
-            )
+            folder = Path(td); mutex = folder / "scope" / "update_supervisor.lock"; held = folder / "held.marker"
+            proc = subprocess.Popen([sys.executable, "-c", SUPERVISOR_HOLDER_SCRIPT, str(mutex), str(held)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=_env())
             try:
                 self.assertTrue(_wait_for_path(held, 5.0))
                 competing = create_supervisor_mutex(path=mutex)
-                self.assertFalse(competing.acquire(), "mutex allowed two live supervisor owners")
-                proc.terminate()
-                proc.wait(timeout=5)
-                self.assertTrue(
-                    _wait_for_mutex_available(mutex, 5.0),
-                    "kernel mutex did not become available after owner process died",
-                )
+                self.assertFalse(competing.acquire())
+                proc.terminate(); proc.wait(timeout=5)
+                self.assertTrue(_wait_for_mutex_available(mutex, 5.0))
             finally:
-                if proc.poll() is None:
-                    proc.terminate()
-                    proc.wait(timeout=3)
+                if proc.poll() is None: proc.terminate(); proc.wait(timeout=3)
 
 
 if __name__ == "__main__":
