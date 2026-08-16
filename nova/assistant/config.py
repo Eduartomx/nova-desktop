@@ -24,6 +24,21 @@ SECURITY_PROFILES: dict[str, dict[str, Any]] = {
         "confirm_browser_close_tab": False,
         "backup_overwritten_files": True,
     },
+    "balanced": {
+        "confirm_file_writes": True,
+        "confirm_powershell": True,
+        "confirm_input_actions": True,
+        "confirm_window_close": True,
+        "confirm_window_layout": False,
+        "confirm_clipboard_write": True,
+        "confirm_read_selection": False,
+        "confirm_uia_actions": True,
+        "confirm_browser_typing": True,
+        "confirm_browser_submit": True,
+        "confirm_browser_sensitive_clicks": True,
+        "confirm_browser_close_tab": False,
+        "backup_overwritten_files": True,
+    },
     "trusted": {
         "confirm_file_writes": False,
         "confirm_powershell": False,
@@ -299,16 +314,18 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "paid_api_opt_in": False,
     },
     "security": {
-        "profile": "trusted",
+        "profile": "balanced",
         "restrict_files_to_allowed_roots": True,
         "allowed_roots": ["~"],
-        **SECURITY_PROFILES["trusted"],
+        **SECURITY_PROFILES["balanced"],
+        "approval_timeout_seconds": 120,
+        "emergency_stop_hotkey": "",
     },
 }
 
 
 def apply_security_profile(config: dict[str, Any], profile: str) -> dict[str, Any]:
-    profile = str(profile or "trusted").lower().strip()
+    profile = str(profile or "balanced").lower().strip()
     if profile not in SECURITY_PROFILES:
         raise ValueError(f"Perfil de seguridad desconocido: {profile}")
     security = config.setdefault("security", {})
@@ -351,9 +368,19 @@ def load_config() -> dict[str, Any]:
         migrated = True
 
     original_security = data.get("security", {}) if isinstance(data.get("security", {}), dict) else {}
-    profile = str(original_security.get("profile", "trusted")).lower().strip()
+    if "profile" in original_security:
+        profile = str(original_security.get("profile") or "balanced").lower().strip()
+    else:
+        # Legacy confirm_* preferences are migrated conservatively. Any enabled
+        # confirmation selects safe; an all-false legacy setup remains trusted.
+        legacy_values = [
+            bool(value) for key, value in original_security.items()
+            if str(key).startswith("confirm_")
+        ]
+        profile = "safe" if any(legacy_values) else ("trusted" if legacy_values else "balanced")
+        migrated = True
     if profile not in SECURITY_PROFILES:
-        profile = "trusted"
+        profile = "balanced"
     apply_security_profile(merged, profile)
 
     if migrated:

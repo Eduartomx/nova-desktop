@@ -298,7 +298,7 @@ def install_tools_desktop():
 
         def browser_click(self, target):
             raw = str(target or "").strip()
-            if self.config.get("security", {}).get("confirm_browser_sensitive_clicks", True) and _SENSITIVE_BROWSER.search(raw):
+            if not getattr(self, "_action_broker_executing", False) and self.config.get("security", {}).get("confirm_browser_sensitive_clicks", True) and _SENSITIVE_BROWSER.search(raw):
                 return {"ok": False, "error": "confirmation_required", "detail": "El objetivo parece una acción web sensible; requiere confirmación explícita."}
             def op():
                 page = self.browser_agent.page
@@ -307,7 +307,7 @@ def install_tools_desktop():
                     label = (loc.get_attribute("aria-label") or loc.inner_text() or "")[:300]
                 except Exception:
                     label = raw
-                if self.config.get("security", {}).get("confirm_browser_sensitive_clicks", True) and _SENSITIVE_BROWSER.search(label):
+                if not getattr(self, "_action_broker_executing", False) and self.config.get("security", {}).get("confirm_browser_sensitive_clicks", True) and _SENSITIVE_BROWSER.search(label):
                     return {"ok": False, "error": "confirmation_required", "detail": "El control parece sensible: " + label[:180]}
                 loc.click()
                 return {"ok": True, "clicked": label or raw, "url": page.url}
@@ -321,7 +321,7 @@ def install_tools_desktop():
                 loc = self.browser_agent.resolve(raw)
                 loc.fill(value)
                 if bool(submit):
-                    if self.config.get("security", {}).get("confirm_browser_submit", True):
+                    if not getattr(self, "_action_broker_executing", False) and self.config.get("security", {}).get("confirm_browser_submit", True):
                         return {"ok": False, "error": "confirmation_required", "filled": True, "detail": "El campo fue rellenado, pero enviar el formulario requiere confirmación."}
                     loc.press("Enter")
                 return {"ok": True, "filled": True, "submitted": bool(submit), "url": page.url}
@@ -404,7 +404,7 @@ def install_tools_desktop():
                 return {"ok": False, "error": type(exc).__name__, "detail": str(exc)[:500]}
 
         def window_close(self, title):
-            if self.config.get("security", {}).get("confirm_window_close", False):
+            if not getattr(self, "_action_broker_executing", False) and self.config.get("security", {}).get("confirm_window_close", False):
                 return {"ok": False, "error": "confirmation_required", "detail": "Cerrar ventanas requiere confirmación según el perfil actual."}
             try:
                 win = _find_window(self, title)
@@ -415,7 +415,7 @@ def install_tools_desktop():
                 return {"ok": False, "error": type(exc).__name__, "detail": str(exc)[:500]}
 
         def window_move(self, title, x, y, width, height):
-            if self.config.get("security", {}).get("confirm_window_layout", False):
+            if not getattr(self, "_action_broker_executing", False) and self.config.get("security", {}).get("confirm_window_layout", False):
                 return {"ok": False, "error": "confirmation_required"}
             try:
                 win = _find_window(self, title)
@@ -462,7 +462,7 @@ def install_tools_desktop():
                 return win.child_window(title_re=".*" + re.escape(raw) + ".*").wrapper_object()
 
         def uia_click(self, window="", control=""):
-            if self.config.get("security", {}).get("confirm_uia_actions", False):
+            if not getattr(self, "_action_broker_executing", False) and self.config.get("security", {}).get("confirm_uia_actions", False):
                 return {"ok": False, "error": "confirmation_required"}
             try:
                 ctrl = _uia_control(self, window, control)
@@ -478,7 +478,7 @@ def install_tools_desktop():
                 return {"ok": False, "error": type(exc).__name__, "detail": str(exc)[:500]}
 
         def uia_type(self, window="", control="", text=""):
-            if self.config.get("security", {}).get("confirm_uia_actions", False):
+            if not getattr(self, "_action_broker_executing", False) and self.config.get("security", {}).get("confirm_uia_actions", False):
                 return {"ok": False, "error": "confirmation_required"}
             try:
                 ctrl = _uia_control(self, window, control)
@@ -493,7 +493,7 @@ def install_tools_desktop():
 
         # ---------- Entrada sintética (fallback) ----------
         def mouse_move(self, x, y):
-            if self.config.get("security", {}).get("confirm_input_actions", False):
+            if not getattr(self, "_action_broker_executing", False) and self.config.get("security", {}).get("confirm_input_actions", False):
                 return {"ok": False, "error": "confirmation_required"}
             try:
                 from pynput.mouse import Controller
@@ -503,7 +503,7 @@ def install_tools_desktop():
                 return {"ok": False, "error": str(exc)[:500]}
 
         def mouse_click(self, x, y, button="left", count=1):
-            if self.config.get("security", {}).get("confirm_input_actions", False):
+            if not getattr(self, "_action_broker_executing", False) and self.config.get("security", {}).get("confirm_input_actions", False):
                 return {"ok": False, "error": "confirmation_required"}
             try:
                 from pynput.mouse import Button, Controller
@@ -516,7 +516,7 @@ def install_tools_desktop():
                 return {"ok": False, "error": str(exc)[:500]}
 
         def keyboard_type(self, text):
-            if self.config.get("security", {}).get("confirm_input_actions", False):
+            if not getattr(self, "_action_broker_executing", False) and self.config.get("security", {}).get("confirm_input_actions", False):
                 return {"ok": False, "error": "confirmation_required"}
             try:
                 from pynput.keyboard import Controller
@@ -526,7 +526,7 @@ def install_tools_desktop():
                 return {"ok": False, "error": str(exc)[:500]}
 
         def keyboard_press(self, key):
-            if self.config.get("security", {}).get("confirm_input_actions", False):
+            if not getattr(self, "_action_broker_executing", False) and self.config.get("security", {}).get("confirm_input_actions", False):
                 return {"ok": False, "error": "confirmation_required"}
             try:
                 from pynput.keyboard import Controller, Key

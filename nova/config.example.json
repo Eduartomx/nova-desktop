@@ -340,21 +340,23 @@
     "paid_api_opt_in": false
   },
   "security": {
-    "profile": "trusted",
+    "profile": "balanced",
     "restrict_files_to_allowed_roots": true,
     "allowed_roots": ["~"],
-    "confirm_file_writes": false,
-    "confirm_powershell": false,
-    "confirm_input_actions": false,
-    "confirm_window_close": false,
+    "confirm_file_writes": true,
+    "confirm_powershell": true,
+    "confirm_input_actions": true,
+    "confirm_window_close": true,
     "confirm_window_layout": false,
-    "confirm_clipboard_write": false,
+    "confirm_clipboard_write": true,
     "confirm_read_selection": false,
-    "confirm_uia_actions": false,
-    "confirm_browser_typing": false,
-    "confirm_browser_submit": false,
+    "confirm_uia_actions": true,
+    "confirm_browser_typing": true,
+    "confirm_browser_submit": true,
     "confirm_browser_sensitive_clicks": true,
     "confirm_browser_close_tab": false,
-    "backup_overwritten_files": true
+    "backup_overwritten_files": true,
+    "approval_timeout_seconds": 120,
+    "emergency_stop_hotkey": ""
   }
 }

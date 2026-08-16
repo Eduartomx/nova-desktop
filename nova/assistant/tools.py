@@ -102,7 +102,7 @@ class LocalTools:
 
     # ---------- seguridad/rutas ----------
     def _trusted_mode(self) -> bool:
-        return str(self.config.get("security", {}).get("profile", "trusted")).casefold() == "trusted"
+        return str(self.config.get("security", {}).get("profile", "balanced")).casefold() == "trusted"
 
     def _allowed_roots(self) -> list[Path]:
         roots: list[Path] = []

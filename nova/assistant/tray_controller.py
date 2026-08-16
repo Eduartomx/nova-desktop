@@ -156,6 +156,7 @@ class TrayController:
             pystray.MenuItem("Precargar Qwen", lambda *_: self._run_worker(self._preload_qwen)),
             pystray.MenuItem("Liberar Qwen", lambda *_: self._run_worker(self._unload_qwen)),
             pystray.MenuItem("Buscar actualizaciones", lambda *_: self._run_worker(self._check_updates)),
+            pystray.MenuItem("Detener automatización", lambda *_: self.ui.root.after(0, self.ui.stop_automation)),
             pystray.MenuItem(
                 "Iniciar con Windows",
                 lambda *_: self._run_worker(self._toggle_autostart),

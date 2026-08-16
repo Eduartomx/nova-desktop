@@ -20,6 +20,7 @@ from tkinter import messagebox
 from .agent import LocalAgent
 from .autostart import AutostartManager
 from .runtime_lifecycle import RuntimeLifecycleManager
+from .task_engine import TaskEngine
 from .tray_controller import TrayController
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -41,6 +42,7 @@ class AssistantUI:
         self.config = config or {}
         self.name = str(self.config.get("assistant_name") or "Nova")
         self.agent = LocalAgent(self.config)
+        self.task_engine = TaskEngine(self.agent, self.config, self.agent.memory)
         self.busy = False
         self.result_queue: queue.Queue[tuple[str, str]] = queue.Queue()
         self._hotkey_listener = None
@@ -57,6 +59,14 @@ class AssistantUI:
         self.runtime_lifecycle = RuntimeLifecycleManager(root, self.config, ui=self)
         if instance_lock is not None:
             self.runtime_lifecycle.attach_instance(instance_lock)
+            try:
+                identity = instance_lock.status()
+                tools = self.agent.tools
+                tools.action_owner_id = str(identity.get("owner_id") or tools.action_owner_id)
+                tools.action_scope = str(identity.get("scope_id") or tools.action_scope)
+                tools.action_session_id = str(identity.get("session_id") or tools.action_session_id)
+            except Exception:
+                pass
         self.runtime_lifecycle.attach_autostart(self.autostart_manager)
 
         self.root.title(f"{self.name} · Asistente local")
@@ -64,6 +74,8 @@ class AssistantUI:
         self.root.minsize(560, 420)
 
         self._build()
+        from .ui_action_approval import attach_action_approval
+        attach_action_approval(self)
         self._install_hotkeys()
 
         resident = self.config.get("resident_mode", {}) if isinstance(self.config, dict) else {}
@@ -103,17 +115,32 @@ class AssistantUI:
         self.mic_button.pack(side="left", padx=(8, 0))
         self.send_button = tk.Button(composer, text="Enviar", command=self._send_from_entry, width=10)
         self.send_button.pack(side="left", padx=(8, 0))
+        self.stop_button = tk.Button(composer, text="Detener", command=self.stop_automation, width=9)
+        self.stop_button.pack(side="left", padx=(8, 0))
 
         foot = tk.Frame(self.root, padx=12)
         foot.pack(fill="x", pady=(0, 8))
         hotkey = str(self.config.get("hotkey", "<ctrl>+<alt>+<space>"))
         tk.Label(foot, text=f"Atajo: {hotkey} · Contexto: Ctrl+Shift+Espacio · Voz: F9", anchor="w", fg="#666").pack(fill="x")
 
-        self._append("system", "Nova Core 0.9 · Agent/Tools/UI administrados por GitHub; las acciones siguen respetando seguridad y verificaciones.")
+        self._append("system", "Nova Core 0.10 · las acciones sensibles usan autorización local y Repository Intelligence identifica sus fuentes.")
         try:
             self.input_entry.focus_set()
         except Exception:
             pass
+
+    def stop_automation(self):
+        controller = getattr(self, "action_approval", None)
+        if controller is not None:
+            controller.cancel_all("user_stop")
+        engine = getattr(self, "task_engine", None)
+        if engine is not None and hasattr(engine, "cancel"):
+            engine.cancel()
+        try:
+            self.status_var.set("Automatización detenida")
+        except Exception:
+            pass
+        return {"ok": True, "stopped": True}
 
     def _append(self, role: str, text: str):
         label = {"user": "Tú", "assistant": self.name, "system": "Sistema", "error": "Error"}.get(str(role), str(role).title())
@@ -264,6 +291,10 @@ class AssistantUI:
             self._hotkey_listener = keyboard.GlobalHotKeys({
                 main_hotkey: lambda: self.root.after(0, self._show_window),
                 context_hotkey: lambda: self.root.after(0, self._context_hotkey),
+                **({
+                    self._normalize_hotkey(str(self.config.get("security", {}).get("emergency_stop_hotkey"))):
+                        lambda: self.root.after(0, self.stop_automation),
+                } if str(self.config.get("security", {}).get("emergency_stop_hotkey") or "").strip() else {}),
             })
             self._hotkey_listener.daemon = True
             self._hotkey_listener.start()
