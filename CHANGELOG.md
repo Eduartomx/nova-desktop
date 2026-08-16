@@ -1,5 +1,24 @@
 # Changelog
 
+## v0.10.0 — Safe Actions & Repository Intelligence
+
+- Añade un Action Broker local como autoridad única antes de ejecutar herramientas: cada solicitud queda ligada a herramienta, hash SHA-256 de argumentos, propietario, scope, sesión, tarea y snapshot revalidable.
+- Clasifica todas las herramientas en lectura, lectura sensible, reversible, mutación, alto riesgo o prohibida; las herramientas desconocidas fallan cerradas.
+- Incorpora perfiles `safe`, `balanced` y `trusted`; `balanced` es el valor inicial para instalaciones nuevas y la migración conserva o endurece las confirmaciones antiguas.
+- Las acciones de alto riesgo solo aceptan permiso de una vez. Los grants de tarea no cruzan tarea, owner, scope ni herramienta.
+- La tarjeta de aprobación vive exclusivamente en la UI local de Tk. Cerrar la tarjeta equivale a denegar; timeout, cancelación, shutdown o update liberan la espera.
+- `browser_fill(..., submit=true)` pide permiso antes de rellenar. Enter, UI Automation y mouse no pueden usarse como bypass del envío sensible.
+- `write_file` solicita permiso antes de crear carpetas, copiar backup o escribir, y conserva los backups previos a sobrescritura.
+- PowerShell aplica un denylist fail-closed para borrado masivo, formato, arranque, seguridad, protecciones y credenciales; el audit log nunca guarda comandos, texto, secretos ni argumentos completos.
+- Task Engine reconoce `waiting_for_approval`, `approved`, `denied` y `expired`; la espera humana no consume timeout ni provoca retry/replan y las aprobaciones se consumen exactamente una vez.
+- Añade botón visible y acción de bandeja para detener automatización; el hotkey de emergencia es configurable pero queda vacío por defecto.
+- Añade Repository Intelligence para responder versión, novedades, disponibilidad de actualización, actividad y archivos públicos del repositorio propio configurado.
+- El cliente GitHub read-only usa exclusivamente `api.github.com`, `urllib`, timeout, ETag, límites de tamaño y cache pública atómica; no usa `gh`, tokens, cookies ni autenticación.
+- Versiones y changelog funcionan offline con archivos locales, `update_last.json` y cache. Las respuestas siempre indican la evidencia utilizada.
+- Repositorio, releases, commits, issues y PR se tratan como datos externos no confiables y nunca pueden autorizar herramientas ni ejecutar instrucciones encontradas.
+- Añade routing determinista anterior al LLM para consultas de versión, changelog, actualización y estado del repositorio.
+- Minecraft Agent y Hexabot permanecen explícitamente fuera de alcance de v0.10.0.
+
 ## v0.9.9 — Resident Mode & Runtime Lifecycle
 
 - Añade `RuntimeLifecycleManager` con estados `starting`, `running`, `hidden`, `shutting_down` y `stopped`; ocultar la ventana ya no equivale a terminar Nova.

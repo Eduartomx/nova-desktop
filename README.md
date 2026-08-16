@@ -6,9 +6,15 @@ GitHub (`Eduartomx/nova-desktop`) es la fuente de verdad. El updater estable sin
 
 ## Estado
 
-La versión estable preparada para publicación es **v0.9.9 — Resident Mode & Runtime Lifecycle**. La implementación y el hardening del Resident Runtime están completados.
+La versión estable publicada es **v0.9.9 — Resident Mode & Runtime Lifecycle**. La rama v0.10.0 desarrolla **Safe Actions & Repository Intelligence** sin modificar las garantías transaccionales del runtime residente.
 
 Nova v0.9.9 finalizó correctamente las suites completas de Ubuntu y Windows y una validación manual controlada r17 en Windows 11 del lifecycle residente, la actualización sin consola visible, la identidad autoritativa del runtime y el handoff transaccional.
+
+### v0.10.0 — Safe Actions & Repository Intelligence
+
+Nova centraliza las acciones sensibles en un broker local con perfiles `safe`, `balanced` y `trusted`. Las aprobaciones se muestran únicamente en la UI local, se ligan al contexto exacto y se consumen una vez; detener, cancelar, cerrar o actualizar libera cualquier espera.
+
+Repository Intelligence permite consultar la versión local, el changelog, la última release y la actividad del repositorio propio. Funciona offline con fuentes locales/cache e identifica siempre la evidencia usada. El contenido remoto se trata como dato no confiable y nunca autoriza acciones.
 
 ### v0.9.8 — Gaming Reliability
 
