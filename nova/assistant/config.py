@@ -319,6 +319,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "allowed_roots": ["~"],
         **SECURITY_PROFILES["balanced"],
         "approval_timeout_seconds": 120,
+        "action_history_limit": 256,
+        "action_active_limit": 32,
+        "action_audit_max_bytes": 262144,
+        "action_audit_rotations": 2,
         "emergency_stop_hotkey": "",
     },
 }

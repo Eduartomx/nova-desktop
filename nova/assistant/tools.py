@@ -55,7 +55,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     _fn("screenshot", "Toma una captura puntual de pantalla y devuelve la ruta local."),
     _fn("clipboard_read", "Lee el portapapeles solo cuando el usuario lo solicita explícitamente."),
     _fn("clipboard_write", "Escribe texto en el portapapeles.", {"text": {"type": "string"}}, ["text"]),
-    _fn("powershell", "Ejecuta PowerShell. Bloquea patrones destructivos/seguridad de alto riesgo por defecto.", {"command": {"type": "string"}, "timeout": {"type": "integer"}}, ["command"]),
+    _fn("powershell", "Ejecuta únicamente consultas PowerShell simples incluidas en la lista positiva acotada; cualquier sintaxis no comprendida se prohíbe.", {"command": {"type": "string"}, "timeout": {"type": "integer"}}, ["command"]),
     _fn("remember", "Guarda un dato estable en memoria local.", {"key": {"type": "string"}, "value": {"type": "string"}}, ["key", "value"]),
 ]
 
@@ -349,22 +349,17 @@ class LocalTools:
             return {"ok": False, "error": str(exc)[:500]}
 
     # ---------- PowerShell ----------
-    _DANGEROUS_PS = re.compile(
-        r"(?i)(remove-item\b|del\s+/[sqf]|format-volume\b|clear-disk\b|initialize-disk\b|"
-        r"stop-computer\b|restart-computer\b|shutdown\b|bcdedit\b|reg\s+delete\b|"
-        r"set-executionpolicy\b|disable-windowsoptionalfeature\b|invoke-expression\b|iex\b|"
-        r"downloadstring\b|frombase64string\b)"
-    )
-
     def powershell(self, command, timeout=20):
         cmd = str(command or "").strip()
         if not cmd:
             return {"ok": False, "error": "command_required"}
-        if self._DANGEROUS_PS.search(cmd):
+        from .action_powershell import classify_powershell
+        assessment = classify_powershell(cmd)
+        if not assessment.allowed:
             return {
                 "ok": False,
-                "error": "confirmation_required",
-                "detail": "Nova Core bloqueó un patrón PowerShell destructivo/seguridad. Usa una ruta explícita con confirmación del usuario.",
+                "error": "forbidden_action",
+                "detail": "PowerShell fuera de la lista positiva acotada de Nova.",
             }
         timeout = max(1, min(int(timeout or 20), 120))
         try:

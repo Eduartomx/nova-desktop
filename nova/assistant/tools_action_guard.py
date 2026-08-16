@@ -8,7 +8,7 @@ import uuid
 from typing import Any
 
 from .action_broker import ActionBroker
-from .action_context import ActionContext, build_action_context
+from .action_context import ActionContext, HumanIntent, build_action_context
 
 
 def install_tools_action_guard():
@@ -25,9 +25,9 @@ def install_tools_action_guard():
         original_init(self, *args, **kwargs)
         self.action_owner_id = uuid.uuid4().hex
         self.action_scope = "local-ui"
-        self.action_session_id = str(os.getpid())
+        self.action_session_id = f"{os.getpid()}:{uuid.uuid4().hex}"
         self.action_task_id = ""
-        self.action_user_text = ""
+        self.action_human_intent: HumanIntent | None = None
         names = {
             str(schema.get("function", {}).get("name") or "")
             for schema in mod.TOOL_SCHEMAS
@@ -48,7 +48,7 @@ def install_tools_action_guard():
             arguments,
             tools=self,
             task_id=getattr(self, "action_task_id", ""),
-            user_text=getattr(self, "action_user_text", ""),
+            human_intent=getattr(self, "action_human_intent", None),
         )
 
     def execute_tool(self, name: str, arguments: dict[str, Any] | None = None, action_context: ActionContext | None = None):

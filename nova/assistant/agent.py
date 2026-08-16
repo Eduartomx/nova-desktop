@@ -17,6 +17,7 @@ import requests
 
 from .memory import MemoryStore
 from .llm_performance import get_llm_performance
+from .action_context import HumanIntent, human_intent_from_text
 from . import tools as tools_mod
 
 LocalTools = tools_mod.LocalTools
@@ -167,6 +168,8 @@ Sé breve y práctico salvo que el usuario pida detalle.
             "name": name,
             "ok": bool(result.get("ok")) if isinstance(result, dict) else True,
             "authorization_state": result.get("authorization_state") if isinstance(result, dict) else None,
+            "error": result.get("error") if isinstance(result, dict) else None,
+            "request_id": result.get("request", {}).get("request_id") if isinstance(result, dict) and isinstance(result.get("request"), dict) else None,
         })
         return name, args, result
 
@@ -184,18 +187,17 @@ Sé breve y práctico salvo que el usuario pida detalle.
             return f"No pude completar la consulta local ({name}): {detail[:700]}"
         return f"No pude completar la consulta local ({name})."
 
-    def ask(self, user_text: str) -> str:
+    def _ask_core(self, user_text: str, *, record_conversation: bool = True) -> str:
         text = str(user_text or "").strip()
         if not text:
             return "¿Qué necesitas?"
 
         self._last_tool_trace = []
-        if hasattr(self.tools, "action_user_text"):
-            self.tools.action_user_text = text
-        try:
-            self.memory.add_message("user", text)
-        except Exception:
-            pass
+        if record_conversation:
+            try:
+                self.memory.add_message("user", text)
+            except Exception:
+                pass
 
         messages: list[dict[str, Any]] = [{"role": "system", "content": self._system_prompt()}]
         history = self._history_messages()
@@ -234,6 +236,12 @@ Sé breve y práctico salvo que el usuario pida detalle.
                     if isinstance(result, dict) and result.get("error") == "waiting_for_approval":
                         final_text = "Esperando aprobación local para continuar la acción."
                         break
+                    if isinstance(result, dict) and result.get("error") == "approval_ui_unavailable":
+                        final_text = "La acción requiere una aprobación local, pero la interfaz de autorización no está disponible."
+                        break
+                    if isinstance(result, dict) and result.get("error") == "forbidden_action":
+                        final_text = "La política local prohíbe esta acción y no se mostró ninguna aprobación."
+                        break
                     if isinstance(result, dict) and result.get("authorization_state") in {"denied", "expired", "cancelled"}:
                         state = str(result.get("authorization_state"))
                         final_text = {
@@ -251,11 +259,30 @@ Sé breve y práctico salvo que el usuario pida detalle.
 
         final_text = re.sub(r"\n{4,}", "\n\n\n", str(final_text or "")).strip()
         self._last_response = final_text
-        try:
-            self.memory.add_message("assistant", final_text)
-        except Exception:
-            pass
+        if record_conversation:
+            try:
+                self.memory.add_message("assistant", final_text)
+            except Exception:
+                pass
         return final_text
+
+    def _ask_with_intent(self, text: str, intent: HumanIntent | None, *, record_conversation: bool) -> str:
+        previous = getattr(self.tools, "action_human_intent", None)
+        if hasattr(self.tools, "action_human_intent"):
+            self.tools.action_human_intent = intent if isinstance(intent, HumanIntent) and intent.source == "local_user" else None
+        try:
+            return self._ask_core(text, record_conversation=record_conversation)
+        finally:
+            if hasattr(self.tools, "action_human_intent"):
+                self.tools.action_human_intent = previous
+
+    def ask(self, user_text: str) -> str:
+        text = str(user_text or "")
+        return self._ask_with_intent(text, human_intent_from_text(text, source="local_user"), record_conversation=True)
+
+    def ask_internal(self, instruction: str, *, human_intent: HumanIntent | None = None) -> str:
+        """Execute Planner/Executor text without deriving new human intent from it."""
+        return self._ask_with_intent(str(instruction or ""), human_intent, record_conversation=False)
 
     def last_tool_trace(self) -> list[dict[str, Any]]:
         return list(self._last_tool_trace)

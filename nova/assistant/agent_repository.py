@@ -12,8 +12,15 @@ def _normal(text: str) -> str:
 
 
 _VERSION = ("que version eres", "que version tienes", "version de nova", "hay una actualizacion disponible")
-_CHANGES = ("que cambio en la nueva version", "que se agrego en esta actualizacion", "muestrame tu changelog", "cuales son tus ultimos cambios")
-_ACTIVITY = ("consulta tu repositorio", "estado de tu repo", "actividad del repositorio", "estado de tu repositorio")
+_CHANGES = (
+    "que cambio en la nueva version", "que se agrego en esta actualizacion", "muestrame tu changelog",
+    "cuales son tus ultimos cambios", "que trae esta version", "que hay de nuevo",
+    "cuales fueron los cambios", "que agregaron",
+)
+_ACTIVITY = (
+    "consulta tu repositorio", "estado de tu repo", "actividad del repositorio", "estado de tu repositorio",
+    "revisa tu github", "consulta tus commits",
+)
 
 
 def repository_route(text: str) -> str:
@@ -64,8 +71,12 @@ def install_agent_repository():
 
     def ask(self, user_text):
         route = repository_route(user_text)
-        intelligence = getattr(getattr(self, "tools", None), "repository_intelligence", None)
+        tools = getattr(self, "tools", None)
+        intelligence = getattr(tools, "repository_intelligence", None)
         if route and intelligence is not None:
+            previous_intent = getattr(tools, "action_human_intent", None)
+            if hasattr(tools, "action_human_intent"):
+                tools.action_human_intent = None
             try:
                 self._last_fast_route = "version" if route == "version" else ("repository_changes" if route == "changes" else "repository_activity")
                 if route == "version":
@@ -83,6 +94,9 @@ def install_agent_repository():
                 return answer
             except Exception:
                 pass
+            finally:
+                if hasattr(tools, "action_human_intent"):
+                    tools.action_human_intent = previous_intent
         return original_ask(self, user_text)
 
     LocalAgent.ask = ask

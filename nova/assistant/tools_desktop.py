@@ -307,8 +307,17 @@ def install_tools_desktop():
                     label = (loc.get_attribute("aria-label") or loc.inner_text() or "")[:300]
                 except Exception:
                     label = raw
-                if not getattr(self, "_action_broker_executing", False) and self.config.get("security", {}).get("confirm_browser_sensitive_clicks", True) and _SENSITIVE_BROWSER.search(label):
-                    return {"ok": False, "error": "confirmation_required", "detail": "El control parece sensible: " + label[:180]}
+                if not getattr(self, "_action_broker_executing", False):
+                    try:
+                        tag = str(loc.evaluate("el=>el.tagName.toLowerCase()") or "").casefold()
+                        typ = str(loc.evaluate("el=>String(el.type||'').toLowerCase()") or "").casefold()
+                        associated = bool(loc.evaluate("el=>!!el.form"))
+                        formaction = str(loc.get_attribute("formaction") or "")
+                        submits = bool(formaction) or typ in {"submit", "image"} or (tag == "button" and associated and typ in {"", "submit"})
+                    except Exception:
+                        return {"ok": False, "error": "confirmation_required", "detail": "No fue posible clasificar el control web de forma segura."}
+                    if submits or (self.config.get("security", {}).get("confirm_browser_sensitive_clicks", True) and _SENSITIVE_BROWSER.search(label)):
+                        return {"ok": False, "error": "confirmation_required", "detail": "El control puede producir un envío o efecto externo."}
                 loc.click()
                 return {"ok": True, "clicked": label or raw, "url": page.url}
             return self.browser_agent.call(op)
@@ -316,13 +325,13 @@ def install_tools_desktop():
         def browser_fill(self, target, text, submit=False):
             raw = str(target or "").strip()
             value = str(text or "")
+            if bool(submit) and not getattr(self, "_action_broker_executing", False):
+                return {"ok": False, "error": "confirmation_required", "detail": "Rellenar y enviar requiere autorización previa."}
             def op():
                 page = self.browser_agent.page
                 loc = self.browser_agent.resolve(raw)
                 loc.fill(value)
                 if bool(submit):
-                    if not getattr(self, "_action_broker_executing", False) and self.config.get("security", {}).get("confirm_browser_submit", True):
-                        return {"ok": False, "error": "confirmation_required", "filled": True, "detail": "El campo fue rellenado, pero enviar el formulario requiere confirmación."}
                     loc.press("Enter")
                 return {"ok": True, "filled": True, "submitted": bool(submit), "url": page.url}
             return self.browser_agent.call(op)

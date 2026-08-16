@@ -50,7 +50,7 @@ class NativeCoreTests(unittest.TestCase):
             self.assertEqual(read["content"], "hola")
             blocked = tools.powershell("Remove-Item -Recurse C:\\Temp")
             self.assertFalse(blocked["ok"])
-            self.assertEqual(blocked["error"], "confirmation_required")
+            self.assertEqual(blocked["error"], "forbidden_action")
 
     def test_agent_tool_loop_works_without_historical_local_agent(self):
         with tempfile.TemporaryDirectory() as td:

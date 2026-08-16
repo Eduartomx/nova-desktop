@@ -9,7 +9,10 @@
 - La tarjeta de aprobación vive exclusivamente en la UI local de Tk. Cerrar la tarjeta equivale a denegar; timeout, cancelación, shutdown o update liberan la espera.
 - `browser_fill(..., submit=true)` pide permiso antes de rellenar. Enter, UI Automation y mouse no pueden usarse como bypass del envío sensible.
 - `write_file` solicita permiso antes de crear carpetas, copiar backup o escribir, y conserva los backups previos a sobrescritura.
-- PowerShell aplica un denylist fail-closed para borrado masivo, formato, arranque, seguridad, protecciones y credenciales; el audit log nunca guarda comandos, texto, secretos ni argumentos completos.
+- PowerShell genérico queda reducido a una lista positiva estrecha de consultas simples: aliases, composición dinámica, shells anidados, comandos codificados, cadenas, pipelines y sintaxis no comprendida se rechazan antes de la UI o subprocess.
+- La cobertura de políticas es explícita y auditable; una herramienta nueva sin clasificación falla en CI y se rechaza en runtime. Los clicks web usan inspección DOM y escalan a alto riesgo ante submit, `formaction` o ambigüedad.
+- Grants, expiración, consumo único, poda y reanudación quedan ligados también a sesión. El audit JSONL rota con límites de tamaño/archivos y nunca guarda comandos, texto, secretos ni argumentos completos.
+- La intención para lecturas sensibles sólo puede derivarse de la orden humana local original; Planner, memoria, skills, web, archivos y contenido remoto no pueden fabricarla.
 - Task Engine reconoce `waiting_for_approval`, `approved`, `denied` y `expired`; la espera humana no consume timeout ni provoca retry/replan y las aprobaciones se consumen exactamente una vez.
 - Añade botón visible y acción de bandeja para detener automatización; el hotkey de emergencia es configurable pero queda vacío por defecto.
 - Añade Repository Intelligence para responder versión, novedades, disponibilidad de actualización, actividad y archivos públicos del repositorio propio configurado.

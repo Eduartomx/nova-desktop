@@ -14,6 +14,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
+from .action_powershell import classify_powershell
+
 
 _SECRET_KEYS = {
     "content", "text", "command", "password", "token", "secret", "cookie",
@@ -72,6 +74,8 @@ def _file_observation(path: Path) -> dict[str, Any]:
 
 
 def _sanitized_target(tool: str, arguments: dict[str, Any]) -> str:
+    if str(tool) == "powershell":
+        return classify_powershell(str(arguments.get("command") or "")).target[:180]
     for key in ("path", "url", "app", "title", "window", "control", "target", "workspace", "skill"):
         if key not in arguments:
             continue
@@ -85,16 +89,45 @@ def _sanitized_target(tool: str, arguments: dict[str, Any]) -> str:
     return str(tool or "")[:180]
 
 
-def explicit_intent_for(tool: str, user_text: str) -> bool:
-    raw = str(user_text or "").casefold()
-    cues = {
-        "clipboard_read": ("portapapeles", "clipboard"),
-        "screenshot": ("captura", "screenshot", "pantalla"),
-        "vision_describe_screen": ("mira", "captura", "pantalla", "describe"),
-        "expert_import_chatgpt_response": ("importa", "respuesta", "portapapeles"),
-    }
-    wanted = cues.get(str(tool), ())
-    return bool(wanted and any(cue in raw for cue in wanted))
+_INTENT_CUES = {
+    "clipboard_read": ("portapapeles", "clipboard"),
+    "screenshot": ("captura", "screenshot", "pantalla"),
+    "vision_describe_screen": ("mira", "captura", "pantalla", "describe"),
+    "expert_import_chatgpt_response": ("importa", "respuesta", "portapapeles"),
+}
+
+
+@dataclass(frozen=True)
+class HumanIntent:
+    """Hashed capability derived only from the original local human order."""
+
+    source: str
+    text_sha256: str
+    sensitive_tools: frozenset[str] = field(default_factory=frozenset)
+
+
+def human_intent_from_text(text: str, *, source: str = "local_user") -> HumanIntent:
+    raw = str(text or "")
+    normalized = raw.casefold()
+    source_name = str(source or "")
+    allowed = frozenset(
+        tool for tool, cues in _INTENT_CUES.items()
+        if source_name == "local_user" and any(cue in normalized for cue in cues)
+    )
+    return HumanIntent(
+        source=source_name,
+        text_sha256=hashlib.sha256(raw.encode("utf-8", errors="surrogatepass")).hexdigest(),
+        sensitive_tools=allowed,
+    )
+
+
+def explicit_intent_for(tool: str, intent: HumanIntent | None) -> bool:
+    return bool(
+        isinstance(intent, HumanIntent)
+        and intent.source == "local_user"
+        and str(tool or "") in intent.sensitive_tools
+        and len(intent.text_sha256) == 64
+    )
 
 
 @dataclass(frozen=True)
@@ -107,6 +140,8 @@ class ActionContext:
     task_id: str = ""
     target: str = ""
     explicit_intent: bool = False
+    intent_sha256: str = ""
+    intent_source: str = ""
     observations: dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -120,6 +155,8 @@ class ActionContext:
             "task_id": self.task_id,
             "target": self.target,
             "explicit_intent": self.explicit_intent,
+            "intent_sha256": self.intent_sha256,
+            "intent_source": self.intent_source,
             "observations": self.observations,
         })
 
@@ -142,6 +179,7 @@ def build_action_context(
     *,
     tools: Any = None,
     task_id: Any = None,
+    human_intent: HumanIntent | None = None,
     user_text: str = "",
     owner_id: str = "",
     scope: str = "",
@@ -164,6 +202,8 @@ def build_action_context(
 
     browser = getattr(tools, "browser_agent", None)
     page = getattr(browser, "_page", None)
+    if str(tool).startswith("browser_"):
+        observations["browser_inspection"] = "unavailable"
     if str(tool).startswith("browser_") and page is not None:
         try:
             observations["browser_url"] = _safe_url(str(page.url))
@@ -176,7 +216,7 @@ def build_action_context(
             def inspect_target():
                 loc = browser.resolve(target)
                 attrs = {}
-                for name in ("id", "name", "type", "role", "aria-label", "formaction", "formmethod"):
+                for name in ("id", "name", "type", "role", "aria-label", "formaction", "formmethod", "form", "href"):
                     try:
                         attrs[name] = str(loc.get_attribute(name) or "")[:240]
                     except Exception:
@@ -185,13 +225,29 @@ def build_action_context(
                     attrs["tag"] = str(loc.evaluate("el=>el.tagName.toLowerCase()") or "")[:40]
                 except Exception:
                     attrs["tag"] = ""
+                try:
+                    attrs["effective_type"] = str(loc.evaluate("el=>String(el.type||'').toLowerCase()") or "")[:40]
+                except Exception:
+                    attrs["effective_type"] = ""
+                try:
+                    attrs["form_associated"] = bool(loc.evaluate("el=>!!el.form"))
+                    attrs["may_submit"] = bool(loc.evaluate(
+                        "el=>{const t=el.tagName.toLowerCase();const k=String(el.type||'').toLowerCase();"
+                        "return !!el.form&&((t==='button'&&(!k||k==='submit'))||(t==='input'&&(k==='submit'||k==='image')))}"
+                    ))
+                except Exception:
+                    attrs["form_associated"] = None
+                    attrs["may_submit"] = None
                 return attrs
             try:
                 inspected = browser.call(inspect_target)
-                if isinstance(inspected, dict) and inspected.get("ok") is not False:
+                if isinstance(inspected, dict) and inspected.get("ok") is not False and inspected.get("tag"):
                     observations["browser_control"] = inspected
-            except Exception:
-                pass
+                    observations["browser_inspection"] = "ok"
+                else:
+                    observations["browser_inspection"] = "ambiguous"
+            except Exception as exc:
+                observations["browser_inspection"] = "failed:" + type(exc).__name__
 
     if str(tool).startswith(("window_", "uia_", "mouse_", "keyboard_")):
         observations["window"] = str(args.get("window") or args.get("title") or "")[:240]
@@ -225,7 +281,9 @@ def build_action_context(
         session_id=selected_session,
         task_id=selected_task,
         target=_sanitized_target(tool, args),
-        explicit_intent=explicit_intent_for(tool, user_text),
+        explicit_intent=explicit_intent_for(tool, human_intent),
+        intent_sha256=human_intent.text_sha256 if isinstance(human_intent, HumanIntent) else "",
+        intent_source=human_intent.source if isinstance(human_intent, HumanIntent) else "",
         observations=observations,
     )
 

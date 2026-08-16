@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import threading
@@ -14,6 +15,7 @@ import uuid
 from typing import Any, Callable
 
 from .action_context import ActionContext
+from .action_powershell import classify_powershell
 
 
 ACTION_STATES = {"pending", "approved", "denied", "expired", "cancelled", "executed"}
@@ -59,51 +61,87 @@ _MUTATING = {
     "expert_prepare_chatgpt", "expert_free_second_opinion",
 }
 _HIGH_RISK = {"powershell", "browser_press", "keyboard_press", "uia_click", "mouse_click"}
-
-_FORBIDDEN_PS = re.compile(
-    r"(?is)(remove-item\b.*(?:-recurse|-force)|\b(?:del|erase|rd|rmdir)\b.*(?:/s|/q)|"
-    r"format-(?:volume|disk)\b|clear-disk\b|initialize-disk\b|bcdedit\b|bootrec\b|"
-    r"stop-computer\b|restart-computer\b|shutdown(?:\.exe)?\b|reg(?:\.exe)?\s+delete\b|"
-    r"set-executionpolicy\b|disable-(?:windowsoptionalfeature|computerrestore|bitlocker)\b|"
-    r"set-mppreference\b.*disable|disable.*(?:defender|firewall|antivirus|security)|"
-    r"credential|sam\\|security\\policy|invoke-expression\b|\biex\b|downloadstring\b|frombase64string\b)"
-)
 _SENSITIVE_TARGET = re.compile(
     r"(?i)\b(buy|purchase|checkout|pay|transfer|send|post|publish|delete|remove|"
     r"submit|comprar|pagar|transferir|enviar|publicar|eliminar|borrar|confirmar|pedido)\b"
 )
 
 
-def policy_for(tool: str, arguments: dict[str, Any] | None = None, *, known_tools: set[str] | None = None) -> ActionPolicy:
+def _registry() -> dict[str, ActionPolicy]:
+    registry: dict[str, ActionPolicy] = {}
+    groups = (
+        (_READ_ONLY, ActionPolicy("read_only", "low", "Lectura local o pública sin efectos.")),
+        (_SENSITIVE_READ, ActionPolicy("sensitive_read", "medium", "Lectura sensible solicitada explícitamente.")),
+        (_REVERSIBLE, ActionPolicy("reversible", "low", "Efecto local reversible.", allow_task_grant=True)),
+        (_MUTATING | {"skill_save", "skill_finish"}, ActionPolicy("mutating", "medium", "La acción modifica estado.", allow_task_grant=True)),
+        (_HIGH_RISK, ActionPolicy("high_risk", "high", "Acción de alto riesgo; permiso de una sola vez.")),
+    )
+    for names, policy in groups:
+        for name in names:
+            if name in registry:
+                raise RuntimeError(f"duplicate_action_policy:{name}")
+            registry[name] = policy
+    return registry
+
+
+POLICY_REGISTRY = _registry()
+
+
+def validate_policy_coverage(tool_names: set[str] | list[str]) -> None:
+    names = {str(name) for name in tool_names if str(name)}
+    missing = sorted(names - set(POLICY_REGISTRY))
+    if missing:
+        raise ValueError("unclassified_action_tools:" + ",".join(missing))
+
+
+def _browser_click_policy(context: ActionContext | None) -> ActionPolicy:
+    observations = context.observations if isinstance(context, ActionContext) else {}
+    inspection = str(observations.get("browser_inspection") or "unavailable")
+    control = observations.get("browser_control") if isinstance(observations.get("browser_control"), dict) else {}
+    if inspection != "ok" or not control:
+        return ActionPolicy("high_risk", "high", "El control web no pudo inspeccionarse de forma concluyente; permiso de una sola vez.")
+    kind = str(control.get("effective_type") or control.get("type") or "").casefold()
+    tag = str(control.get("tag") or "").casefold()
+    sensitive = " ".join(str(control.get(key) or "") for key in ("id", "name", "role", "aria-label", "formaction"))
+    submits = bool(control.get("may_submit")) or kind in {"submit", "image"} or bool(control.get("formaction"))
+    if tag == "button" and bool(control.get("form_associated")) and kind in {"", "submit"}:
+        submits = True
+    if submits or _SENSITIVE_TARGET.search(sensitive):
+        return ActionPolicy("high_risk", "high", "El control puede enviar un formulario o producir un efecto externo; permiso de una sola vez.")
+    return POLICY_REGISTRY["browser_click"]
+
+
+def policy_for(
+    tool: str,
+    arguments: dict[str, Any] | None = None,
+    *,
+    known_tools: set[str] | None = None,
+    context: ActionContext | None = None,
+) -> ActionPolicy:
     name = str(tool or "")
     args = dict(arguments or {})
     if known_tools is not None and name not in known_tools:
         return ActionPolicy("forbidden", "critical", "Herramienta desconocida: política fail-closed.")
-    if name == "powershell" and _FORBIDDEN_PS.search(str(args.get("command") or "")):
-        return ActionPolicy("forbidden", "critical", "Comando de borrado, arranque, seguridad o credenciales prohibido.")
+    if name not in POLICY_REGISTRY:
+        return ActionPolicy("forbidden", "critical", "Herramienta sin política explícita: acción prohibida.")
+    if name == "powershell":
+        assessment = classify_powershell(str(args.get("command") or ""))
+        if not assessment.allowed:
+            return ActionPolicy("forbidden", "critical", assessment.reason)
+        return ActionPolicy("high_risk", "high", assessment.reason)
     if name == "browser_fill" and bool(args.get("submit")):
         return ActionPolicy("high_risk", "high", "Rellenar y enviar un formulario requiere permiso de una sola vez.")
-    if name in {"browser_click", "uia_click"} and _SENSITIVE_TARGET.search(str(args.get("target") or args.get("control") or "")):
+    if name == "browser_click":
+        return _browser_click_policy(context)
+    if name == "uia_click" and _SENSITIVE_TARGET.search(str(args.get("target") or args.get("control") or "")):
         return ActionPolicy("high_risk", "high", "El control puede producir un efecto externo sensible.")
-    if name in _READ_ONLY:
-        return ActionPolicy("read_only", "low", "Lectura local o pública sin efectos.")
-    if name in _SENSITIVE_READ:
-        return ActionPolicy("sensitive_read", "medium", "Lectura sensible solicitada explícitamente.")
-    if name in _REVERSIBLE:
-        return ActionPolicy("reversible", "low", "Efecto local reversible.", allow_task_grant=True)
-    if name in _MUTATING:
-        return ActionPolicy("mutating", "medium", "La acción modifica estado.", allow_task_grant=True)
-    if name in _HIGH_RISK:
-        return ActionPolicy("high_risk", "high", "Acción de alto riesgo; permiso de una sola vez.")
-    # Every schema receives a policy, but unclassified tools are conservative.
-    if known_tools is not None and name in known_tools:
-        return ActionPolicy("mutating", "medium", "Herramienta registrada sin clasificación específica.", allow_task_grant=True)
-    return ActionPolicy("forbidden", "critical", "Herramienta desconocida: política fail-closed.")
+    return POLICY_REGISTRY[name]
 
 
 def policy_registry(tool_names: set[str] | list[str]) -> dict[str, ActionPolicy]:
     names = {str(name) for name in tool_names if str(name)}
-    return {name: policy_for(name, {}, known_tools=names) for name in names}
+    validate_policy_coverage(names)
+    return {name: POLICY_REGISTRY[name] for name in sorted(names)}
 
 
 def _now_iso() -> str:
@@ -120,10 +158,17 @@ class ActionBroker:
         self._clock = clock
         self._lock = threading.RLock()
         self._pending: dict[str, dict[str, Any]] = {}
-        self._task_grants: set[tuple[str, str, str, str]] = set()
+        self._task_grants: set[tuple[str, str, str, str, str]] = set()
         self._approval_handler: Callable[[dict[str, Any]], Any] | None = None
+        self._state_listener: Callable[[str, dict[str, Any]], Any] | None = None
         self._shutting_down = False
+        self._terminal_sequence = 0
         self.total_wait_seconds = 0.0
+        security = self.config.get("security", {}) if isinstance(self.config, dict) else {}
+        self._history_limit = max(16, min(int(security.get("action_history_limit", 256) or 256), 2048))
+        self._active_limit = max(4, min(int(security.get("action_active_limit", 32) or 32), 256))
+        self._audit_max_bytes = max(4096, min(int(security.get("action_audit_max_bytes", 262144) or 262144), 8 * 1024 * 1024))
+        self._audit_rotations = max(0, min(int(security.get("action_audit_rotations", 2) or 2), 5))
 
     @property
     def profile(self) -> str:
@@ -134,6 +179,10 @@ class ActionBroker:
     def set_approval_handler(self, handler: Callable[[dict[str, Any]], Any] | None) -> None:
         with self._lock:
             self._approval_handler = handler
+
+    def set_state_listener(self, listener: Callable[[str, dict[str, Any]], Any] | None) -> None:
+        with self._lock:
+            self._state_listener = listener
 
     def _requires_approval(self, policy: ActionPolicy) -> bool:
         if policy.effect in {"forbidden", "high_risk"}:
@@ -146,6 +195,38 @@ class ActionBroker:
             return policy.effect == "mutating"
         return False
 
+    def _atomic_audit_write_locked(self, line: bytes) -> None:
+        if self.audit_path is None:
+            return
+        self.audit_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            current = self.audit_path.read_bytes()
+        except FileNotFoundError:
+            current = b""
+        if current and len(current) + len(line) > self._audit_max_bytes:
+            for index in range(self._audit_rotations, 0, -1):
+                source = self.audit_path if index == 1 else self.audit_path.with_name(self.audit_path.name + f".{index - 1}")
+                destination = self.audit_path.with_name(self.audit_path.name + f".{index}")
+                try:
+                    if source.exists():
+                        os.replace(source, destination)
+                except OSError:
+                    pass
+            current = b""
+        tmp = self.audit_path.with_name(self.audit_path.name + "." + uuid.uuid4().hex + ".tmp")
+        try:
+            with tmp.open("wb") as handle:
+                handle.write(current)
+                handle.write(line)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp, self.audit_path)
+        finally:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+
     def _audit(self, event: str, request: dict[str, Any], *, detail: str = "") -> None:
         if self.audit_path is None:
             return
@@ -155,15 +236,51 @@ class ActionBroker:
             "target_sha256": hashlib.sha256(str(request.get("target") or "").encode("utf-8", errors="ignore")).hexdigest(),
             "task_id": request.get("task_id"),
             "owner_id": request.get("owner_id"), "scope": request.get("scope"),
+            "session_id": request.get("session_id"),
             "arguments_sha256": request.get("arguments_sha256"), "state": request.get("state"),
             "detail": str(detail or "")[:160],
         }
+        line = (json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
+        if len(line) > self._audit_max_bytes:
+            return
         try:
-            self.audit_path.parent.mkdir(parents=True, exist_ok=True)
-            with self.audit_path.open("a", encoding="utf-8") as handle:
-                handle.write(json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n")
+            with self._lock:
+                self._atomic_audit_write_locked(line)
         except OSError:
             pass
+
+    def _emit_state_locked(self, event: str, request: dict[str, Any]) -> None:
+        if self._state_listener is not None:
+            try:
+                self._state_listener(str(event), self._public(request))
+            except Exception:
+                pass
+
+    def _prune_locked(self) -> int:
+        terminal = sorted(
+            (row for row in self._pending.values() if row.get("state") in {"denied", "expired", "cancelled", "executed"}),
+            key=lambda row: int(row.get("terminal_sequence") or 0),
+        )
+        remove = max(0, len(terminal) - self._history_limit)
+        for row in terminal[:remove]:
+            self._pending.pop(str(row.get("request_id") or ""), None)
+        return remove
+
+    def prune(self) -> int:
+        with self._lock:
+            return self._prune_locked()
+
+    def _mark_locked(self, request: dict[str, Any], state: str, *, detail: str = "") -> None:
+        request["state"] = state
+        if state in {"denied", "expired", "cancelled", "executed"}:
+            self._terminal_sequence += 1
+            request["terminal_sequence"] = self._terminal_sequence
+        event = request.get("event")
+        if state != "pending" and hasattr(event, "set"):
+            event.set()
+        self._audit(state, request, detail=detail)
+        self._emit_state_locked(state, request)
+        self._prune_locked()
 
     def _public(self, request: dict[str, Any]) -> dict[str, Any]:
         keys = (
@@ -173,7 +290,7 @@ class ActionBroker:
         return {key: request.get(key) for key in keys}
 
     def request(self, tool: str, arguments: dict[str, Any], context: ActionContext, *, timeout=None) -> dict[str, Any]:
-        policy = policy_for(tool, arguments, known_tools=self.known_tools)
+        policy = policy_for(tool, arguments, known_tools=self.known_tools, context=context)
         if policy.effect == "forbidden":
             denied = {
                 "request_id": uuid.uuid4().hex, "tool": tool, "effect": policy.effect, "risk": policy.risk,
@@ -184,14 +301,16 @@ class ActionBroker:
             }
             self._audit("denied", denied, detail="forbidden")
             return {"ok": False, "error": "forbidden_action", "authorization_state": "denied", "request": self._public(denied)}
-        if policy.effect == "sensitive_read" and not context.explicit_intent:
+        has_local_human_intent = bool(
+            context.explicit_intent
+            and context.intent_source == "local_user"
+            and len(context.intent_sha256) == 64
+        )
+        if policy.effect == "sensitive_read" and not has_local_human_intent:
             return {"ok": False, "error": "explicit_intent_required", "authorization_state": "denied"}
         if policy.effect == "read_only" or not self._requires_approval(policy):
             return {"ok": True, "authorization_state": "approved", "automatic": True, "policy": policy}
 
-        # A headless Task Engine may have yielded while pending. If the local UI
-        # approved that exact immutable context afterwards, the resumed step may
-        # claim it once; a changed context cannot reuse it.
         with self._lock:
             for existing in self._pending.values():
                 if (
@@ -207,10 +326,23 @@ class ActionBroker:
                         "policy": policy,
                         "resumed": True,
                     }
-
-        grant_key = (context.task_id, context.owner_id, context.scope, str(tool))
-        if policy.allow_task_grant and context.task_id and grant_key in self._task_grants:
-            return {"ok": True, "authorization_state": "approved", "automatic": True, "task_grant": True, "policy": policy}
+            grant_key = (context.task_id, context.owner_id, context.scope, context.session_id, str(tool))
+            if policy.allow_task_grant and context.task_id and grant_key in self._task_grants:
+                return {"ok": True, "authorization_state": "approved", "automatic": True, "task_grant": True, "policy": policy}
+            handler = self._approval_handler
+            if handler is None:
+                unavailable = {
+                    "request_id": uuid.uuid4().hex, "tool": str(tool), "effect": policy.effect, "risk": policy.risk,
+                    "target": context.target, "reason": policy.reason, "task_id": context.task_id or None,
+                    "owner_id": context.owner_id, "scope": context.scope, "session_id": context.session_id,
+                    "arguments_sha256": context.arguments_sha256, "context_sha256": context.digest,
+                    "state": "cancelled", "created_at": _now_iso(), "expires_at": None,
+                }
+                self._audit("cancelled", unavailable, detail="approval_ui_unavailable")
+                return {"ok": False, "error": "approval_ui_unavailable", "authorization_state": "cancelled", "request": self._public(unavailable)}
+            active = sum(1 for row in self._pending.values() if row.get("state") in {"pending", "approved"})
+            if active >= self._active_limit:
+                return {"ok": False, "error": "authorization_capacity_exceeded", "authorization_state": "denied"}
 
         wait_seconds = float(timeout if timeout is not None else self.config.get("security", {}).get("approval_timeout_seconds", 120) or 120)
         wait_seconds = max(1.0, min(wait_seconds, 900.0))
@@ -229,10 +361,8 @@ class ActionBroker:
             if self._shutting_down:
                 return {"ok": False, "error": "authorization_cancelled", "authorization_state": "cancelled"}
             self._pending[request["request_id"]] = request
-            handler = self._approval_handler
-        self._audit("pending", request)
-        if handler is None:
-            return {"ok": False, "error": "waiting_for_approval", "authorization_state": "pending", "request": self._public(request)}
+            self._audit("pending", request)
+            self._emit_state_locked("pending", request)
         try:
             handler(self._public(request))
         except Exception:
@@ -244,8 +374,7 @@ class ActionBroker:
         with self._lock:
             self.total_wait_seconds += waited
             if request["state"] == "pending":
-                request["state"] = "expired"
-                self._audit("expired", request)
+                self._mark_locked(request, "expired", detail="timeout")
         if request["state"] != "approved":
             return {
                 "ok": False,
@@ -261,18 +390,16 @@ class ActionBroker:
             if not request or request.get("state") != "pending" or self._shutting_down:
                 return False
             if self._clock() >= float(request.get("expires_at") or 0):
-                request["state"] = "expired"
-                request["event"].set()
-                self._audit("expired", request)
+                self._mark_locked(request, "expired", detail="approval_after_timeout")
                 return False
             if mode == "task":
                 if not request.get("allow_task_grant") or not request.get("task_id"):
                     return False
-                self._task_grants.add((str(request["task_id"]), str(request["owner_id"]), str(request["scope"]), str(request["tool"])))
             request["state"] = "approved"
             request["approval_mode"] = "task" if mode == "task" else "once"
             request["event"].set()
             self._audit("approved", request, detail=request["approval_mode"])
+            self._emit_state_locked("approved", request)
             return True
 
     def deny(self, request_id: str, *, reason: str = "user") -> bool:
@@ -280,20 +407,16 @@ class ActionBroker:
             request = self._pending.get(str(request_id))
             if not request or request.get("state") != "pending":
                 return False
-            request["state"] = "denied"
-            request["event"].set()
-            self._audit("denied", request, detail=reason)
+            self._mark_locked(request, "denied", detail=reason)
             return True
 
     def cancel_all(self, reason: str = "cancelled", *, shutdown: bool = False) -> int:
         count = 0
         with self._lock:
             self._shutting_down = self._shutting_down or bool(shutdown)
-            for request in self._pending.values():
-                if request.get("state") == "pending":
-                    request["state"] = "cancelled"
-                    request["event"].set()
-                    self._audit("cancelled", request, detail=reason)
+            for request in list(self._pending.values()):
+                if request.get("state") in {"pending", "approved"} and int(request.get("executions") or 0) == 0:
+                    self._mark_locked(request, "cancelled", detail=reason)
                     count += 1
             self._task_grants.clear()
         return count
@@ -301,8 +424,13 @@ class ActionBroker:
     def consume(self, request_id: str, current: ActionContext) -> dict[str, Any]:
         with self._lock:
             request = self._pending.get(str(request_id))
+            if request and request.get("state") == "executed":
+                return {"ok": False, "error": "authorization_already_consumed"}
             if not request or request.get("state") != "approved":
                 return {"ok": False, "error": "authorization_not_approved"}
+            if self._clock() >= float(request.get("expires_at") or 0):
+                self._mark_locked(request, "expired", detail="consume_after_timeout")
+                return {"ok": False, "error": "authorization_expired"}
             checks = {
                 "arguments_sha256": current.arguments_sha256,
                 "context_sha256": current.digest,
@@ -312,14 +440,17 @@ class ActionBroker:
                 "task_id": current.task_id or None,
             }
             if any(request.get(key) != value for key, value in checks.items()):
-                request["state"] = "cancelled"
-                self._audit("cancelled", request, detail="context_changed")
+                self._mark_locked(request, "cancelled", detail="context_changed")
                 return {"ok": False, "error": "authorization_context_changed"}
             if int(request.get("executions") or 0) != 0:
                 return {"ok": False, "error": "authorization_already_consumed"}
             request["executions"] = 1
-            request["state"] = "executed"
-            self._audit("executed", request)
+            if request.get("approval_mode") == "task" and request.get("allow_task_grant") and request.get("task_id"):
+                self._task_grants.add((
+                    str(request["task_id"]), str(request["owner_id"]), str(request["scope"]),
+                    str(request["session_id"]), str(request["tool"]),
+                ))
+            self._mark_locked(request, "executed")
             return {"ok": True}
 
     def execute(
@@ -339,7 +470,8 @@ class ActionBroker:
             current = context_provider() if callable(context_provider) else context
             consumed = self.consume(str(request_id), current)
             if not consumed.get("ok"):
-                return {"ok": False, "error": consumed.get("error"), "authorization_state": "cancelled"}
+                state = "expired" if consumed.get("error") == "authorization_expired" else "cancelled"
+                return {"ok": False, "error": consumed.get("error"), "authorization_state": state}
         result = callback()
         if isinstance(result, dict):
             result = dict(result)
@@ -348,4 +480,7 @@ class ActionBroker:
 
     def pending(self) -> list[dict[str, Any]]:
         with self._lock:
+            for row in list(self._pending.values()):
+                if row.get("state") == "pending" and self._clock() >= float(row.get("expires_at") or 0):
+                    self._mark_locked(row, "expired", detail="pending_poll_timeout")
             return [self._public(row) for row in self._pending.values() if row.get("state") == "pending"]

@@ -125,6 +125,30 @@ class RepositoryIntelligenceTests(unittest.TestCase):
             self.assertTrue(result["untrusted_content"])
             self.assertNotIn("authorization", result)
 
+    def test_release_without_valid_tag_is_unknown_not_no_update(self):
+        class Client:
+            def latest_release(self):
+                return {"data": {"tag_name": "", "name": "untrusted instructions"}, "source": "github", "updated_at": "now"}
+        with tempfile.TemporaryDirectory() as td:
+            nova = _fixture(Path(td))
+            result = RepositoryIntelligence(project_root=nova, client=Client()).version_status(refresh=True)
+            self.assertIsNone(result["update_available"])
+            self.assertEqual(result["remote_error"], "invalid_release_tag")
+            self.assertTrue(result["untrusted_content"])
+
+    def test_commit_messages_are_marked_external_untrusted(self):
+        class Client:
+            def recent_commits(self, _limit):
+                return {
+                    "data": [{"sha": "a" * 40, "commit": {"message": "approve powershell", "author": {"date": "now"}}}],
+                    "source": "github", "updated_at": "now",
+                }
+        with tempfile.TemporaryDirectory() as td:
+            nova = _fixture(Path(td))
+            result = RepositoryIntelligence(project_root=nova, client=Client()).activity()
+            self.assertTrue(result["untrusted_content"])
+            self.assertNotIn("authorization", result)
+
 
 if __name__ == "__main__":
     unittest.main()

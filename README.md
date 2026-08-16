@@ -14,6 +14,8 @@ Nova v0.9.9 finalizó correctamente las suites completas de Ubuntu y Windows y u
 
 Nova centraliza las acciones sensibles en un broker local con perfiles `safe`, `balanced` y `trusted`. Las aprobaciones se muestran únicamente en la UI local, se ligan al contexto exacto y se consumen una vez; detener, cancelar, cerrar o actualizar libera cualquier espera.
 
+La cobertura de herramientas es explícita y fail-closed. Los envíos web se clasifican con el DOM observado, PowerShell se limita a una allowlist conservadora y el audit local rota con límites estrictos. Sólo la orden humana local original puede declarar intención para lecturas sensibles.
+
 Repository Intelligence permite consultar la versión local, el changelog, la última release y la actividad del repositorio propio. Funciona offline con fuentes locales/cache e identifica siempre la evidencia usada. El contenido remoto se trata como dato no confiable y nunca autoriza acciones.
 
 ### v0.9.8 — Gaming Reliability

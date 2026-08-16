@@ -28,6 +28,13 @@ def _version_key(value: str) -> tuple[int, ...]:
     return tuple(int(x) for x in nums[:4]) or (0,)
 
 
+_RELEASE_TAG = re.compile(r"^v?\d+\.\d+\.\d+(?:[-+][A-Za-z0-9][A-Za-z0-9_.-]*)?$")
+
+
+def _valid_release_tag(value: str) -> bool:
+    return bool(_RELEASE_TAG.fullmatch(str(value or "").strip()))
+
+
 class _UnavailableClient:
     def __init__(self, code="configuration_unavailable"):
         self.code = str(code)
@@ -111,16 +118,28 @@ class RepositoryIntelligence:
             try:
                 remote = self.client.latest_release()
                 release = remote.get("data") if isinstance(remote.get("data"), dict) else {}
-                latest = str(release.get("tag_name") or "").lstrip("vV")
-                result.update({
-                    "latest": latest,
-                    "update_available": bool(latest and _version_key(latest) > _version_key(current)),
-                    "release_url": str(release.get("html_url") or ""),
-                    "release_name": str(release.get("name") or ""),
-                    "source": "release " + ("v" + latest if latest else "pública"),
-                    "updated_at": remote.get("updated_at") or _now(),
-                    "offline": bool(remote.get("offline")),
-                })
+                tag = str(release.get("tag_name") or "").strip()
+                if not _valid_release_tag(tag):
+                    result.update({
+                        "latest": "", "update_available": None,
+                        "remote_error": "invalid_release_tag",
+                        "source": "release pública sin tag válido",
+                        "updated_at": remote.get("updated_at") or _now(),
+                        "offline": bool(remote.get("offline")),
+                        "untrusted_content": True,
+                    })
+                else:
+                    latest = tag.lstrip("vV")
+                    result.update({
+                        "latest": latest,
+                        "update_available": _version_key(latest) > _version_key(current),
+                        "release_url": str(release.get("html_url") or ""),
+                        "release_name": str(release.get("name") or ""),
+                        "source": "release v" + latest,
+                        "updated_at": remote.get("updated_at") or _now(),
+                        "offline": bool(remote.get("offline")),
+                        "untrusted_content": True,
+                    })
             except GitHubReadError as exc:
                 result.update({"latest": "", "update_available": None, "offline": True, "remote_error": exc.code, "source": "GitHub no disponible; archivos de versión locales"})
         return result
@@ -146,6 +165,7 @@ class RepositoryIntelligence:
             "ok": bool(section), "version": selected_version, "changes": section[:60_000],
             "source": source if section else "GitHub no disponible", "updated_at": _now(),
             "offline": offline, "update_range": update_range,
+            "untrusted_content": bool(section and source.startswith("CHANGELOG.md remoto")),
         }
 
     def activity(self, *, limit=8) -> dict[str, Any]:
@@ -161,7 +181,12 @@ class RepositoryIntelligence:
                     "date": str(author.get("date") or ""),
                     "url": str(item.get("html_url") or ""),
                 })
-            return {"ok": True, "commits": rows, "source": "repositorio público" if remote.get("source") == "github" else "cache consultada", "updated_at": remote.get("updated_at"), "offline": bool(remote.get("offline"))}
+            return {
+                "ok": True, "commits": rows,
+                "source": "repositorio público" if remote.get("source") == "github" else "cache consultada",
+                "updated_at": remote.get("updated_at"), "offline": bool(remote.get("offline")),
+                "untrusted_content": True,
+            }
         except GitHubReadError as exc:
             return {"ok": False, "error": exc.code, "commits": [], "source": "GitHub no disponible", "updated_at": _now(), "offline": True}
 

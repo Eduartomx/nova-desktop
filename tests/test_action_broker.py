@@ -15,18 +15,21 @@ def context(tool="write_file", args=None, **overrides):
     values = {
         "tool": tool, "arguments_sha256": arguments_hash(tool, args), "owner_id": "owner-a",
         "scope": "scope-a", "session_id": "session-a", "task_id": "task-a",
-        "target": "demo.txt", "explicit_intent": True, "observations": {"stable": True},
+        "target": "demo.txt", "explicit_intent": True, "intent_source": "local_user",
+        "intent_sha256": "a" * 64, "observations": {"stable": True},
     }
     values.update(overrides)
     return ActionContext(**values)
 
 
 class ActionBrokerTests(unittest.TestCase):
-    def broker(self, profile="balanced", names=None, audit=None, clock=None):
+    def broker(self, profile="balanced", names=None, audit=None, clock=None, security=None):
+        settings = {"profile": profile, "approval_timeout_seconds": 2}
+        settings.update(security or {})
         kwargs = {"tool_names": names or {"read_file", "clipboard_read", "write_file", "powershell", "browser_press"}, "audit_path": audit}
         if clock is not None:
             kwargs["clock"] = clock
-        return ActionBroker({"security": {"profile": profile, "approval_timeout_seconds": 2}}, **kwargs)
+        return ActionBroker({"security": settings}, **kwargs)
 
     def test_read_only_and_sensitive_read_intent(self):
         broker = self.broker()
@@ -38,6 +41,19 @@ class ActionBrokerTests(unittest.TestCase):
         clip = context("clipboard_read", {}, explicit_intent=False)
         denied = broker.execute("clipboard_read", {}, clip, lambda: self.fail("must not run"))
         self.assertEqual(denied["error"], "explicit_intent_required")
+        forged = context("clipboard_read", {}, intent_source="planner")
+        denied = broker.execute("clipboard_read", {}, forged, lambda: self.fail("must not run"))
+        self.assertEqual(denied["error"], "explicit_intent_required")
+        for profile in ("balanced", "trusted"):
+            allowed = self.broker(profile).execute(
+                "clipboard_read", {}, context("clipboard_read", {}, explicit_intent=True), lambda: {"ok": True},
+            )
+            self.assertTrue(allowed["ok"], profile)
+        safe = self.broker("safe")
+        safe.set_approval_handler(lambda row: safe.approve(row["request_id"]))
+        self.assertTrue(safe.execute(
+            "clipboard_read", {}, context("clipboard_read", {}, explicit_intent=True), lambda: {"ok": True},
+        )["ok"])
 
     def test_allow_once_executes_exactly_once_and_double_approval_fails(self):
         broker = self.broker()
@@ -65,6 +81,11 @@ class ActionBrokerTests(unittest.TestCase):
         self.assertFalse(denied["ok"])
         self.assertEqual(len(prompts), 2)
 
+        other_session = context(args=args, session_id="session-b")
+        denied = broker.execute("write_file", args, other_session, lambda: self.fail("must not run"))
+        self.assertFalse(denied["ok"])
+        self.assertEqual(len(prompts), 3)
+
         high_args = {"key": "Enter"}
         high = context("browser_press", high_args)
         modes = []
@@ -87,14 +108,35 @@ class ActionBrokerTests(unittest.TestCase):
 
         now = [10.0]
         expiring = self.broker(clock=lambda: now[0])
-        pending = expiring.request("write_file", args, context(args=args), timeout=1)
-        now[0] = 12.0
-        self.assertFalse(expiring.approve(pending["request"]["request_id"]))
+        expiring.set_approval_handler(lambda row: (now.__setitem__(0, 12.0), expiring.approve(row["request_id"])))
+        expired = expiring.request("write_file", args, context(args=args), timeout=1)
+        self.assertEqual(expired["authorization_state"], "expired")
 
         cancelling = self.broker()
-        pending = cancelling.request("write_file", args, context(args=args))
+        shown = threading.Event()
+        rows = []
+        cancelling.set_approval_handler(lambda row: (rows.append(row), shown.set()))
+        worker = threading.Thread(target=lambda: cancelling.request("write_file", args, context(args=args)), daemon=True)
+        worker.start()
+        self.assertTrue(shown.wait(1))
         self.assertEqual(cancelling.cancel_all("shutdown", shutdown=True), 1)
-        self.assertFalse(cancelling.approve(pending["request"]["request_id"]))
+        worker.join(1)
+        self.assertFalse(cancelling.approve(rows[0]["request_id"]))
+
+    def test_approval_expires_before_consume_and_double_consume_fails(self):
+        now = [1.0]
+        broker = self.broker(clock=lambda: now[0])
+        broker.set_approval_handler(lambda row: broker.approve(row["request_id"]))
+        args = {"path": "x", "content": "y"}
+        ctx = context(args=args)
+        decision = broker.request("write_file", args, ctx, timeout=2)
+        now[0] = 4.0
+        self.assertEqual(broker.consume(decision["request_id"], ctx)["error"], "authorization_expired")
+
+        now[0] = 10.0
+        decision = broker.request("write_file", args, ctx, timeout=2)
+        self.assertTrue(broker.consume(decision["request_id"], ctx)["ok"])
+        self.assertEqual(broker.consume(decision["request_id"], ctx)["error"], "authorization_already_consumed")
 
     def test_context_changes_reject_owner_scope_task_hash_and_file_toctou(self):
         variants = {
@@ -145,6 +187,70 @@ class ActionBrokerTests(unittest.TestCase):
             self.assertNotIn("content", raw)
             for line in raw.splitlines():
                 self.assertEqual(len(json.loads(line)["arguments_sha256"]), 64)
+
+    def test_audit_rotation_is_bounded_valid_and_secret_free(self):
+        with tempfile.TemporaryDirectory() as td:
+            audit = Path(td) / "action_audit.jsonl"
+            broker = self.broker(
+                audit=audit,
+                security={"action_audit_max_bytes": 4096, "action_audit_rotations": 2},
+            )
+            broker.set_approval_handler(lambda row: broker.approve(row["request_id"]))
+            for index in range(30):
+                args = {"path": f"demo-{index}.txt", "content": "ROTATION-TOP-SECRET"}
+                broker.execute("write_file", args, context(args=args), lambda: {"ok": True})
+            files = sorted(Path(td).glob("action_audit.jsonl*"))
+            self.assertLessEqual(len(files), 3)
+            self.assertLessEqual(sum(path.stat().st_size for path in files), 4096 * 3)
+            for path in files:
+                raw = path.read_text(encoding="utf-8")
+                self.assertNotIn("ROTATION-TOP-SECRET", raw)
+                for line in raw.splitlines():
+                    json.loads(line)
+
+    def test_pruning_preserves_active_and_bounds_terminal_history(self):
+        broker = self.broker(security={"action_history_limit": 16})
+        active_seen = threading.Event()
+        active_rows = []
+        broker.set_approval_handler(lambda row: (active_rows.append(row), active_seen.set()))
+        args = {"path": "active", "content": "x"}
+        worker = threading.Thread(target=lambda: broker.request("write_file", args, context(args=args)), daemon=True)
+        worker.start()
+        self.assertTrue(active_seen.wait(1))
+
+        broker.set_approval_handler(lambda row: broker.deny(row["request_id"]))
+        for index in range(30):
+            row_args = {"path": str(index), "content": "x"}
+            broker.request("write_file", row_args, context(args=row_args))
+        broker.prune()
+        self.assertIn(active_rows[0]["request_id"], {row["request_id"] for row in broker.pending()})
+        self.assertLessEqual(sum(1 for row in broker._pending.values() if row.get("state") != "pending"), 16)
+        broker.cancel_all("test")
+        worker.join(1)
+
+    def test_racing_terminal_decisions_never_execute_twice(self):
+        broker = self.broker()
+        shown = threading.Event()
+        rows = []
+        calls = []
+        broker.set_approval_handler(lambda row: (rows.append(row), shown.set()))
+        args = {"path": "race", "content": "secret"}
+        worker = threading.Thread(
+            target=lambda: broker.execute("write_file", args, context(args=args), lambda: calls.append(1) or {"ok": True}),
+            daemon=True,
+        )
+        worker.start()
+        self.assertTrue(shown.wait(1))
+        request_id = rows[0]["request_id"]
+        racers = [
+            threading.Thread(target=lambda: broker.approve(request_id)),
+            threading.Thread(target=lambda: broker.deny(request_id)),
+            threading.Thread(target=lambda: broker.cancel_all("race")),
+        ]
+        for row in racers: row.start()
+        for row in racers: row.join()
+        worker.join(1)
+        self.assertLessEqual(len(calls), 1)
 
     def test_shutdown_cancellation_releases_waiting_worker(self):
         broker = self.broker()
