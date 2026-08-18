@@ -210,6 +210,25 @@ class ActionTaskEngineTests(unittest.TestCase):
             self.assertEqual(task["status"], "expired")
             self.assertEqual(task["steps"][0]["status"], "expired")
 
+    def test_process_reopen_expires_every_waiting_task_beyond_first_page(self):
+        with tempfile.TemporaryDirectory() as td:
+            memory = MemoryStore(Path(td) / "memory.db")
+            task_ids = []
+            for index in range(135):
+                task_id = memory.create_task(
+                    f"objetivo-{index}",
+                    {"steps": [{"index": 1, "description": "escribe", "success_criteria": "archivo"}]},
+                    status="waiting_for_approval",
+                )
+                memory.upsert_task_step(task_id, 1, "escribe", "archivo", status="waiting_for_approval", attempts=1)
+                task_ids.append(task_id)
+            TaskEngine(_Agent(memory), memory=memory)
+            self.assertEqual(
+                [memory.get_task(task_id)["status"] for task_id in task_ids],
+                ["expired"] * len(task_ids),
+            )
+            self.assertTrue(all(memory.get_task(task_id)["steps"][0]["status"] == "expired" for task_id in task_ids))
+
 
 if __name__ == "__main__":
     unittest.main()

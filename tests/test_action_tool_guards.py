@@ -18,8 +18,8 @@ from assistant.tools_file_safety import install_tools_file_safety
 from assistant.tools_action_guard import install_tools_action_guard
 install_tools_desktop(); install_tools_file_safety(); install_tools_action_guard()
 class Locator:
-    def __init__(self, attrs=None, fail_inspection=False):
-        self.fills=[]; self.keys=[]; self.clicks=0; self.attrs=dict(attrs or {}); self.fail_inspection=fail_inspection
+    def __init__(self, owner, attrs=None, fail_inspection=False):
+        self.owner=owner; self.fills=[]; self.keys=[]; self.clicks=0; self.attrs=dict(attrs or {}); self.fail_inspection=fail_inspection
     def fill(self, value): self.fills.append(value)
     def press(self, key): self.keys.append(key)
     def click(self): self.clicks += 1
@@ -28,19 +28,55 @@ class Locator:
         if self.fail_inspection: raise RuntimeError('inspection failed')
         return self.attrs.get(name,'')
     def evaluate(self, script):
+        assert self.owner.inside_worker, 'Playwright locator accessed outside browser worker'
         if self.fail_inspection: raise RuntimeError('inspection failed')
+        if 'const form=el.form' in script:
+            a=self.attrs
+            return {
+                'tag':a.get('tag','button'), 'id':a.get('id','next'), 'name':a.get('name',''),
+                'role':a.get('role',''), 'aria_label':a.get('aria_label',''), 'type':a.get('type',''),
+                'effective_type':a.get('effective_type',a.get('type','')), 'href':a.get('href',''),
+                'onclick':a.get('onclick',''), 'download':bool(a.get('download',False)),
+                'contenteditable':a.get('contenteditable','false'),
+                'form_associated':bool(a.get('form_associated',False)), 'form_id':a.get('form_id',''),
+                'form_name':a.get('form_name',''), 'form_method':a.get('form_method',''),
+                'form_action':a.get('form_action',''), 'formaction':a.get('formaction',''),
+                'may_submit':bool(a.get('may_submit',False)),
+            }
+        if "tag:String(el.tagName" in script:
+            a=self.attrs
+            return {'tag':a.get('tag','button'),'role':a.get('role',''),'href':a.get('href',''),
+                    'onclick':a.get('onclick',''),'download':bool(a.get('download',False)),
+                    'form_associated':bool(a.get('form_associated',False))}
         if 'return !!el.form' in script: return bool(self.attrs.get('may_submit',False))
         if '!!el.form' in script: return bool(self.attrs.get('form_associated',False))
         if 'String(el.type' in script: return self.attrs.get('effective_type',self.attrs.get('type',''))
         if 'tagName' in script: return self.attrs.get('tag','button')
         return ''
-class Page: url='https://example.test/form'
+class Page:
+    def __init__(self, owner): self.owner=owner
+    @property
+    def url(self):
+        assert self.owner.inside_worker, 'page.url accessed outside browser worker'
+        return self.owner.url
 class Browser:
-    def __init__(self, attrs=None, fail_inspection=False): self._page=Page(); self.locator=Locator(attrs,fail_inspection)
-    def call(self, callback, timeout=None): return callback()
+    def __init__(self, attrs=None, fail_inspection=False):
+        self.url='https://example.test/form'; self.inside_worker=False; self.call_count=0
+        self._page=Page(self); self.locator=Locator(self,attrs,fail_inspection)
+    def call(self, callback, timeout=None):
+        assert not self.inside_worker
+        self.call_count += 1
+        self.inside_worker=True
+        try: return callback()
+        finally: self.inside_worker=False
     @property
     def page(self): return self._page
-    def resolve(self, target): return self.locator
+    def resolve(self, target):
+        assert self.inside_worker
+        return self.locator
+    def resolve_with_selector(self, target):
+        assert self.inside_worker
+        return self.locator, 'css='+str(target)
 def make(root, profile='balanced'):
     cfg={'security':{'profile':profile,'allowed_roots':[str(root)],'restrict_files_to_allowed_roots':True,'backup_overwritten_files':True}}
     return LocalTools(cfg, MemoryStore(root/'memory.db'))
@@ -99,10 +135,71 @@ with tempfile.TemporaryDirectory() as td:
     assert tools.browser_agent.locator.clicks==0
 ''')
 
+    def test_only_proven_passive_link_avoids_high_risk_and_all_access_is_serialized(self):
+        self.run_isolated('''
+with tempfile.TemporaryDirectory() as td:
+    root=Path(td)
+    dangerous=(
+        {'tag':'button','type':'button'}, {'tag':'a','role':'button','href':'https://example.test/next'},
+        {'tag':'input','type':'button'}, {'tag':'a','href':'javascript:send()'},
+        {'tag':'a','href':'https://example.test/next','onclick':'send()'},
+        {'tag':'a','href':'https://example.test/file','download':True},
+        {'tag':'a','href':'https://example.test/next','form_associated':True},
+    )
+    for attrs in dangerous:
+        tools=make(root,profile='trusted'); tools.browser_agent=Browser(attrs)
+        result=tools.execute_tool('browser_click', {'target':'#next'})
+        assert result['error']=='approval_ui_unavailable', (attrs,result)
+        assert tools.browser_agent.locator.clicks==0 and tools.browser_agent.call_count==1
+    tools=make(root,profile='trusted'); tools.browser_agent=Browser({'tag':'a','href':'https://example.test/docs'})
+    try:
+        _=tools.browser_agent.page.url
+        raise AssertionError('page.url was accessible outside worker')
+    except AssertionError as exc:
+        assert 'outside browser worker' in str(exc)
+    result=tools.execute_tool('browser_click', {'target':'#next'})
+    assert result['ok'] and tools.browser_agent.locator.clicks==1, result
+''')
+
+    def test_browser_toctou_changes_invalidate_approval_before_click(self):
+        self.run_isolated('''
+with tempfile.TemporaryDirectory() as td:
+    root=Path(td)
+    mutations=(
+        lambda b:setattr(b,'url','https://other.test/form'),
+        lambda b:b.locator.attrs.__setitem__('href','https://example.test/changed'),
+        lambda b:b.locator.attrs.__setitem__('form_id','form-b'),
+        lambda b:b.locator.attrs.__setitem__('form_action','https://example.test/changed'),
+        lambda b:b.locator.attrs.__setitem__('id','different-control'),
+    )
+    initial={'tag':'button','type':'submit','effective_type':'submit','form_associated':True,
+             'form_id':'form-a','form_method':'post','form_action':'https://example.test/send','may_submit':True}
+    for mutate in mutations:
+        tools=make(root,profile='trusted'); tools.browser_agent=Browser(initial)
+        def approve(row):
+            mutate(tools.browser_agent)
+            assert tools.action_broker.approve(row['request_id'])
+        tools.action_broker.set_approval_handler(approve)
+        result=tools.execute_tool('browser_click', {'target':'#next'})
+        assert result['error']=='authorization_context_changed', result
+        assert tools.browser_agent.locator.clicks==0
+''')
+
+    def test_approved_browser_callback_executes_once(self):
+        self.run_isolated('''
+with tempfile.TemporaryDirectory() as td:
+    tools=make(Path(td),profile='trusted')
+    tools.browser_agent=Browser({'tag':'button','type':'button'})
+    tools.action_broker.set_approval_handler(lambda row:tools.action_broker.approve(row['request_id']))
+    result=tools.execute_tool('browser_click', {'target':'#next'})
+    assert result['ok'] and tools.browser_agent.locator.clicks==1, result
+    assert tools.browser_agent.call_count==3
+''')
+
     def test_task_grant_does_not_cover_later_submit(self):
         self.run_isolated('''
 with tempfile.TemporaryDirectory() as td:
-    tools=make(Path(td),profile='balanced'); tools.action_task_id='task-a'; tools.browser_agent=Browser({'tag':'a','href':'/docs','form_associated':False,'may_submit':False}); prompts=[]
+    tools=make(Path(td),profile='balanced'); tools.action_task_id='task-a'; tools.browser_agent=Browser({'tag':'a','href':'https://example.test/docs','form_associated':False,'may_submit':False}); prompts=[]
     def approve(row):
         prompts.append(row)
         tools.action_broker.approve(row['request_id'],mode='task' if len(prompts)==1 else 'once')

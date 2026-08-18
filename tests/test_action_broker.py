@@ -16,7 +16,8 @@ def context(tool="write_file", args=None, **overrides):
         "tool": tool, "arguments_sha256": arguments_hash(tool, args), "owner_id": "owner-a",
         "scope": "scope-a", "session_id": "session-a", "task_id": "task-a",
         "target": "demo.txt", "explicit_intent": True, "intent_source": "local_user",
-        "intent_sha256": "a" * 64, "observations": {"stable": True},
+        "intent_sha256": "a" * 64, "intent_session_id": "session-a",
+        "intent_request_id": "b" * 32, "observations": {"stable": True},
     }
     values.update(overrides)
     return ActionContext(**values)
@@ -137,6 +138,90 @@ class ActionBrokerTests(unittest.TestCase):
         decision = broker.request("write_file", args, ctx, timeout=2)
         self.assertTrue(broker.consume(decision["request_id"], ctx)["ok"])
         self.assertEqual(broker.consume(decision["request_id"], ctx)["error"], "authorization_already_consumed")
+
+    def test_abandoned_pending_and_approved_requests_expire_on_sweep(self):
+        now = [100.0]
+        broker = self.broker(clock=lambda: now[0], security={"action_active_limit": 1})
+        args = {"path": "pending", "content": "x"}
+        shown = threading.Event()
+        rows = []
+        broker.set_approval_handler(lambda row: (rows.append(row), shown.set()))
+        results = []
+        worker = threading.Thread(target=lambda: results.append(broker.request("write_file", args, context(args=args), timeout=2)), daemon=True)
+        worker.start()
+        self.assertTrue(shown.wait(1))
+        now[0] = 103.0
+        self.assertEqual(broker.pending(), [])
+        worker.join(1)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(results[0]["authorization_state"], "expired")
+
+        now[0] = 200.0
+        broker.set_approval_handler(lambda row: broker.approve(row["request_id"]))
+        decision = broker.request("write_file", args, context(args=args), timeout=2)
+        self.assertEqual(broker.request_state(decision["request_id"]), "approved")
+        now[0] = 203.0
+        self.assertEqual(broker.request_state(decision["request_id"]), "expired")
+        self.assertEqual(broker.consume(decision["request_id"], context(args=args))["error"], "authorization_expired")
+
+    def test_expired_task_approval_never_creates_a_grant(self):
+        now = [10.0]
+        broker = self.broker(clock=lambda: now[0])
+        prompts = []
+        broker.set_approval_handler(lambda row: (prompts.append(row), broker.approve(row["request_id"], mode="task")))
+        args = {"path": "grant", "content": "x"}
+        ctx = context(args=args)
+        decision = broker.request("write_file", args, ctx, timeout=2)
+        now[0] = 13.0
+        self.assertEqual(broker.consume(decision["request_id"], ctx)["error"], "authorization_expired")
+        self.assertEqual(broker._task_grants, set())
+        now[0] = 20.0
+        broker.set_approval_handler(lambda row: (prompts.append(row), broker.deny(row["request_id"])))
+        denied = broker.request("write_file", args, ctx, timeout=2)
+        self.assertEqual(denied["authorization_state"], "denied")
+        self.assertEqual(len(prompts), 2)
+
+    def test_capacity_check_and_insert_are_atomic_and_expiry_recovers_capacity(self):
+        broker = self.broker(security={"action_active_limit": 2, "approval_timeout_seconds": 5})
+        shown = threading.Event()
+        rows = []
+        rows_lock = threading.Lock()
+        maximum = [0]
+        def handler(row):
+            with rows_lock:
+                rows.append(row)
+                maximum[0] = max(maximum[0], len(broker.pending()))
+                if len(rows) >= 2:
+                    shown.set()
+        broker.set_approval_handler(handler)
+        results = []
+        def request(index):
+            args = {"path": f"row-{index}", "content": "x"}
+            results.append(broker.request("write_file", args, context(args=args), timeout=5))
+        workers = [threading.Thread(target=request, args=(index,), daemon=True) for index in range(8)]
+        for worker in workers:
+            worker.start()
+        self.assertTrue(shown.wait(2))
+        self.assertEqual(len(broker.pending()), 2)
+        broker.cancel_all("capacity_test")
+        for worker in workers:
+            worker.join(2)
+        self.assertEqual(len(rows), 2)
+        self.assertLessEqual(maximum[0], 2)
+        self.assertEqual(sum(row.get("error") == "authorization_capacity_exceeded" for row in results), 6)
+
+        broker = self.broker(security={"action_active_limit": 1})
+        first_shown = threading.Event()
+        broker.set_approval_handler(lambda _row: first_shown.set())
+        args = {"path": "first", "content": "x"}
+        worker = threading.Thread(target=lambda: broker.request("write_file", args, context(args=args), timeout=1), daemon=True)
+        worker.start()
+        self.assertTrue(first_shown.wait(1))
+        broker.cancel_all("release_capacity")
+        worker.join(1)
+        broker.set_approval_handler(lambda row: broker.deny(row["request_id"]))
+        args2 = {"path": "second", "content": "x"}
+        self.assertEqual(broker.request("write_file", args2, context(args=args2))["authorization_state"], "denied")
 
     def test_context_changes_reject_owner_scope_task_hash_and_file_toctou(self):
         variants = {

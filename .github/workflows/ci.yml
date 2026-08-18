@@ -30,6 +30,8 @@ jobs:
           python -m unittest -v \
             tests.test_action_broker \
             tests.test_action_policy \
+            tests.test_action_intent_isolation \
+            tests.test_action_app_safety \
             tests.test_action_task_engine \
             tests.test_ui_action_approval \
             tests.test_action_tool_guards \
@@ -129,7 +131,7 @@ jobs:
       - name: Safe Actions and Repository Intelligence focal gate
         env:
           PYTHONPATH: nova
-        run: python -m unittest -v tests.test_action_broker tests.test_action_policy tests.test_action_task_engine tests.test_ui_action_approval tests.test_action_tool_guards tests.test_repository_intelligence tests.test_repository_routing tests.test_v010_windows_harness
+        run: python -m unittest -v tests.test_action_broker tests.test_action_policy tests.test_action_intent_isolation tests.test_action_app_safety tests.test_action_task_engine tests.test_ui_action_approval tests.test_action_tool_guards tests.test_repository_intelligence tests.test_repository_routing tests.test_v010_windows_harness
       - name: Validated recovery handoff focal gate
         env:
           PYTHONPATH: nova

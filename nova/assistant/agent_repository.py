@@ -5,6 +5,8 @@ from __future__ import annotations
 import re
 import unicodedata
 
+from .action_context import bind_human_intent
+
 
 def _normal(text: str) -> str:
     raw = unicodedata.normalize("NFKD", str(text or "").casefold())
@@ -74,17 +76,15 @@ def install_agent_repository():
         tools = getattr(self, "tools", None)
         intelligence = getattr(tools, "repository_intelligence", None)
         if route and intelligence is not None:
-            previous_intent = getattr(tools, "action_human_intent", None)
-            if hasattr(tools, "action_human_intent"):
-                tools.action_human_intent = None
             try:
                 self._last_fast_route = "version" if route == "version" else ("repository_changes" if route == "changes" else "repository_activity")
-                if route == "version":
-                    answer = _format_version(intelligence.version_status(refresh=True))
-                elif route == "changes":
-                    answer = _format_changes(intelligence.whats_new(refresh=True))
-                else:
-                    answer = _format_activity(intelligence.activity(limit=8))
+                with bind_human_intent(None):
+                    if route == "version":
+                        answer = _format_version(intelligence.version_status(refresh=True))
+                    elif route == "changes":
+                        answer = _format_changes(intelligence.whats_new(refresh=True))
+                    else:
+                        answer = _format_activity(intelligence.activity(limit=8))
                 try:
                     self.memory.add_message("user", str(user_text or ""))
                     self.memory.add_message("assistant", answer)
@@ -94,9 +94,6 @@ def install_agent_repository():
                 return answer
             except Exception:
                 pass
-            finally:
-                if hasattr(tools, "action_human_intent"):
-                    tools.action_human_intent = previous_intent
         return original_ask(self, user_text)
 
     LocalAgent.ask = ask

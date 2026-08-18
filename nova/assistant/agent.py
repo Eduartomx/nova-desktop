@@ -17,7 +17,7 @@ import requests
 
 from .memory import MemoryStore
 from .llm_performance import get_llm_performance
-from .action_context import HumanIntent, human_intent_from_text
+from .action_context import HumanIntent, bind_human_intent, human_intent_from_text
 from . import tools as tools_mod
 
 LocalTools = tools_mod.LocalTools
@@ -267,18 +267,19 @@ Sé breve y práctico salvo que el usuario pida detalle.
         return final_text
 
     def _ask_with_intent(self, text: str, intent: HumanIntent | None, *, record_conversation: bool) -> str:
-        previous = getattr(self.tools, "action_human_intent", None)
-        if hasattr(self.tools, "action_human_intent"):
-            self.tools.action_human_intent = intent if isinstance(intent, HumanIntent) and intent.source == "local_user" else None
-        try:
+        session_id = str(getattr(self.tools, "action_session_id", "") or "")
+        scoped = intent if isinstance(intent, HumanIntent) and intent.source == "local_user" and intent.session_id == session_id else None
+        with bind_human_intent(scoped):
             return self._ask_core(text, record_conversation=record_conversation)
-        finally:
-            if hasattr(self.tools, "action_human_intent"):
-                self.tools.action_human_intent = previous
 
     def ask(self, user_text: str) -> str:
         text = str(user_text or "")
-        return self._ask_with_intent(text, human_intent_from_text(text, source="local_user"), record_conversation=True)
+        intent = human_intent_from_text(
+            text,
+            source="local_user",
+            session_id=str(getattr(self.tools, "action_session_id", "") or ""),
+        )
+        return self._ask_with_intent(text, intent, record_conversation=True)
 
     def ask_internal(self, instruction: str, *, human_intent: HumanIntent | None = None) -> str:
         """Execute Planner/Executor text without deriving new human intent from it."""

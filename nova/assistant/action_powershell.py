@@ -8,7 +8,11 @@ approval request or subprocess can be created.
 """
 
 from dataclasses import dataclass
+import ctypes
+import os
+from pathlib import Path
 import re
+import sys
 
 
 @dataclass(frozen=True)
@@ -78,3 +82,41 @@ def classify_powershell(command: str) -> PowerShellAssessment:
         return _reject("Clase CIM fuera de la lista positiva.")
 
     return _reject("Cmdlet fuera de la lista positiva de Nova v0.10.0.")
+
+
+def trusted_windows_directory() -> Path | None:
+    if os.name != "nt":
+        return None
+    try:
+        buffer = ctypes.create_unicode_buffer(32768)
+        length = int(ctypes.windll.kernel32.GetWindowsDirectoryW(buffer, len(buffer)))
+        if length <= 0 or length >= len(buffer):
+            return None
+        root = Path(buffer.value).resolve(strict=True)
+        return root if root.is_dir() else None
+    except Exception:
+        return None
+
+
+def resolve_trusted_powershell(*, windows_directory: Path | None = None) -> Path | None:
+    """Resolve Windows PowerShell without consulting PATH or the cwd."""
+    root = Path(windows_directory) if windows_directory is not None else trusted_windows_directory()
+    if root is None:
+        return None
+    try:
+        root = root.resolve(strict=True)
+    except OSError:
+        return None
+    candidates = []
+    if sys.maxsize <= 2**32 and os.environ.get("PROCESSOR_ARCHITEW6432"):
+        candidates.append(root / "Sysnative" / "WindowsPowerShell" / "v1.0" / "powershell.exe")
+    candidates.append(root / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe")
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve(strict=True)
+            resolved.relative_to(root)
+            if resolved.name.casefold() == "powershell.exe" and resolved.is_file():
+                return resolved
+        except (OSError, ValueError):
+            continue
+    return None

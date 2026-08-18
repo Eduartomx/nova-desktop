@@ -5,21 +5,23 @@
 - Añade un Action Broker local como autoridad única antes de ejecutar herramientas: cada solicitud queda ligada a herramienta, hash SHA-256 de argumentos, propietario, scope, sesión, tarea y snapshot revalidable.
 - Clasifica todas las herramientas en lectura, lectura sensible, reversible, mutación, alto riesgo o prohibida; las herramientas desconocidas fallan cerradas.
 - Incorpora perfiles `safe`, `balanced` y `trusted`; `balanced` es el valor inicial para instalaciones nuevas y la migración conserva o endurece las confirmaciones antiguas.
-- Las acciones de alto riesgo solo aceptan permiso de una vez. Los grants de tarea no cruzan tarea, owner, scope ni herramienta.
+- Las acciones de alto riesgo solo aceptan permiso de una vez. Los grants de tarea no cruzan tarea, owner, scope, sesión ni herramienta.
 - La tarjeta de aprobación vive exclusivamente en la UI local de Tk. Cerrar la tarjeta equivale a denegar; timeout, cancelación, shutdown o update liberan la espera.
 - `browser_fill(..., submit=true)` pide permiso antes de rellenar. Enter, UI Automation y mouse no pueden usarse como bypass del envío sensible.
 - `write_file` solicita permiso antes de crear carpetas, copiar backup o escribir, y conserva los backups previos a sobrescritura.
-- PowerShell genérico queda reducido a una lista positiva estrecha de consultas simples: aliases, composición dinámica, shells anidados, comandos codificados, cadenas, pipelines y sintaxis no comprendida se rechazan antes de la UI o subprocess.
-- La cobertura de políticas es explícita y auditable; una herramienta nueva sin clasificación falla en CI y se rechaza en runtime. Los clicks web usan inspección DOM y escalan a alto riesgo ante submit, `formaction` o ambigüedad.
-- Grants, expiración, consumo único, poda y reanudación quedan ligados también a sesión. El audit JSONL rota con límites de tamaño/archivos y nunca guarda comandos, texto, secretos ni argumentos completos.
-- La intención para lecturas sensibles sólo puede derivarse de la orden humana local original; Planner, memoria, skills, web, archivos y contenido remoto no pueden fabricarla.
-- Task Engine reconoce `waiting_for_approval`, `approved`, `denied` y `expired`; la espera humana no consume timeout ni provoca retry/replan y las aprobaciones se consumen exactamente una vez.
+- PowerShell genérico queda reducido a una lista positiva estrecha de consultas simples y resuelve el binario desde `GetWindowsDirectoryW` + `System32`/`Sysnative`, nunca desde `PATH` o el cwd; aliases, composición dinámica, shells anidados, comandos codificados, cadenas, pipelines y sintaxis no comprendida se rechazan antes de la UI o subprocess.
+- `open_app` acepta únicamente aliases registrados resueltos a ubicaciones confiables de Windows con `shell=False`; documentos locales permitidos usan `open_document`, mientras binarios, scripts, UNC y esquemas quedan prohibidos.
+- La cobertura de políticas es explícita y auditable; una herramienta nueva sin clasificación falla en CI y se rechaza en runtime. Los clicks web capturan URL/origen, selector, identidad del elemento y formulario dentro del worker Playwright; sólo un enlace HTTP(S) pasivo demostrado evita alto riesgo y toda ambigüedad falla cerrada.
+- Grants, expiración, consumo único, poda y reanudación quedan ligados también a sesión. Barridos thread-safe expiran tanto solicitudes pendientes como aprobadas sin consumir y recuperan capacidad; la admisión e inserción respetan atómicamente el límite activo. El audit JSONL rota con límites de tamaño/archivos y nunca guarda comandos, texto, secretos ni argumentos completos.
+- La intención para lecturas sensibles sólo puede derivarse de una orden humana local positiva y exacta; negaciones, citas, ejemplos, Planner, memoria, skills, web, archivos y contenido remoto no pueden fabricarla. La capacidad inmutable se liga a solicitud/sesión mediante hash y se propaga con aislamiento por contexto, sin estado compartido entre conversaciones concurrentes.
+- Task Engine reconoce `waiting_for_approval`, `approved`, `denied` y `expired`; la espera humana no consume timeout ni provoca retry/replan y las aprobaciones se consumen exactamente una vez. Al reabrir, pagina y expira todas las tareas irrecuperables, incluso más allá de las primeras 50.
 - Añade botón visible y acción de bandeja para detener automatización; el hotkey de emergencia es configurable pero queda vacío por defecto.
 - Añade Repository Intelligence para responder versión, novedades, disponibilidad de actualización, actividad y archivos públicos del repositorio propio configurado.
 - El cliente GitHub read-only usa exclusivamente `api.github.com`, `urllib`, timeout, ETag, límites de tamaño y cache pública atómica; no usa `gh`, tokens, cookies ni autenticación.
 - Versiones y changelog funcionan offline con archivos locales, `update_last.json` y cache. Las respuestas siempre indican la evidencia utilizada.
 - Repositorio, releases, commits, issues y PR se tratan como datos externos no confiables y nunca pueden autorizar herramientas ni ejecutar instrucciones encontradas.
 - Añade routing determinista anterior al LLM para consultas de versión, changelog, actualización y estado del repositorio.
+- Endurece el harness de Windows 11 con build mínimo 22000, copia descartable aislada de Nova, checkpoints/precondiciones verificables, clasificación de procesos por fixture/ascendencia/rol/`owner.json`, duración y códigos de suites, detección de huérfanos y evidencia JSON/ZIP sanitizada.
 - Minecraft Agent y Hexabot permanecen explícitamente fuera de alcance de v0.10.0.
 
 ## v0.9.9 — Resident Mode & Runtime Lifecycle

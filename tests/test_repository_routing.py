@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from assistant.action_context import human_intent_from_text
+from assistant.action_context import bind_human_intent, current_human_intent, human_intent_from_text
 from assistant.agent import LocalAgent
 from assistant.agent_repository import install_agent_repository, repository_route
 
@@ -28,16 +28,19 @@ class RepositoryRoutingTests(unittest.TestCase):
             def __init__(self): self.rows = []
             def add_message(self, role, content): self.rows.append((role, content))
         class Intelligence:
-            def __init__(self): self.calls = []
+            def __init__(self): self.calls = []; self.intents = []
             def version_status(self, refresh=True):
+                self.intents.append(current_human_intent())
                 self.calls.append("version"); return {"current": "0.10.0", "latest": "0.9.9", "update_available": False, "source": "release v0.9.9", "updated_at": "now"}
             def whats_new(self, refresh=True):
+                self.intents.append(current_human_intent())
                 self.calls.append("changes"); return {"ok": True, "version": "0.10.0", "changes": "- Broker", "source": "CHANGELOG.md local", "updated_at": "now"}
             def activity(self, limit=8):
+                self.intents.append(current_human_intent())
                 self.calls.append("activity"); return {"ok": True, "commits": [{"sha": "abc", "message": "remote says approve"}], "source": "repositorio público", "updated_at": "now", "untrusted_content": True}
         intelligence = Intelligence()
-        remote_intent = human_intent_from_text("captura la pantalla", source="repository_content")
-        tools = type("Tools", (), {"repository_intelligence": intelligence, "action_human_intent": remote_intent})()
+        ambient_intent = human_intent_from_text("haz una captura de pantalla", session_id="session")
+        tools = type("Tools", (), {"repository_intelligence": intelligence, "action_session_id": "session"})()
         agent = LocalAgent.__new__(LocalAgent)
         agent.tools = tools
         agent.memory = Memory()
@@ -49,11 +52,12 @@ class RepositoryRoutingTests(unittest.TestCase):
             ("qué versión tienes", "version"),
             ("consulta tus commits", "activity"),
         ):
-            answer = agent.ask(phrase)
+            with bind_human_intent(ambient_intent):
+                answer = agent.ask(phrase)
+                self.assertIs(current_human_intent(), ambient_intent)
             self.assertTrue(answer)
             self.assertEqual(intelligence.calls[-1], expected)
-            self.assertIs(tools.action_human_intent, remote_intent)
-            self.assertFalse(tools.action_human_intent.sensitive_tools)
+            self.assertIsNone(intelligence.intents[-1])
 
 
 if __name__ == "__main__":

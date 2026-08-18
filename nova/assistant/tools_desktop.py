@@ -8,12 +8,13 @@ dedicado porque su API sync no debe reutilizar objetos desde hilos distintos.
 """
 
 import atexit
+import hashlib
 import queue
 import re
 import threading
 from pathlib import Path
 from typing import Any, Callable
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, urlsplit
 
 
 def _fn(name: str, description: str, properties=None, required=None) -> dict[str, Any]:
@@ -167,7 +168,7 @@ class _BrowserWorker:
         self._ensure_browser()
         return self._page
 
-    def resolve(self, target: str):
+    def resolve_with_selector(self, target: str):
         page = self.page
         raw = str(target or "").strip()
         match = re.fullmatch(r"(?:ref\s*[=:]?\s*|#)?(\d+)", raw, flags=re.I)
@@ -175,24 +176,29 @@ class _BrowserWorker:
             selector = self._refs.get(int(match.group(1)))
             if not selector:
                 raise ValueError(f"Referencia de navegador no vigente: {raw}")
-            return page.locator(selector).first
+            return page.locator(selector).first, selector
         if raw.startswith(("css=", "xpath=", "text=", "role=")):
-            return page.locator(raw).first
+            return page.locator(raw).first, raw
         # Intenta etiqueta/nombre accesible y luego texto.
         for role in ("button", "link", "textbox", "checkbox", "radio", "combobox", "menuitem", "tab"):
             try:
                 loc = page.get_by_role(role, name=raw, exact=False)
                 if loc.count() > 0:
-                    return loc.first
+                    digest = hashlib.sha256(raw.encode("utf-8", errors="surrogatepass")).hexdigest()
+                    return loc.first, f"role={role};name_sha256={digest}"
             except Exception:
                 pass
         try:
             loc = page.get_by_text(raw, exact=False)
             if loc.count() > 0:
-                return loc.first
+                digest = hashlib.sha256(raw.encode("utf-8", errors="surrogatepass")).hexdigest()
+                return loc.first, f"text_sha256={digest}"
         except Exception:
             pass
-        return page.locator(raw).first
+        return page.locator(raw).first, raw
+
+    def resolve(self, target: str):
+        return self.resolve_with_selector(target)[0]
 
     def inspect(self):
         page = self.page
@@ -309,15 +315,23 @@ def install_tools_desktop():
                     label = raw
                 if not getattr(self, "_action_broker_executing", False):
                     try:
-                        tag = str(loc.evaluate("el=>el.tagName.toLowerCase()") or "").casefold()
-                        typ = str(loc.evaluate("el=>String(el.type||'').toLowerCase()") or "").casefold()
-                        associated = bool(loc.evaluate("el=>!!el.form"))
-                        formaction = str(loc.get_attribute("formaction") or "")
-                        submits = bool(formaction) or typ in {"submit", "image"} or (tag == "button" and associated and typ in {"", "submit"})
+                        observed = loc.evaluate("""el=>({
+                            tag:String(el.tagName||'').toLowerCase(), role:String(el.getAttribute('role')||'').toLowerCase(),
+                            href:String(el.href||el.getAttribute('href')||''), onclick:String(el.getAttribute('onclick')||''),
+                            download:el.hasAttribute('download'), form_associated:!!el.form
+                        })""")
+                        href = str(observed.get("href") or "")
+                        passive = bool(
+                            str(observed.get("tag") or "") == "a"
+                            and str(observed.get("role") or "") != "button"
+                            and urlsplit(href).scheme.casefold() in {"http", "https"}
+                            and not observed.get("onclick") and not observed.get("download")
+                            and not observed.get("form_associated")
+                        )
                     except Exception:
                         return {"ok": False, "error": "confirmation_required", "detail": "No fue posible clasificar el control web de forma segura."}
-                    if submits or (self.config.get("security", {}).get("confirm_browser_sensitive_clicks", True) and _SENSITIVE_BROWSER.search(label)):
-                        return {"ok": False, "error": "confirmation_required", "detail": "El control puede producir un envío o efecto externo."}
+                    if not passive:
+                        return {"ok": False, "error": "confirmation_required", "detail": "El control no es un enlace HTTP(S) pasivo demostrado."}
                 loc.click()
                 return {"ok": True, "clicked": label or raw, "url": page.url}
             return self.browser_agent.call(op)

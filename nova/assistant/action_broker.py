@@ -14,6 +14,7 @@ import time
 import uuid
 from typing import Any, Callable
 
+from .action_apps import classify_application, classify_document
 from .action_context import ActionContext
 from .action_powershell import classify_powershell
 
@@ -48,7 +49,7 @@ _READ_ONLY = {
 }
 _SENSITIVE_READ = {"clipboard_read", "screenshot", "vision_describe_screen", "expert_import_chatgpt_response"}
 _REVERSIBLE = {
-    "open_app", "open_url", "browser_open", "browser_search", "browser_back", "browser_reload",
+    "open_app", "open_document", "open_url", "browser_open", "browser_search", "browser_back", "browser_reload",
     "window_activate", "window_move", "mouse_move", "workspace_open", "workspace_set_active",
     "workspace_index", "remember", "continuity_checkpoint", "anomaly_acknowledge", "confidence_assess",
 }
@@ -100,15 +101,13 @@ def _browser_click_policy(context: ActionContext | None) -> ActionPolicy:
     control = observations.get("browser_control") if isinstance(observations.get("browser_control"), dict) else {}
     if inspection != "ok" or not control:
         return ActionPolicy("high_risk", "high", "El control web no pudo inspeccionarse de forma concluyente; permiso de una sola vez.")
-    kind = str(control.get("effective_type") or control.get("type") or "").casefold()
     tag = str(control.get("tag") or "").casefold()
-    sensitive = " ".join(str(control.get(key) or "") for key in ("id", "name", "role", "aria-label", "formaction"))
-    submits = bool(control.get("may_submit")) or kind in {"submit", "image"} or bool(control.get("formaction"))
-    if tag == "button" and bool(control.get("form_associated")) and kind in {"", "submit"}:
-        submits = True
-    if submits or _SENSITIVE_TARGET.search(sensitive):
-        return ActionPolicy("high_risk", "high", "El control puede enviar un formulario o producir un efecto externo; permiso de una sola vez.")
-    return POLICY_REGISTRY["browser_click"]
+    if tag == "a" and control.get("passive_link") is True:
+        return POLICY_REGISTRY["browser_click"]
+    return ActionPolicy(
+        "high_risk", "high",
+        "El control no es un enlace HTTP(S) pasivo demostrado; requiere permiso de una sola vez.",
+    )
 
 
 def policy_for(
@@ -129,6 +128,31 @@ def policy_for(
         if not assessment.allowed:
             return ActionPolicy("forbidden", "critical", assessment.reason)
         return ActionPolicy("high_risk", "high", assessment.reason)
+    if name == "open_app":
+        target = classify_application(str(args.get("app") or ""))
+        if not target.allowed:
+            return ActionPolicy("forbidden", "critical", target.reason)
+        if isinstance(context, ActionContext):
+            observed = context.observations.get("application")
+            file_state = observed.get("file") if isinstance(observed, dict) else None
+            if (
+                not isinstance(observed, dict) or observed.get("allowed") is not True
+                or not isinstance(file_state, dict) or file_state.get("exists") is not True
+                or file_state.get("kind") != "file"
+            ):
+                return ActionPolicy("forbidden", "critical", "Aplicación registrada no verificable en una ubicación confiable.")
+    if name == "open_document":
+        target = classify_document(str(args.get("path") or ""))
+        if not target.allowed:
+            return ActionPolicy("forbidden", "critical", target.reason)
+        if isinstance(context, ActionContext):
+            file_state = context.observations.get("file")
+            if (
+                "file_error" in context.observations
+                or not isinstance(file_state, dict) or file_state.get("exists") is not True
+                or file_state.get("kind") != "file"
+            ):
+                return ActionPolicy("forbidden", "critical", "Documento fuera de scope, ausente o no verificable.")
     if name == "browser_fill" and bool(args.get("submit")):
         return ActionPolicy("high_risk", "high", "Rellenar y enviar un formulario requiere permiso de una sola vez.")
     if name == "browser_click":
@@ -166,7 +190,7 @@ class ActionBroker:
         self.total_wait_seconds = 0.0
         security = self.config.get("security", {}) if isinstance(self.config, dict) else {}
         self._history_limit = max(16, min(int(security.get("action_history_limit", 256) or 256), 2048))
-        self._active_limit = max(4, min(int(security.get("action_active_limit", 32) or 32), 256))
+        self._active_limit = max(1, min(int(security.get("action_active_limit", 32) or 32), 256))
         self._audit_max_bytes = max(4096, min(int(security.get("action_audit_max_bytes", 262144) or 262144), 8 * 1024 * 1024))
         self._audit_rotations = max(0, min(int(security.get("action_audit_rotations", 2) or 2), 5))
 
@@ -266,8 +290,22 @@ class ActionBroker:
             self._pending.pop(str(row.get("request_id") or ""), None)
         return remove
 
+    def _expire_locked(self, detail: str = "sweep") -> int:
+        now = self._clock()
+        expired = 0
+        for row in list(self._pending.values()):
+            if (
+                row.get("state") in {"pending", "approved"}
+                and int(row.get("executions") or 0) == 0
+                and now >= float(row.get("expires_at") or 0)
+            ):
+                self._mark_locked(row, "expired", detail=detail)
+                expired += 1
+        return expired
+
     def prune(self) -> int:
         with self._lock:
+            self._expire_locked("prune_sweep")
             return self._prune_locked()
 
     def _mark_locked(self, request: dict[str, Any], state: str, *, detail: str = "") -> None:
@@ -305,13 +343,33 @@ class ActionBroker:
             context.explicit_intent
             and context.intent_source == "local_user"
             and len(context.intent_sha256) == 64
+            and context.intent_session_id == context.session_id
+            and bool(re.fullmatch(r"[0-9a-f]{32}", context.intent_request_id))
         )
         if policy.effect == "sensitive_read" and not has_local_human_intent:
             return {"ok": False, "error": "explicit_intent_required", "authorization_state": "denied"}
+        with self._lock:
+            self._expire_locked("request_entry_sweep")
         if policy.effect == "read_only" or not self._requires_approval(policy):
             return {"ok": True, "authorization_state": "approved", "automatic": True, "policy": policy}
 
+        wait_seconds = float(timeout if timeout is not None else self.config.get("security", {}).get("approval_timeout_seconds", 120) or 120)
+        wait_seconds = max(1.0, min(wait_seconds, 900.0))
+        event = threading.Event()
+        created = self._clock()
+        request = {
+            "request_id": uuid.uuid4().hex, "tool": str(tool), "effect": policy.effect, "risk": policy.risk,
+            "target": context.target, "reason": policy.reason, "task_id": context.task_id or None,
+            "owner_id": context.owner_id, "scope": context.scope, "session_id": context.session_id,
+            "arguments_sha256": context.arguments_sha256, "context_sha256": context.digest,
+            "created_at": _now_iso(), "expires_at": created + wait_seconds, "state": "pending",
+            "allow_task_grant": bool(policy.allow_task_grant and policy.effect != "high_risk"),
+            "executions": 0, "event": event, "policy": policy,
+        }
         with self._lock:
+            self._expire_locked("request_create_sweep")
+            if self._shutting_down:
+                return {"ok": False, "error": "authorization_cancelled", "authorization_state": "cancelled"}
             for existing in self._pending.values():
                 if (
                     existing.get("state") == "approved"
@@ -343,23 +401,6 @@ class ActionBroker:
             active = sum(1 for row in self._pending.values() if row.get("state") in {"pending", "approved"})
             if active >= self._active_limit:
                 return {"ok": False, "error": "authorization_capacity_exceeded", "authorization_state": "denied"}
-
-        wait_seconds = float(timeout if timeout is not None else self.config.get("security", {}).get("approval_timeout_seconds", 120) or 120)
-        wait_seconds = max(1.0, min(wait_seconds, 900.0))
-        event = threading.Event()
-        created = self._clock()
-        request = {
-            "request_id": uuid.uuid4().hex, "tool": str(tool), "effect": policy.effect, "risk": policy.risk,
-            "target": context.target, "reason": policy.reason, "task_id": context.task_id or None,
-            "owner_id": context.owner_id, "scope": context.scope, "session_id": context.session_id,
-            "arguments_sha256": context.arguments_sha256, "context_sha256": context.digest,
-            "created_at": _now_iso(), "expires_at": created + wait_seconds, "state": "pending",
-            "allow_task_grant": bool(policy.allow_task_grant and policy.effect != "high_risk"),
-            "executions": 0, "event": event, "policy": policy,
-        }
-        with self._lock:
-            if self._shutting_down:
-                return {"ok": False, "error": "authorization_cancelled", "authorization_state": "cancelled"}
             self._pending[request["request_id"]] = request
             self._audit("pending", request)
             self._emit_state_locked("pending", request)
@@ -373,8 +414,9 @@ class ActionBroker:
         waited = max(0.0, self._clock() - wait_started)
         with self._lock:
             self.total_wait_seconds += waited
+            self._expire_locked("wait_complete_sweep")
             if request["state"] == "pending":
-                self._mark_locked(request, "expired", detail="timeout")
+                self._mark_locked(request, "expired", detail="wait_timeout")
         if request["state"] != "approved":
             return {
                 "ok": False,
@@ -387,10 +429,8 @@ class ActionBroker:
     def approve(self, request_id: str, *, mode: str = "once") -> bool:
         with self._lock:
             request = self._pending.get(str(request_id))
+            self._expire_locked("approval_sweep")
             if not request or request.get("state") != "pending" or self._shutting_down:
-                return False
-            if self._clock() >= float(request.get("expires_at") or 0):
-                self._mark_locked(request, "expired", detail="approval_after_timeout")
                 return False
             if mode == "task":
                 if not request.get("allow_task_grant") or not request.get("task_id"):
@@ -405,6 +445,7 @@ class ActionBroker:
     def deny(self, request_id: str, *, reason: str = "user") -> bool:
         with self._lock:
             request = self._pending.get(str(request_id))
+            self._expire_locked("denial_sweep")
             if not request or request.get("state") != "pending":
                 return False
             self._mark_locked(request, "denied", detail=reason)
@@ -413,6 +454,7 @@ class ActionBroker:
     def cancel_all(self, reason: str = "cancelled", *, shutdown: bool = False) -> int:
         count = 0
         with self._lock:
+            self._expire_locked("cancel_sweep")
             self._shutting_down = self._shutting_down or bool(shutdown)
             for request in list(self._pending.values()):
                 if request.get("state") in {"pending", "approved"} and int(request.get("executions") or 0) == 0:
@@ -424,13 +466,13 @@ class ActionBroker:
     def consume(self, request_id: str, current: ActionContext) -> dict[str, Any]:
         with self._lock:
             request = self._pending.get(str(request_id))
+            self._expire_locked("consume_sweep")
+            if request and request.get("state") == "expired":
+                return {"ok": False, "error": "authorization_expired"}
             if request and request.get("state") == "executed":
                 return {"ok": False, "error": "authorization_already_consumed"}
             if not request or request.get("state") != "approved":
                 return {"ok": False, "error": "authorization_not_approved"}
-            if self._clock() >= float(request.get("expires_at") or 0):
-                self._mark_locked(request, "expired", detail="consume_after_timeout")
-                return {"ok": False, "error": "authorization_expired"}
             checks = {
                 "arguments_sha256": current.arguments_sha256,
                 "context_sha256": current.digest,
@@ -480,7 +522,11 @@ class ActionBroker:
 
     def pending(self) -> list[dict[str, Any]]:
         with self._lock:
-            for row in list(self._pending.values()):
-                if row.get("state") == "pending" and self._clock() >= float(row.get("expires_at") or 0):
-                    self._mark_locked(row, "expired", detail="pending_poll_timeout")
+            self._expire_locked("pending_query_sweep")
             return [self._public(row) for row in self._pending.values() if row.get("state") == "pending"]
+
+    def request_state(self, request_id: str) -> str:
+        with self._lock:
+            self._expire_locked("state_query_sweep")
+            row = self._pending.get(str(request_id))
+            return str(row.get("state") or "missing") if row else "missing"

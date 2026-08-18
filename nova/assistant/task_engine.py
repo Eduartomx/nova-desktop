@@ -28,7 +28,6 @@ class TaskEngine:
         self._active_step_index: int | None = None
         self._waiting_request_id = ""
         self._authorization_state = ""
-        self._human_intent: HumanIntent | None = None
         self._expire_stale_waiting_tasks()
         broker = getattr(getattr(self.agent, "tools", None), "action_broker", None)
         if broker is not None and hasattr(broker, "set_state_listener"):
@@ -38,13 +37,29 @@ class TaskEngine:
         if self.memory is None or not hasattr(self.memory, "list_tasks"):
             return
         try:
-            for row in self.memory.list_tasks(50):
-                if str(row.get("status") or "") != "waiting_for_approval":
-                    continue
+            rows = []
+            pager = getattr(self.memory, "list_tasks_by_status", None)
+            if callable(pager):
+                for waiting_status in ("waiting_for_approval", "waiting_approval"):
+                    after_id = 0
+                    while True:
+                        page = pager(waiting_status, after_id=after_id, limit=100)
+                        if not page:
+                            break
+                        rows.extend(page)
+                        after_id = max(int(item.get("id") or 0) for item in page)
+                        if len(page) < 100:
+                            break
+            else:
+                rows = [
+                    row for row in self.memory.list_tasks(50)
+                    if str(row.get("status") or "") in {"waiting_for_approval", "waiting_approval"}
+                ]
+            for row in rows:
                 task_id = int(row["id"])
                 task = self.memory.get_task(task_id) or {}
                 for step in task.get("steps") or []:
-                    if str(step.get("status") or "") == "waiting_for_approval":
+                    if str(step.get("status") or "") in {"waiting_for_approval", "waiting_approval"}:
                         self.memory.upsert_task_step(
                             task_id, int(step.get("step_index") or 0), str(step.get("description") or ""),
                             str(step.get("success_criteria") or ""), status="expired",
@@ -242,7 +257,11 @@ class TaskEngine:
             return {"ok": False, "error": "task_engine_disabled"}
         self._cancel.clear()
         self._pause.clear()
-        self._human_intent = human_intent if isinstance(human_intent, HumanIntent) and human_intent.source == "local_user" else None
+        selected_human_intent = (
+            human_intent
+            if isinstance(human_intent, HumanIntent) and human_intent.source == "local_user"
+            else None
+        )
         started = time.monotonic()
         max_minutes = max(1, min(int(self.settings.get("max_task_minutes", 20) or 20), 240))
         max_tool_calls = max(1, min(int(self.settings.get("max_tool_calls", 40) or 40), 500))
@@ -321,7 +340,7 @@ class TaskEngine:
                 broker = getattr(getattr(self.agent, "tools", None), "action_broker", None)
                 wait_before = float(getattr(broker, "total_wait_seconds", 0.0) or 0.0)
                 if callable(getattr(self.agent, "ask_internal", None)):
-                    response = str(self.agent.ask_internal(instruction, human_intent=self._human_intent) or "")
+                    response = str(self.agent.ask_internal(instruction, human_intent=selected_human_intent) or "")
                 else:
                     response = str(self.agent.ask(instruction) or "")
                 wait_after = float(getattr(broker, "total_wait_seconds", 0.0) or 0.0)
@@ -435,7 +454,6 @@ class TaskEngine:
             with self._state_lock:
                 self._active_step_index = None
                 self._waiting_request_id = ""
-            self._human_intent = None
 
         elapsed = time.monotonic() - started
         if elapsed >= 8.0:

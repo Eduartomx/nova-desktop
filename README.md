@@ -14,9 +14,13 @@ Nova v0.9.9 finalizó correctamente las suites completas de Ubuntu y Windows y u
 
 Nova centraliza las acciones sensibles en un broker local con perfiles `safe`, `balanced` y `trusted`. Las aprobaciones se muestran únicamente en la UI local, se ligan al contexto exacto y se consumen una vez; detener, cancelar, cerrar o actualizar libera cualquier espera.
 
-La cobertura de herramientas es explícita y fail-closed. Los envíos web se clasifican con el DOM observado, PowerShell se limita a una allowlist conservadora y el audit local rota con límites estrictos. Sólo la orden humana local original puede declarar intención para lecturas sensibles.
+La cobertura de herramientas es explícita y fail-closed. Sólo un enlace HTTP(S) pasivo demostrado por un snapshot DOM capturado en el worker del navegador evita alto riesgo; el contexto se vuelve a capturar antes del consumo. PowerShell se limita a una allowlist conservadora resuelta desde el directorio confiable de Windows, y `open_app` acepta únicamente aliases registrados mientras los documentos usan una capacidad separada.
+
+La intención sensible sólo puede derivarse de una orden humana local positiva y exacta. Se liga a solicitud y sesión mediante metadatos/hash inmutables y aislamiento por contexto de ejecución, sin estado mutable compartido entre conversaciones concurrentes. Solicitudes pendientes o aprobadas sin consumir expiran mediante barridos acotados y liberan capacidad sin crear grants.
 
 Repository Intelligence permite consultar la versión local, el changelog, la última release y la actividad del repositorio propio. Funciona offline con fuentes locales/cache e identifica siempre la evidencia usada. El contenido remoto se trata como dato no confiable y nunca autoriza acciones.
+
+El harness de Windows 11 usa una copia descartable aislada de Nova, checkpoints con precondiciones observables y evidencia JSON/ZIP sanitizada. Distingue procesos de la fixture por ruta, ascendencia, rol e identidad publicada, e ignora procesos Python ajenos.
 
 ### v0.9.8 — Gaming Reliability
 
