@@ -281,13 +281,20 @@ def _owner_identity(fixture_root: Path) -> dict[str, Any]:
 
 
 def sanitized_runtime_snapshot(fixture_root: Path, *, process_source=None, thread_source=None, window_source=None) -> dict[str, Any]:
-    fixture = _normal_path(Path(fixture_root).resolve(strict=False))
+    fixture_path = Path(fixture_root)
+    fixture_markers = {
+        marker for marker in (
+            _normal_path(fixture_path),
+            _normal_path(fixture_path.resolve(strict=False)),
+        ) if marker
+    }
     rows, source = _process_rows(process_source)
     by_pid = {int(row.get("pid") or 0): row for row in rows if int(row.get("pid") or 0) > 0}
     related: set[int] = set()
     for pid, row in by_pid.items():
         command = " ".join(str(item) for item in (row.get("cmdline") or []))
-        if fixture and fixture in _normal_path(str(row.get("exe") or "") + " " + command):
+        process_identity = _normal_path(str(row.get("exe") or "") + " " + command)
+        if any(marker in process_identity for marker in fixture_markers):
             related.add(pid)
     changed = True
     while changed:
