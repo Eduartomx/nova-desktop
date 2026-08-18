@@ -214,7 +214,14 @@ def _process_rows(process_source=None) -> tuple[list[dict[str, Any]], str]:
 
 
 def _normal_path(value: Any) -> str:
-    return str(value or "").replace("\\", "/").casefold()
+    text = str(value or "").replace("\\", "/").casefold()
+    # Path.resolve() can add the Win32 extended-length prefix while psutil's
+    # cmdline uses the ordinary drive form.  They identify the same fixture.
+    if text.startswith("//?/unc/"):
+        text = "//" + text[8:]
+    elif text.startswith("//?/"):
+        text = text[4:]
+    return text
 
 
 def _process_role(row: dict[str, Any]) -> str:

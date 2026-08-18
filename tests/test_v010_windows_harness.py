@@ -35,6 +35,10 @@ class WindowsHarnessTests(unittest.TestCase):
         self.assertTrue(HARNESS.is_windows_11({"system": "Windows", "build": 26100}))
         self.assertFalse(HARNESS.is_windows_11({"system": "Linux", "build": 26100}))
 
+    def test_windows_extended_path_prefix_matches_regular_cmdline_form(self):
+        self.assertEqual(HARNESS._normal_path(r"\\?\D:\a\fixture"), "d:/a/fixture")
+        self.assertEqual(HARNESS._normal_path(r"D:\a\fixture"), "d:/a/fixture")
+
     def test_manual_checkpoints_are_exact_and_have_verifiable_preconditions(self):
         self.assertEqual(len(HARNESS.MANUAL_CHECKS), 13)
         self.assertEqual(
