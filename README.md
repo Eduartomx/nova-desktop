@@ -6,9 +6,21 @@ GitHub (`Eduartomx/nova-desktop`) es la fuente de verdad. El updater estable sin
 
 ## Estado
 
-La versión estable preparada para publicación es **v0.9.9 — Resident Mode & Runtime Lifecycle**. La implementación y el hardening del Resident Runtime están completados.
+La versión estable publicada es **v0.9.9 — Resident Mode & Runtime Lifecycle**. La rama v0.10.0 desarrolla **Safe Actions & Repository Intelligence** sin modificar las garantías transaccionales del runtime residente.
 
 Nova v0.9.9 finalizó correctamente las suites completas de Ubuntu y Windows y una validación manual controlada r17 en Windows 11 del lifecycle residente, la actualización sin consola visible, la identidad autoritativa del runtime y el handoff transaccional.
+
+### v0.10.0 — Safe Actions & Repository Intelligence
+
+Nova centraliza las acciones sensibles en un broker local con perfiles `safe`, `balanced` y `trusted`. Las aprobaciones se muestran únicamente en la UI local, se ligan al contexto exacto y se consumen una vez; detener, cancelar, cerrar o actualizar libera cualquier espera.
+
+La cobertura de herramientas es explícita y fail-closed. Sólo un enlace HTTP(S) pasivo demostrado por un snapshot DOM capturado en el worker del navegador evita alto riesgo; el contexto se vuelve a capturar antes del consumo. PowerShell se limita a una allowlist conservadora resuelta desde el directorio confiable de Windows, y `open_app` acepta únicamente aliases registrados mientras los documentos usan una capacidad separada.
+
+La intención sensible sólo puede derivarse de una orden humana local positiva y exacta. Se liga a solicitud y sesión mediante metadatos/hash inmutables y aislamiento por contexto de ejecución, sin estado mutable compartido entre conversaciones concurrentes. Solicitudes pendientes o aprobadas sin consumir expiran mediante barridos acotados y liberan capacidad sin crear grants.
+
+Repository Intelligence permite consultar la versión local, el changelog, la última release y la actividad del repositorio propio. Funciona offline con fuentes locales/cache e identifica siempre la evidencia usada. El contenido remoto se trata como dato no confiable y nunca autoriza acciones.
+
+El harness de Windows 11 usa una copia descartable aislada de Nova, checkpoints con precondiciones observables y evidencia JSON/ZIP sanitizada. Distingue procesos de la fixture por ruta, ascendencia, rol e identidad publicada, e ignora procesos Python ajenos.
 
 ### v0.9.8 — Gaming Reliability
 

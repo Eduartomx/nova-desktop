@@ -13,6 +13,8 @@ import threading
 import time
 from typing import Any
 
+from .action_context import HumanIntent
+
 
 class TaskEngine:
     def __init__(self, agent, config: dict[str, Any] | None = None, memory=None):
@@ -22,6 +24,82 @@ class TaskEngine:
         self._cancel = threading.Event()
         self._pause = threading.Event()
         self.current_task_id: int | None = None
+        self._state_lock = threading.RLock()
+        self._active_step_index: int | None = None
+        self._waiting_request_id = ""
+        self._authorization_state = ""
+        self._expire_stale_waiting_tasks()
+        broker = getattr(getattr(self.agent, "tools", None), "action_broker", None)
+        if broker is not None and hasattr(broker, "set_state_listener"):
+            broker.set_state_listener(self._on_broker_state)
+
+    def _expire_stale_waiting_tasks(self) -> None:
+        if self.memory is None or not hasattr(self.memory, "list_tasks"):
+            return
+        try:
+            rows = []
+            pager = getattr(self.memory, "list_tasks_by_status", None)
+            if callable(pager):
+                for waiting_status in ("waiting_for_approval", "waiting_approval"):
+                    after_id = 0
+                    while True:
+                        page = pager(waiting_status, after_id=after_id, limit=100)
+                        if not page:
+                            break
+                        rows.extend(page)
+                        after_id = max(int(item.get("id") or 0) for item in page)
+                        if len(page) < 100:
+                            break
+            else:
+                rows = [
+                    row for row in self.memory.list_tasks(50)
+                    if str(row.get("status") or "") in {"waiting_for_approval", "waiting_approval"}
+                ]
+            for row in rows:
+                task_id = int(row["id"])
+                task = self.memory.get_task(task_id) or {}
+                for step in task.get("steps") or []:
+                    if str(step.get("status") or "") in {"waiting_for_approval", "waiting_approval"}:
+                        self.memory.upsert_task_step(
+                            task_id, int(step.get("step_index") or 0), str(step.get("description") or ""),
+                            str(step.get("success_criteria") or ""), status="expired",
+                            attempts=int(step.get("attempts") or 0), result="approval_session_lost",
+                            verifier="action_broker_session",
+                        )
+                self.memory.update_task(task_id, status="expired", summary="La sesión de autorización terminó; se requiere una solicitud nueva.")
+                self.memory.add_task_event(task_id, "expired", "La autorización no se reconstruyó después de reiniciar el proceso.")
+        except Exception:
+            pass
+
+    def _on_broker_state(self, event: str, request: dict[str, Any]) -> None:
+        with self._state_lock:
+            if not self.current_task_id or str(request.get("task_id") or "") != str(self.current_task_id):
+                return
+            self._authorization_state = str(event or "")
+            self._waiting_request_id = str(request.get("request_id") or "") if event in {"pending", "approved"} else ""
+            step_index = self._active_step_index
+            if step_index is None or self.memory is None:
+                return
+            task = self.memory.get_task(self.current_task_id) or {}
+            step = next((row for row in task.get("steps") or [] if int(row.get("step_index") or -1) == step_index), {})
+            status = "waiting_for_approval" if event == "pending" else event
+            if status not in {"waiting_for_approval", "approved", "denied", "expired", "cancelled", "executed"}:
+                return
+            try:
+                self.memory.upsert_task_step(
+                    self.current_task_id, step_index, str(step.get("description") or ""),
+                    str(step.get("success_criteria") or ""), status=status,
+                    attempts=int(step.get("attempts") or 1), result="", verifier="action_broker",
+                )
+                task_status = "running" if status in {"approved", "executed"} else status
+                self.memory.update_task(self.current_task_id, status=task_status)
+                self.memory.add_task_event(
+                    self.current_task_id, status,
+                    f"Paso {step_index}: autorización {status}.",
+                    {"step_index": step_index, "request_id": str(request.get("request_id") or "")},
+                )
+            except Exception:
+                pass
 
     @property
     def settings(self) -> dict[str, Any]:
@@ -30,6 +108,10 @@ class TaskEngine:
 
     def cancel(self):
         self._cancel.set()
+        tools = getattr(self.agent, "tools", None)
+        broker = getattr(tools, "action_broker", None)
+        if broker is not None:
+            broker.cancel_all("task_cancelled")
         if self.current_task_id and self.memory is not None:
             try:
                 self.memory.update_task(self.current_task_id, status="cancelled", summary="Cancelada por el usuario.")
@@ -50,13 +132,20 @@ class TaskEngine:
 
     def resume(self):
         self._pause.clear()
-        if self.current_task_id and self.memory is not None:
+        with self._state_lock:
+            state = self._authorization_state or "running"
+            task_id = self.current_task_id
+        if self.current_task_id and self.memory is not None and state != "pending":
             try:
                 self.memory.update_task(self.current_task_id, status="running")
                 self.memory.add_task_event(self.current_task_id, "resumed", "Tarea reanudada.")
             except Exception:
                 pass
-        return {"ok": True, "paused": False}
+        return {
+            "ok": True, "paused": False, "task_id": task_id,
+            "status": "waiting_for_approval" if state == "pending" else state,
+            "same_task": bool(task_id),
+        }
 
     @staticmethod
     def _extract_json(text: str) -> dict[str, Any] | None:
@@ -152,6 +241,8 @@ class TaskEngine:
         negative = (
             "no pude", "no se pudo", "falló", "fallo", "error:", "confirmation_required",
             "alcancé el límite", "no pude conectar con ollama", "requiere confirmación",
+            "authorization_denied", "authorization_expired", "authorization_cancelled",
+            "acción fue denegada", "autorización expiró", "autorización fue cancelada",
         )
         return bool(t.strip()) and not any(x in t for x in negative)
 
@@ -161,11 +252,16 @@ class TaskEngine:
         except Exception:
             return 0
 
-    def run(self, goal: str, plan: dict[str, Any] | None = None) -> dict[str, Any]:
+    def run(self, goal: str, plan: dict[str, Any] | None = None, *, human_intent: HumanIntent | None = None) -> dict[str, Any]:
         if not self.settings.get("enabled", True):
             return {"ok": False, "error": "task_engine_disabled"}
         self._cancel.clear()
         self._pause.clear()
+        selected_human_intent = (
+            human_intent
+            if isinstance(human_intent, HumanIntent) and human_intent.source == "local_user"
+            else None
+        )
         started = time.monotonic()
         max_minutes = max(1, min(int(self.settings.get("max_task_minutes", 20) or 20), 240))
         max_tool_calls = max(1, min(int(self.settings.get("max_tool_calls", 40) or 40), 500))
@@ -185,6 +281,9 @@ class TaskEngine:
             try:
                 task_id = self.memory.create_task(str(goal), plan, status="running")
                 self.current_task_id = int(task_id)
+                tools = getattr(self.agent, "tools", None)
+                if tools is not None and hasattr(tools, "action_task_id"):
+                    tools.action_task_id = str(task_id)
                 for step in steps:
                     self.memory.upsert_task_step(
                         task_id, int(step["index"]), str(step["description"]), str(step["success_criteria"]), status="pending",
@@ -213,11 +312,16 @@ class TaskEngine:
 
             step = steps[pointer]
             idx = int(step.get("index") or pointer + 1)
+            with self._state_lock:
+                self._active_step_index = idx
+                self._authorization_state = "running"
             description = str(step.get("description") or "").strip()
             criteria = str(step.get("success_criteria") or "").strip()
             attempts = 0
             success = False
             response = ""
+            waiting_for_approval = False
+            authorization_terminal = ""
 
             while attempts <= max_retries and not self._cancel.is_set():
                 attempts += 1
@@ -233,23 +337,55 @@ class TaskEngine:
                     f"Criterio de éxito: {criteria or 'resultado verificable'}\n"
                     "Usa herramientas reales si hacen falta y no afirmes éxito sin evidencia."
                 )
-                response = str(self.agent.ask(instruction) or "")
+                broker = getattr(getattr(self.agent, "tools", None), "action_broker", None)
+                wait_before = float(getattr(broker, "total_wait_seconds", 0.0) or 0.0)
+                if callable(getattr(self.agent, "ask_internal", None)):
+                    response = str(self.agent.ask_internal(instruction, human_intent=selected_human_intent) or "")
+                else:
+                    response = str(self.agent.ask(instruction) or "")
+                wait_after = float(getattr(broker, "total_wait_seconds", 0.0) or 0.0)
+                # Human decision time is not autonomous execution time.
+                started += max(0.0, wait_after - wait_before)
                 total_tool_calls += self._tool_count()
+                try:
+                    auth_states = {
+                        str(row.get("authorization_state") or "")
+                        for row in self.agent.last_tool_trace()
+                    }
+                except Exception:
+                    auth_states = set()
+                try:
+                    auth_errors = {str(row.get("error") or "") for row in self.agent.last_tool_trace()}
+                except Exception:
+                    auth_errors = set()
+                if "approval_ui_unavailable" in auth_errors:
+                    authorization_terminal = "approval_ui_unavailable"
+                    success = False
+                    break
+                waiting_for_approval = "pending" in auth_states or "waiting_for_approval" in response.casefold()
+                if waiting_for_approval:
+                    success = False
+                    break
+                authorization_terminal = next((state for state in ("denied", "expired", "cancelled") if state in auth_states), "")
+                if authorization_terminal:
+                    success = False
+                    break
                 success = self._response_success(response)
                 if success or total_tool_calls >= max_tool_calls:
                     break
 
-            results.append({"index": idx, "description": description, "success": success, "attempts": attempts, "result": response})
+            action_state = "waiting_for_approval" if waiting_for_approval else (authorization_terminal or None)
+            results.append({"index": idx, "description": description, "success": success, "attempts": attempts, "result": response, "authorization_state": action_state})
             if task_id and self.memory is not None:
                 try:
                     self.memory.upsert_task_step(
                         task_id, idx, description, criteria,
-                        status="completed" if success else "failed", attempts=attempts,
+                        status="completed" if success else ("waiting_for_approval" if waiting_for_approval else (authorization_terminal or "failed")), attempts=attempts,
                         result=response[:5000], verifier="native_response_guard",
                     )
                     self.memory.add_task_event(
-                        task_id, "completed" if success else "failed",
-                        f"Paso {idx}: {'completado' if success else 'fallido'}.",
+                        task_id, "completed" if success else ("waiting_for_approval" if waiting_for_approval else (authorization_terminal or "failed")),
+                        f"Paso {idx}: {'completado' if success else ('esperando autorización' if waiting_for_approval else (authorization_terminal or 'fallido'))}.",
                         {"step_index": idx, "attempts": attempts, "tool_calls": total_tool_calls},
                     )
                 except Exception:
@@ -259,6 +395,13 @@ class TaskEngine:
                 completed_defs.append(dict(step))
                 pointer += 1
                 continue
+
+            if waiting_for_approval:
+                limit_reason = "waiting_for_approval"
+                break
+            if authorization_terminal:
+                limit_reason = authorization_terminal if authorization_terminal == "approval_ui_unavailable" else "authorization_" + authorization_terminal
+                break
 
             if auto_replan and replans < max_replans and total_tool_calls < max_tool_calls:
                 new_steps = self._replan(goal, step, completed_defs, start_index=idx)
@@ -280,23 +423,37 @@ class TaskEngine:
             pointer += 1
 
         cancelled = self._cancel.is_set()
-        if limit_reason and task_id and self.memory is not None:
+        if limit_reason and limit_reason != "waiting_for_approval" and task_id and self.memory is not None:
             try:
                 self.memory.add_task_event(task_id, "blocked", f"Límite de autonomía alcanzado: {limit_reason}.", {"tool_calls": total_tool_calls})
             except Exception:
                 pass
         success_count = sum(1 for x in results if x.get("success"))
         ok = pointer >= len(steps) and not cancelled and not limit_reason and bool(steps)
-        status = "cancelled" if cancelled else ("blocked" if limit_reason else ("completed" if ok else "failed"))
+        authorization_status = limit_reason.removeprefix("authorization_") if limit_reason.startswith("authorization_") else ""
+        status = "cancelled" if cancelled else ("waiting_for_approval" if limit_reason == "waiting_for_approval" else (authorization_status or ("blocked" if limit_reason else ("completed" if ok else "failed"))))
+        if limit_reason == "approval_ui_unavailable":
+            status = "approval_ui_unavailable"
         summary = f"{success_count} pasos correctos · {replans} replans · {total_tool_calls} tool calls."
-        if limit_reason:
+        if limit_reason and limit_reason != "waiting_for_approval" and not authorization_status:
             summary += f" Límite: {limit_reason}."
+        elif limit_reason == "waiting_for_approval":
+            summary += " Esperando autorización local; no se reintentó ni replanteó el paso."
+        elif authorization_status:
+            summary += f" Autorización {authorization_status}; no se reintentó ni replanteó el paso."
         if task_id and self.memory is not None:
             try:
                 self.memory.update_task(task_id, status=status, summary=summary)
             except Exception:
                 pass
-        self.current_task_id = None
+        if status != "waiting_for_approval":
+            self.current_task_id = None
+            tools = getattr(self.agent, "tools", None)
+            if tools is not None and hasattr(tools, "action_task_id"):
+                tools.action_task_id = ""
+            with self._state_lock:
+                self._active_step_index = None
+                self._waiting_request_id = ""
 
         elapsed = time.monotonic() - started
         if elapsed >= 8.0:

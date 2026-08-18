@@ -512,6 +512,19 @@ class MemoryStore:
             out.append(item)
         return out
 
+    def list_tasks_by_status(self, status: str, *, after_id: int = 0, limit: int = 100) -> list[dict[str, Any]]:
+        """Page every task in one state without the UI list's 50-row ceiling."""
+        limit = max(1, min(int(limit), 500))
+        with self._lock, self._connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT id,goal,status,summary,workspace_id,created_at,updated_at
+                FROM tasks WHERE status=? AND id>? ORDER BY id ASC LIMIT ?
+                """,
+                (str(status), int(after_id), limit),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def get_task(self, task_id: int) -> dict[str, Any] | None:
         with self._lock, self._connection() as conn:
             task = conn.execute(

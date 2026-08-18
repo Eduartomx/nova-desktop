@@ -10,7 +10,6 @@ dependen de una copia histórica local que el updater no pueda reconstruir.
 import json
 import os
 import re
-import shutil
 import subprocess
 import tempfile
 import time
@@ -23,6 +22,8 @@ import psutil
 import requests
 
 from .memory import MemoryStore
+from .action_apps import classify_document, resolve_known_application
+from .action_powershell import classify_powershell, resolve_trusted_powershell
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = PROJECT_ROOT / "data"
@@ -46,7 +47,8 @@ def _fn(name: str, description: str, properties=None, required=None) -> dict[str
 TOOL_SCHEMAS: list[dict[str, Any]] = [
     _fn("system_status", "Lee CPU, RAM, disco y estado básico del equipo."),
     _fn("list_processes", "Lista procesos con mayor consumo de CPU/RAM.", {"limit": {"type": "integer"}}),
-    _fn("open_app", "Abre una aplicación instalada o comando conocido.", {"app": {"type": "string"}}, ["app"]),
+    _fn("open_app", "Abre únicamente una aplicación registrada mediante un alias lógico conocido.", {"app": {"type": "string"}}, ["app"]),
+    _fn("open_document", "Abre un documento local de tipo permitido; nunca ejecuta binarios o scripts.", {"path": {"type": "string"}}, ["path"]),
     _fn("open_url", "Abre una URL en el navegador predeterminado.", {"url": {"type": "string"}}, ["url"]),
     _fn("web_search", "Busca información actual en Internet y devuelve resultados resumidos.", {"query": {"type": "string"}, "limit": {"type": "integer"}}, ["query"]),
     _fn("list_files", "Lista archivos/carpetas en una ruta permitida.", {"path": {"type": "string"}, "limit": {"type": "integer"}}),
@@ -55,7 +57,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     _fn("screenshot", "Toma una captura puntual de pantalla y devuelve la ruta local."),
     _fn("clipboard_read", "Lee el portapapeles solo cuando el usuario lo solicita explícitamente."),
     _fn("clipboard_write", "Escribe texto en el portapapeles.", {"text": {"type": "string"}}, ["text"]),
-    _fn("powershell", "Ejecuta PowerShell. Bloquea patrones destructivos/seguridad de alto riesgo por defecto.", {"command": {"type": "string"}, "timeout": {"type": "integer"}}, ["command"]),
+    _fn("powershell", "Ejecuta únicamente consultas PowerShell simples incluidas en la lista positiva acotada; cualquier sintaxis no comprendida se prohíbe.", {"command": {"type": "string"}, "timeout": {"type": "integer"}}, ["command"]),
     _fn("remember", "Guarda un dato estable en memoria local.", {"key": {"type": "string"}, "value": {"type": "string"}}, ["key", "value"]),
 ]
 
@@ -64,6 +66,7 @@ _SIMPLE_CUES = {
     "system_status": ("cpu", "ram", "memoria ram", "estado del pc", "estado del sistema", "recursos"),
     "list_processes": ("procesos", "proceso", "consume", "consumo", "task manager"),
     "open_app": ("abre ", "abrir ", "ejecuta ", "inicia "),
+    "open_document": ("abre el archivo", "abre el documento", "abrir documento"),
     "open_url": ("url", "sitio", "pagina web", "página web"),
     "web_search": ("busca", "buscar", "internet", "web", "actual", "ultima", "última"),
     "list_files": ("archivos", "carpeta", "directorio", "lista"),
@@ -102,7 +105,7 @@ class LocalTools:
 
     # ---------- seguridad/rutas ----------
     def _trusted_mode(self) -> bool:
-        return str(self.config.get("security", {}).get("profile", "trusted")).casefold() == "trusted"
+        return str(self.config.get("security", {}).get("profile", "balanced")).casefold() == "trusted"
 
     def _allowed_roots(self) -> list[Path]:
         roots: list[Path] = []
@@ -202,21 +205,28 @@ class LocalTools:
         raw = str(app or "").strip()
         if not raw:
             return {"ok": False, "error": "app_required"}
-        aliases = {
-            "explorador": "explorer.exe", "explorer": "explorer.exe",
-            "bloc de notas": "notepad.exe", "notepad": "notepad.exe",
-            "calculadora": "calc.exe", "calculator": "calc.exe",
-            "powershell": "powershell.exe", "cmd": "cmd.exe",
-            "edge": "msedge.exe", "chrome": "chrome.exe", "vscode": "code.exe", "visual studio code": "code.exe",
-        }
-        target = aliases.get(raw.casefold(), raw)
+        target = resolve_known_application(raw)
+        if not target.allowed or target.path is None:
+            return {"ok": False, "error": "forbidden_action", "detail": target.reason}
         try:
-            if Path(os.path.expandvars(os.path.expanduser(target))).exists():
-                os.startfile(str(Path(target)))
-            else:
-                executable = shutil.which(target) or target
-                subprocess.Popen([executable], creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
-            return {"ok": True, "opened": target}
+            subprocess.Popen(
+                [str(target.path)], shell=False,
+                creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
+            )
+            return {"ok": True, "opened": target.display_name}
+        except Exception as exc:
+            return {"ok": False, "error": type(exc).__name__, "detail": str(exc)[:500]}
+
+    def open_document(self, path):
+        target = self._ensure_allowed(self._resolve_path(path))
+        classified = classify_document(str(target))
+        if not classified.allowed or not target.is_file():
+            return {"ok": False, "error": "forbidden_action", "detail": classified.reason or "Documento no verificable."}
+        if os.name != "nt" or not hasattr(os, "startfile"):
+            return {"ok": False, "error": "document_opener_unavailable"}
+        try:
+            os.startfile(str(target))
+            return {"ok": True, "opened": target.name, "kind": "document"}
         except Exception as exc:
             return {"ok": False, "error": type(exc).__name__, "detail": str(exc)[:500]}
 
@@ -323,8 +333,11 @@ class LocalTools:
 
     @staticmethod
     def _ps_clipboard(script: str, timeout: int = 4):
+        executable = resolve_trusted_powershell()
+        if executable is None:
+            raise FileNotFoundError("trusted_powershell_unavailable")
         return subprocess.run(
-            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
+            [str(executable), "-NoProfile", "-NonInteractive", "-Command", script],
             capture_output=True, text=True, timeout=timeout,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
@@ -339,8 +352,11 @@ class LocalTools:
     def clipboard_write(self, text):
         # Pasa el valor por stdin para no incrustarlo en la línea de comandos.
         try:
+            executable = resolve_trusted_powershell()
+            if executable is None:
+                return {"ok": False, "error": "trusted_powershell_unavailable"}
             proc = subprocess.run(
-                ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", "$input | Set-Clipboard"],
+                [str(executable), "-NoProfile", "-NonInteractive", "-Command", "$input | Set-Clipboard"],
                 input=str(text or ""), capture_output=True, text=True, timeout=4,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
@@ -349,27 +365,24 @@ class LocalTools:
             return {"ok": False, "error": str(exc)[:500]}
 
     # ---------- PowerShell ----------
-    _DANGEROUS_PS = re.compile(
-        r"(?i)(remove-item\b|del\s+/[sqf]|format-volume\b|clear-disk\b|initialize-disk\b|"
-        r"stop-computer\b|restart-computer\b|shutdown\b|bcdedit\b|reg\s+delete\b|"
-        r"set-executionpolicy\b|disable-windowsoptionalfeature\b|invoke-expression\b|iex\b|"
-        r"downloadstring\b|frombase64string\b)"
-    )
-
     def powershell(self, command, timeout=20):
         cmd = str(command or "").strip()
         if not cmd:
             return {"ok": False, "error": "command_required"}
-        if self._DANGEROUS_PS.search(cmd):
+        assessment = classify_powershell(cmd)
+        if not assessment.allowed:
             return {
                 "ok": False,
-                "error": "confirmation_required",
-                "detail": "Nova Core bloqueó un patrón PowerShell destructivo/seguridad. Usa una ruta explícita con confirmación del usuario.",
+                "error": "forbidden_action",
+                "detail": "PowerShell fuera de la lista positiva acotada de Nova.",
             }
         timeout = max(1, min(int(timeout or 20), 120))
+        executable = resolve_trusted_powershell()
+        if executable is None:
+            return {"ok": False, "error": "trusted_powershell_unavailable"}
         try:
             proc = subprocess.run(
-                ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", cmd],
+                [str(executable), "-NoProfile", "-NonInteractive", "-Command", cmd],
                 capture_output=True, text=True, timeout=timeout,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )

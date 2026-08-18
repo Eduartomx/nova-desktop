@@ -212,6 +212,9 @@ class RuntimeLifecycleManager:
                 return
             ui._closing = True
             ui._accepting_commands = False
+            approval = getattr(ui, "action_approval", None)
+            if approval is not None:
+                approval.cancel_all(self._last_shutdown_reason or "shutdown", shutdown=True)
             for listener in (getattr(ui, "_hotkey_listener", None), getattr(ui, "_ptt_listener", None)):
                 if listener is not None:
                     listener.stop()

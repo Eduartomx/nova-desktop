@@ -72,6 +72,13 @@ def install_core_runtime():
     install_tools_learning()
     install_tools_confidence()
 
+    # Debe instalarse al final: el broker registra y protege todas las
+    # herramientas añadidas por los adaptadores anteriores.
+    from .tools_repository import install_tools_repository
+    install_tools_repository()
+    from .tools_action_guard import install_tools_action_guard
+    install_tools_action_guard()
+
     from .agent_workspace import install_agent_v060
     from .agent_semantic import install_agent_v063
     from .agent_continuity import install_agent_v065
@@ -102,6 +109,8 @@ def install_core_runtime():
     install_agent_fast_routing()
     install_agent_instant_wake()
     install_agent_gaming()
+    from .agent_repository import install_agent_repository
+    install_agent_repository()
 
     from .ui_workspace import install_ui_v060
     from .ui_semantic import install_ui_v063
@@ -160,6 +169,8 @@ def architecture_status() -> dict:
         "runtime_lifecycle", "resident_mode", "system_tray", "single_instance", "windows_autostart",
         "update_supervisor_mutex", "updater_recovery_diagnostics",
         "agent", "tools", "ui", "task_engine",
+        "action_authorization_broker", "permissioned_task_resume",
+        "repository_intelligence", "self_release_awareness",
     ]
     return {
         "ok": all(managed_core.values()),
